@@ -23,6 +23,11 @@ from discord import app_commands
 from discord.ext import commands
 from resources.shared import bridge_log
 
+# 🌸 Dynamic personality — instructions are generated live from the bot's
+# CURRENT per-guild nickname (set via /server-persona-set), same system
+# groq_ai.py uses, instead of a static personality.txt file.
+from personality import load_personality
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pastel palette & loading GIFs  (from chatting_fun.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +66,6 @@ CLOUDFLARE_AUTH_SETS = [
 AUTH_FILES = CLOUDFLARE_AUTH_SETS  # alias kept so len(AUTH_FILES) usages below still work
 
 USAGE_PATH        = os.path.join(_AUTH_DIR, "cloudflare_usage.json")
-PERSONALITY_PATH  = os.path.join(_BASE_DIR, "..", "gemini", "configuration", "personality.txt")
 
 # Discord v10 REST base
 DISCORD_API_BASE  = "https://discord.com/api/v10"
@@ -153,14 +157,6 @@ def _load_auth(auth_set: dict) -> tuple[str, str, list]:
         return "", "", []
 
     return account_id, gateway_id, tokens
-
-
-def load_personality() -> str:
-    try:
-        with open(PERSONALITY_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return "You are a super cute AI companion assistant! 🥰✨"
 
 
 def _load_discord_token() -> str:
@@ -276,9 +272,12 @@ class SummarizeCog(commands.Cog):
         self,
         prompt: str,
         model:  str = DEFAULT_MODEL,
+        guild_id: int = None,
     ) -> str:
         """
         Sends a stateless prompt to Cloudflare AI Gateway.
+        Pass guild_id so the personality reflects the bot's CURRENT
+        per-guild nickname (falls back to the default nickname if omitted).
         Rotates API tokens on 401/403/429/404.
         Switches auth files when neurons exceed NEURON_SWITCH_THRESHOLD.
         """
@@ -290,7 +289,7 @@ class SummarizeCog(commands.Cog):
             return "❌ Missing account_id or gateway_id in the auth file!"
 
         messages = [
-            {"role": "system", "content": load_personality()},
+            {"role": "system", "content": await load_personality(self.bot, guild_id)},
             {"role": "user",   "content": prompt},
         ]
 
@@ -644,7 +643,9 @@ class SummarizeCog(commands.Cog):
             )
 
             # ── Call Cloudflare AI ────────────────────────────────────────────
-            summary_reply = await self._call_cloudflare(prompt, model=selected_model)
+            summary_reply = await self._call_cloudflare(
+                prompt, model=selected_model, guild_id=interaction.guild_id
+            )
 
             # ── Log & swap loading embed → summary embed ──────────────────────
             await bridge_log(

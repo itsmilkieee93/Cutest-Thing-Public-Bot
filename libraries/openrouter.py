@@ -2,8 +2,9 @@
 🌸 openrouter.py
 Discord cog for /openrouter and /openrouter-reply slash commands
 Uses OpenRouter API (aiohttp, async) with free model tier
-API key loaded from auth/openrouter
-Personality loaded from gemini/configuration/personality.txt
+API key loaded from key_config.OPENROUTER_API_KEYS
+Personality: dynamic, built live from the bot's CURRENT per-guild nickname
+(set via /server-persona-set) — see personality.py. Same system groq_ai.py uses.
 Memory stored per-user at gemini/memory/openrouter/chat_{user}_{id}.json
 """
 
@@ -20,13 +21,17 @@ from resources.shared import (
     reply_to_autocomplete,
 )
 
+# 🌸 Dynamic personality — instructions are generated live from the bot's
+# CURRENT per-guild nickname (set via /server-persona-set), same system
+# groq_ai.py uses, instead of a static personality.txt file.
+from personality import load_personality
+
 _AUTH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "auth")
 if _AUTH_DIR not in sys.path:
     sys.path.insert(0, _AUTH_DIR)
 import key_config  # lives at auth/key_config.py, gitignored — see generate_key_config.py
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-PERSONALITY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gemini", "configuration", "personality.txt")
 MODEL              = "openrouter/free"
 MEMORY_MODEL_ID    = "openrouter"
 MAX_HISTORY        = 200
@@ -60,15 +65,6 @@ def _build_key_pool() -> list:
     return keys
 
 
-def load_personality() -> str:
-    try:
-        with open(PERSONALITY_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception as e:
-        print(f"⚠️ OpenRouter: Failed to load personality: {e}")
-        return "You are a super cute AI companion assistant! 🥰✨"
-
-
 class OpenRouterCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot       = bot
@@ -95,15 +91,17 @@ class OpenRouterCog(commands.Cog):
     # ─────────────────────────────────────────────────────────────────
     # Core API call
     # ─────────────────────────────────────────────────────────────────
-    async def _call_openrouter(self, prompt: str, history: list) -> str:
+    async def _call_openrouter(self, prompt: str, history: list, guild_id: int = None) -> str:
         """
         Sends full conversation history + new prompt to OpenRouter.
+        Pass guild_id so the personality reflects the bot's CURRENT
+        per-guild nickname (falls back to the default nickname if omitted).
         Automatically rotates to the next API key on 401 / 403 / 429 / 404.
         """
         if not self._key_pool:
             return "❌ No OpenRouter API keys configured! Add keys to `API_KEYS` in openrouter.py."
 
-        personality = load_personality()
+        personality = await load_personality(self.bot, guild_id)
 
         messages = [{"role": "system", "content": personality}]
         for entry in history:
@@ -190,7 +188,7 @@ class OpenRouterCog(commands.Cog):
             history = load_gemini_memory(MEMORY_MODEL_ID, user.name, user.id)
             history.append({"role": "user", "content": prompt})
 
-            reply = await self._call_openrouter(prompt, history[:-1])
+            reply = await self._call_openrouter(prompt, history[:-1], guild_id=interaction.guild_id)
 
             history.append({"role": "assistant", "content": reply})
             save_gemini_memory(MEMORY_MODEL_ID, user.name, user.id, history[-MAX_HISTORY:])
@@ -240,7 +238,7 @@ class OpenRouterCog(commands.Cog):
             # Fetch the target message
             target_msg = await lookup_channel.fetch_message(int(message_id))
 
-            personality = load_personality()
+            personality = await load_personality(self.bot, interaction.guild_id)
             prompt = (
                 f"SYSTEM_INSTRUCTIONS:\n{personality}\n\n"
                 f"CONTEXT: Replying to {target_msg.author.display_name}: \"{target_msg.content}\"\n"
@@ -251,7 +249,7 @@ class OpenRouterCog(commands.Cog):
             history = load_gemini_memory(MEMORY_MODEL_ID, user.name, user.id)
             history.append({"role": "user", "content": prompt})
 
-            reply = await self._call_openrouter(prompt, history[:-1])
+            reply = await self._call_openrouter(prompt, history[:-1], guild_id=interaction.guild_id)
 
             history.append({"role": "assistant", "content": reply})
             save_gemini_memory(MEMORY_MODEL_ID, user.name, user.id, history[-MAX_HISTORY:])
