@@ -78,7 +78,8 @@ async def register_all_cogs(bot):
         server_info.ServerInfoCog(bot),
         cute.ServerPersona(bot),
         gen.PhotoEditorCog(bot),
-        system_commands.SystemCommands(bot)
+        system_commands.SystemCommands(bot),
+        status_bot.StatusCommands(bot)
     ]
     
     for cog in cogs:

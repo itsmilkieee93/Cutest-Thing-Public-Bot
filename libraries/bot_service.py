@@ -555,24 +555,33 @@ class EnchantedBot(commands.Bot):
                 bubble    = status_data.get("bubble", "")
                 act_type  = status_data.get("type", "custom")
                 act_name  = status_data.get("name", "")
+                emoji_str = status_data.get("emoji", "")
+                stream_url = status_data.get("url", "https://twitch.tv/discord")
 
-                state_key = f"{bubble}|{act_type}|{act_name}"
+                state_key = f"{bubble}|{act_type}|{act_name}|{emoji_str}|{stream_url}"
 
                 if state_key != self.last_state:
                     activity = None
 
+                    parsed_emoji = None
+                    if emoji_str:
+                        try:
+                            parsed_emoji = discord.PartialEmoji.from_str(emoji_str)
+                        except Exception:
+                            parsed_emoji = None
+
                     if act_type == "custom" and bubble:
-                        activity = discord.CustomActivity(name=bubble)
+                        activity = discord.CustomActivity(name=bubble, emoji=parsed_emoji)
                     elif act_type == "watching" and act_name:
                         activity = discord.Activity(type=discord.ActivityType.watching, name=act_name)
                     elif act_type == "listening" and act_name:
                         activity = discord.Activity(type=discord.ActivityType.listening, name=act_name)
                     elif act_type == "streaming" and act_name:
-                        activity = discord.Streaming(name=act_name, url="https://twitch.tv/discord")
+                        activity = discord.Streaming(name=act_name, url=stream_url)
                     elif act_type == "playing" and act_name:
                         activity = discord.Game(name=act_name)
                     elif bubble:
-                        activity = discord.CustomActivity(name=bubble)
+                        activity = discord.CustomActivity(name=bubble, emoji=parsed_emoji)
 
                     await self.change_presence(activity=activity, status=discord.Status.online)
                     self.last_state = state_key

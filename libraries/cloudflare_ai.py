@@ -17,7 +17,8 @@ Neuron usage is persisted to auth/cloudflare_usage.json.
 When the running total for the active auth file exceeds NEURON_SWITCH_THRESHOLD
 the cog advances to the next auth file (wrapping around) and continues.
 
-Personality loaded from gemini/configuration/personality.txt
+Personality: dynamic, built live from the bot's CURRENT per-guild nickname
+(set via /server-persona-set) — see personality.py. Same system groq_ai.py uses.
 Memory stored per-user at gemini/memory/cloudflare_ai/chat_{user}_{id}.json
 """
 
@@ -35,6 +36,11 @@ from resources.shared import (
     load_gemini_memory, save_gemini_memory, bridge_log,
     reply_to_autocomplete,
 )
+
+# 🌸 Dynamic personality — instructions are generated live from the bot's
+# CURRENT per-guild nickname (set via /server-persona-set), same system
+# groq_ai.py uses, instead of a static personality.txt file.
+from personality import load_personality
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths & constants
@@ -56,7 +62,6 @@ CLOUDFLARE_AUTH_SETS = [
 AUTH_FILES = CLOUDFLARE_AUTH_SETS  # kept as alias so len(AUTH_FILES) usages below still work
 
 USAGE_PATH        = os.path.join(_AUTH_DIR, "cloudflare_usage.json")
-PERSONALITY_PATH  = os.path.join(_BASE_DIR, "..", "gemini", "configuration", "personality.txt")
 
 MEMORY_MODEL_ID         = "cloudflare_ai"
 MAX_HISTORY             = 200
@@ -158,15 +163,6 @@ def _load_auth(auth_set: dict) -> tuple[str, str, list]:
         return "", "", []
 
     return account_id, gateway_id, tokens
-
-
-def load_personality() -> str:
-    try:
-        with open(PERSONALITY_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception as e:
-        print(f"⚠️ CloudflareAI: Failed to load personality: {e}")
-        return "You are a super cute AI companion assistant! 🥰✨"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,11 +305,14 @@ class CloudflareAICog(commands.Cog):
         image_mime: str = None,
         top_p: float = None,
         top_k: int   = None,
+        guild_id: int = None,
     ) -> str:
         """
         Sends full conversation history + new prompt to Cloudflare AI Gateway.
         Pass image_b64 + image_mime to use vision-format messages.
         Pass top_p (0.0–1.0) and/or top_k (1–100) to tune sampling.
+        Pass guild_id so the personality reflects the bot's CURRENT
+        per-guild nickname (falls back to the default nickname if omitted).
         Rotates API tokens on 401/403/429/404.
         Switches auth files when neurons exceed NEURON_SWITCH_THRESHOLD.
         """
@@ -322,7 +321,7 @@ class CloudflareAICog(commands.Cog):
         if not self._account_id or not self._gateway_id:
             return "❌ Missing account_id or gateway_id in the auth file!"
 
-        personality = load_personality()
+        personality = await load_personality(self.bot, guild_id)
 
         messages = [{"role": "system", "content": personality}]
         for entry in history:
@@ -568,6 +567,7 @@ class CloudflareAICog(commands.Cog):
                 final_prompt, history[:-1], selected_model,
                 image_b64=image_b64, image_mime=image_mime,
                 top_p=top_p, top_k=top_k,
+                guild_id=interaction.guild_id,
             )
 
             history.append({"role": "assistant", "content": reply})
@@ -658,7 +658,7 @@ class CloudflareAICog(commands.Cog):
             if image_b64 and not model:
                 selected_model = VISION_MODEL
 
-            personality = load_personality()
+            personality = await load_personality(self.bot, interaction.guild_id)
             video_note  = " [Note: the message also contained a video file that cannot be analysed.]" if video_noted else ""
 
             # ── optional web search on the message content ────────────────────
@@ -680,6 +680,7 @@ class CloudflareAICog(commands.Cog):
                 prompt, [], selected_model,
                 image_b64=image_b64, image_mime=image_mime,
                 top_p=top_p, top_k=top_k,
+                guild_id=interaction.guild_id,
             )
 
             await bridge_log(

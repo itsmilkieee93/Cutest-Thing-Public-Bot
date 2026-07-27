@@ -40,3 +40,4 @@ import random_msg
 import server_info
 import server_persona as cute
 import photo_editor as gen
+import status_commands as status_bot
