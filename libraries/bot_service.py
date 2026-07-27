@@ -1,0 +1,773 @@
+import discord
+import json
+import os
+import sys
+import aiohttp
+import asyncio
+import argparse
+import time
+import random
+import re
+from datetime import datetime
+from discord.ext import tasks, commands
+from discord import app_commands
+from google import genai
+from google.genai import types
+from collections import deque
+
+# 🌸 NEW: Config loader for Discord snowflake IDs
+from config_loader import get_owner_id, get_test_guild_id
+
+# 🌸 key_config.py lives at auth/key_config.py, gitignored — see generate_key_config.py.
+# Path is relative to CWD (bot root), matching this file's existing convention
+# of using relative paths like "gemini/configuration/gen_ai" instead of __file__-based ones.
+if "auth" not in sys.path:
+    sys.path.insert(0, "auth")
+import key_config
+
+# 🌸 Dynamic personality — instructions are generated live from the bot's
+# CURRENT per-guild nickname (set via /server-persona-set), same system
+# groq_ai.py already uses, instead of a static personality.txt file.
+from personality import get_personality_for_nickname
+
+# Import separated modules
+from groq_instruct import (
+    handle_role_query, handle_created_query, handle_server_info_query,
+    handle_channel_count_query, handle_role_list_query,
+    handle_server_avatar_query, handle_server_banner_query,
+    handle_server_owner_query, handle_server_verification_query,
+    handle_member_count_query, handle_server_age_query,
+    handle_boost_status_query, handle_locale_query,
+    CONTEXT_TRIGGERS, KEYWORD_STOPWORDS,
+    REACT_TAG_PATTERN, REACT_REQUEST_PATTERN, EXPLICIT_EMOJI_PATTERN,
+    REACT_EMOJI_POOL, RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
+    _build_react_instructions, EMOJI_NAME_MAP
+)
+from groq_ai import GroqService
+from roulette import RouletteService
+from discord_commands import register_all_cogs
+from resources import shared
+
+# ─────────────────────────────────────────────────────────────────────────────
+# When bot_service.py is run directly Python only adds *this* directory
+# (libraries/) to sys.path — it has no idea about the parent package.
+# Insert the parent (bot/) so `from libraries import ...` resolves correctly.
+# ─────────────────────────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom modules — all declared in libraries/__init__.py
+# ─────────────────────────────────────────────────────────────────────────────
+from libraries import *
+
+
+class GeminiService:
+    def __init__(self, bot=None):
+        # 🌸 Back-reference to the bot so we can resolve the CURRENT
+        # per-guild nickname for dynamic personality (see personality.py).
+        # May be None if constructed standalone — get_ai_response falls
+        # back to the default nickname in that case.
+        self.bot = bot
+
+        self.api_keys          = list(key_config.GEMINI_API_KEYS)
+        self.current_key_index = 0
+
+        if self.api_keys:
+            self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
+        else:
+            print("❌ ERROR: No API keys found in key_config.GEMINI_API_KEYS!")
+
+        self.default_model = "gemini-2.5-flash"
+        print(f"🌸 Cutest Thing is online with {len(self.api_keys)} hearts (API Keys)!")
+
+    def _load_keys(self, path):
+        try:
+            with open(path, "r") as f:
+                return [line.strip() for line in f.readlines() if line.strip()]
+        except Exception as e:
+            print(f"⚠️ Failed to load keys: {e}")
+            return []
+
+    def _load_file(self, path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def rotate_key(self):
+        if len(self.api_keys) <= 1:
+            time.sleep(random.uniform(5, 12))
+            return
+
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        new_key = self.api_keys[self.current_key_index]
+        self.client = genai.Client(api_key=new_key)
+        print(f"🔄 Swapping to API Key #{self.current_key_index + 1}...")
+        time.sleep(random.uniform(5, 12))
+
+    def get_ai_response(self, prompt: str, guild_id: int = None, model_id: str = None):
+        model_to_use = model_id or self.default_model
+
+        # 🌸 Resolve the bot's CURRENT nickname in guild_id (if we have a
+        # bot reference and a guild) and build personality instructions
+        # from it live — same dynamic system groq_ai.py uses. Falls back
+        # to the default nickname if bot/guild_id is missing or the bot
+        # has no per-guild nickname set yet.
+        nickname = None
+        if self.bot and guild_id:
+            guild = self.bot.get_guild(guild_id)
+            if guild and guild.me:
+                nickname = guild.me.nick
+        personality = get_personality_for_nickname(nickname)
+
+        config = types.GenerateContentConfig(
+            system_instruction=personality,
+            tools=[{"google_search": {}}],
+            temperature=0.7,
+            top_p=0.96,
+            top_k=60,
+        )
+
+        for attempt in range(len(self.api_keys)):
+            try:
+                full_content = prompt
+                if "youtube.com" in prompt or "youtu.be" in prompt:
+                    full_content = f"Please analyze this YouTube link: {prompt}"
+
+                response = self.client.models.generate_content(
+                    model=model_to_use,
+                    contents=full_content,
+                    config=config
+                )
+                return response.text
+
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "quota" in err or "exhausted" in err:
+                    print(f"⚠️ Limit reached on Key #{self.current_key_index + 1}. Waiting...")
+                    time.sleep(5)
+                    self.rotate_key()
+                    continue
+                else:
+                    return f"Service Error: {err}"
+
+        return "Noo!! All my energy cells are empty! 😭 Try again in a bit 🥲 "
+
+
+class EnchantedBot(commands.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(command_prefix="Ct~!", *args, **kwargs)
+
+        self.base_path   = os.path.dirname(os.path.abspath(__file__))
+        self.status_dir  = os.path.join(self.base_path, "status")
+        self.status_file = os.path.join(self.status_dir, "status.json")
+
+        os.makedirs(self.status_dir, exist_ok=True)
+
+        # 🌸 REFACTORED: owner_id now lives in discord_config.json
+        self.owner_id = get_owner_id()
+        if not self.owner_id:
+            print("⚠️ WARNING: owner_id not set in discord_config.json!")
+        self.last_state  = None
+        self.session     = None
+        self.ai          = GeminiService(bot=self)
+        self.groq        = GroqService(bot=self)
+        self.roulette    = RouletteService()
+
+        # 🌸 Groq activity/error log channels — auth/log_channels.txt, one
+        # Discord channel snowflake ID per line. Supports any number of
+        # channels; every configured channel gets BOTH the 429 rate-limit
+        # alerts and the per-message success logs (see _broadcast_log_embed).
+        self.log_channel_ids = self._load_log_channel_ids("auth/log_channels.txt")
+
+        # 🌸 channel_id -> unix timestamp of when Groq priority-reply is
+        # allowed to fire again. Empty/expired = Groq is off cooldown.
+        self.groq_cooldowns = {}
+
+        # 🌸 channel_id -> deque of the last RECENT_EMOJI_MEMORY emoji this
+        # channel auto-reacted with (both Groq-picked and directly-requested
+        # ones — see _record_reaction_emoji). Fed back into get_ai_response
+        # as an "avoid these" list so the bot stops defaulting to the same
+        # emoji (e.g. 🤗) over and over.
+        self.recent_react_emoji = {}
+
+        # 🌸 guild.id -> (unix timestamp fetched, stripped server-info dict)
+        # — see get_server_context_text / GUILD_INFO_CACHE_TTL. Keeps Groq
+        # from triggering a v10 REST call to /guilds/{id} on every single
+        # mention in a server.
+        self.guild_info_cache = {}
+        
+        # 🌸 guild.id -> full guild data (v10 JSON format with channels,
+        # roles, members, etc.). Loaded from cache/guild_data/ on startup.
+        # Provides complete server context to Groq AI.
+        self.guild_cache = {}
+
+        # 🌸 Guards sync_all_guilds() so it only runs once per process —
+        # on_ready can fire more than once (e.g. after a gateway reconnect)
+        # and we don't want to re-chunk + re-save every guild each time.
+        self._initial_guild_sync_done = False
+
+        self.download_dir = "downloads"
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+    def _load_log_channel_ids(self, path: str) -> list[int]:
+        """🌸 Reads one Discord channel snowflake ID per line from `path`.
+        Blank lines and lines starting with '#' are skipped so the file can
+        be commented. Bad/non-numeric lines are warned about and skipped
+        rather than crashing startup."""
+        ids = []
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.isdigit():
+                        ids.append(int(line))
+                    else:
+                        print(f"⚠️ log_channels.txt: skipping invalid line {line!r}")
+        except FileNotFoundError:
+            print(f"⚠️ {path} not found — Groq logging embeds are disabled until it's created.")
+        except Exception as e:
+            print(f"⚠️ Failed to load log channels: {e}")
+        return ids
+
+    async def _broadcast_log_embed(self, embed: discord.Embed):
+        """🌸 Sends `embed` to every channel in self.log_channel_ids.
+        Best-effort per channel — one missing/forbidden channel never stops
+        the loop. Re-raises on critical errors (e.g. HTTP 401/403 from Discord
+        auth), but skips individual 404s silently."""
+        if not self.log_channel_ids:
+            return
+
+        for channel_id in self.log_channel_ids:
+            try:
+                channel = self.get_channel(channel_id)
+                if not channel:
+                    continue
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                print(f"⚠️ log channel {channel_id}: 403 Forbidden (is bot member + has send perms?)")
+            except discord.HTTPException as e:
+                if e.status == 404:
+                    continue
+                raise
+            except Exception as e:
+                print(f"⚠️ log channel {channel_id}: {e}")
+
+    async def sync_guild_to_db(self, guild: discord.Guild):
+        """🌸 Builds a COMPLETE guild_data dict straight from the live
+        discord.py Guild object and persists it into metadata.db/roles.db/
+        channels.db via shared.save_guild_db(). No extra REST calls needed:
+        - guild.created_at is decoded locally from the snowflake ID
+        - guild.roles / guild.channels / guild.members are already
+          populated by the gateway (Intents.all() covers members too, as
+          long as the "Server Members Intent" toggle is also on in the
+          Discord Dev Portal — if it's off, guild.members will just be
+          the bot itself and member_count will still be accurate).
+
+        Previously `load_guild_caches()` was a stub that only ever wrote
+        {"id": ..., "cached_at": ...} into memory and never touched the
+        SQLite files at all — that's why fields like created_at, owner_id,
+        and member_count sat as NULL in metadata.db forever, and why
+        handle_created_query() had nothing to read (see July 2026 "idk the
+        exact date" bug).
+        """
+        try:
+            # Large/lazy guilds may not have their full member list synced
+            # yet — chunk() blocks until the gateway sends every member.
+            if not guild.chunked and self.intents.members:
+                try:
+                    await guild.chunk(cache=True)
+                except Exception as e:
+                    print(f"⚠️ Chunking failed for {guild.name} ({guild.id}): {e}")
+
+            guild_data = {
+                "id": guild.id,
+                "name": guild.name,
+                "owner_id": guild.owner_id,
+                "created_at": guild.created_at.isoformat() if guild.created_at else None,
+                "member_count": guild.member_count,
+                "description": guild.description,
+                "icon": guild.icon.key if guild.icon else None,
+                "banner": guild.banner.key if guild.banner else None,
+                "preferred_locale": str(guild.preferred_locale) if guild.preferred_locale else None,
+                "verification_level": str(guild.verification_level),
+                "default_notifications": str(guild.default_notifications),
+                "explicit_content_filter": str(guild.explicit_content_filter),
+                "mfa_level": str(guild.mfa_level),
+                "nsfw_level": str(guild.nsfw_level),
+                "roles": [
+                    {
+                        "id": r.id,
+                        "name": r.name,
+                        "color": r.color.value,
+                        "hoist": r.hoist,
+                        "position": r.position,
+                        "permissions": str(r.permissions.value),
+                        "managed": r.managed,
+                        "mentionable": r.mentionable,
+                        "icon": r.icon.key if r.icon else None,
+                    }
+                    for r in guild.roles
+                ],
+                "channels": [
+                    {
+                        "id": ch.id,
+                        "name": ch.name,
+                        "type": str(ch.type),
+                        "position": getattr(ch, "position", 0) or 0,
+                        "parent_id": ch.category_id if hasattr(ch, "category_id") else None,
+                        "nsfw": getattr(ch, "nsfw", False),
+                        "topic": getattr(ch, "topic", None),
+                        "slowmode_delay": getattr(ch, "slowmode_delay", None),
+                        "default_auto_archive_duration": getattr(ch, "default_auto_archive_duration", None),
+                        "bitrate": getattr(ch, "bitrate", None),
+                        "user_limit": getattr(ch, "user_limit", None),
+                    }
+                    for ch in guild.channels
+                ],
+                "members": [
+                    {
+                        "id": m.id,
+                        "username": m.name,
+                        "display_name": m.display_name,
+                        "discriminator": m.discriminator,
+                        "avatar": m.avatar.key if m.avatar else None,
+                        "bot": m.bot,
+                        "system": m.system,
+                        "joined_at": m.joined_at.isoformat() if m.joined_at else None,
+                        "nickname": m.nick,
+                        "pending": bool(getattr(m, "pending", False)),
+                        "roles": [r.id for r in m.roles if r.name != "@everyone"],
+                    }
+                    for m in guild.members
+                ],
+            }
+
+            await shared.save_guild_db(guild_data)
+
+            # Lightweight in-memory marker (kept for parity with the old
+            # behavior — the real source of truth is now the SQLite files).
+            self.guild_cache[guild.id] = {
+                "id": guild.id,
+                "cached_at": datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"⚠️ Failed to sync guild {guild.name} ({guild.id}) to DB: {e}")
+
+    async def sync_all_guilds(self):
+        """🌸 Fetches + saves FULL data (metadata, roles, channels, members)
+        for every guild the bot is currently in. Called once from on_ready
+        (guild data isn't reliably available yet during setup_hook, since
+        that runs before the gateway finishes sending GUILD_CREATE events)
+        so metadata.db/roles.db/channels.db are always fresh on boot,
+        instead of relying on whatever partial data got written on-demand
+        (e.g. by /server-info) — possibly months ago, possibly incomplete.
+        """
+        if not self.guilds:
+            print("⚠️ sync_all_guilds: no guilds available yet.")
+            return
+
+        print(f"🔄 Syncing full guild data for {len(self.guilds)} guild(s)...")
+        synced = 0
+        for guild in self.guilds:
+            await self.sync_guild_to_db(guild)
+            synced += 1
+        print(f"✅ Synced {synced}/{len(self.guilds)} guild(s) to metadata.db/roles.db/channels.db")
+
+    def get_server_context_text(self, guild: discord.Guild) -> str:
+        """🌸 Return a lightweight "where am I" identity line for Groq — just
+        server name + member count, NOT the full roles/channels dump. The
+        detailed compact summary (top roles, channels) is pulled from the
+        SQLite cache (metadata.db/roles.db/channels.db) via
+        shared.get_guild_context_summary inside groq_ai.get_ai_response
+        instead, so it's DB-backed and token-efficient rather than a live
+        guild.roles/guild.channels dump that grows unbounded on big servers.
+        """
+        GUILD_INFO_CACHE_TTL = 300  # 5 minutes
+
+        cached = self.guild_info_cache.get(guild.id)
+        now = time.time()
+
+        if cached and (now - cached.get("fetched_at", 0)) < GUILD_INFO_CACHE_TTL:
+            return cached["text"]
+
+        context_text = f"📍 You are currently in **{guild.name}** ({guild.member_count or '?'} members)."
+
+        self.guild_info_cache[guild.id] = {
+            "text": context_text,
+            "fetched_at": now
+        }
+        return context_text
+
+    async def is_reply_to_bot(self, message: discord.Message) -> bool:
+        """🌸 True if `message` is a reply to one of the bot's messages."""
+        if not message.reference:
+            return False
+
+        try:
+            replied_to = await message.channel.fetch_message(message.reference.message_id)
+            return replied_to.author.id == self.user.id
+        except Exception:
+            return False
+
+    async def handle_mention_reaction(self, message: discord.Message):
+        """🌸 Mention / reply reaction handler (e.g. random message roulette).
+        Combines message content + Groq AI response + emoji reaction.
+        """
+        async with message.channel.typing():
+            guild = message.guild
+
+            # 🌸 REGEX INTERCEPTORS — cheap, instant, token-free answers for
+            # specific question shapes, pulled straight from the SQLite
+            # guild cache instead of ever hitting Groq. Falls through to
+            # Groq normally if none match (or no cache yet).
+            if guild:
+                # 🌸 Most specific/rare patterns checked first (avatar, banner,
+                # owner, verification, boosts) so they never get shadowed by the more
+                # general "what is this server" catch-all below.
+                intercepted = await handle_server_avatar_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_server_banner_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_server_owner_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_server_verification_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_member_count_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_server_age_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_boost_status_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_locale_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_server_info_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_channel_count_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_role_list_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_role_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_created_query(message, guild.id, shared)
+                if intercepted:
+                    await message.reply(intercepted, mention_author=False)
+                    return
+
+            # 🌸 Prompt no longer carries the full guild_context dump — the
+            # compact, DB-backed guild summary is now injected inside
+            # groq_ai.get_ai_response via shared.get_guild_context_summary,
+            # so this prompt stays just the user's actual message.
+            prompt = (
+                f"User: {message.author.name}\n"
+                f"Message: {message.content}\n"
+            )
+
+            # ✅ Check if user is asking for a reaction
+            user_asking_for_react = bool(REACT_REQUEST_PATTERN.search(message.content))
+            
+            # ✅ Determine which emoji to suggest (if allowed to react)
+            react_allowed = user_asking_for_react or random.random() < AUTO_REACT_CHANCE
+
+            response = await self.groq.get_ai_response(
+                prompt,
+                username=message.author.name,
+                user_id=message.author.id,
+                display_name=message.author.display_name,
+                guild=message.guild,
+                channel=message.channel,
+                recent_react_emoji=self.recent_react_emoji.get(str(message.channel.id), []),
+                react_allowed=react_allowed,  # ✅ ADDED: Pass react_allowed
+                shared=shared
+            )
+
+            if response:
+                # ✅ Extract and apply emoji reactions BEFORE stripping tags
+                await self._apply_emoji_reactions(message, response)
+                
+                # ✅ Strip [REACT:emoji] tags from response text so they don't show to users
+                clean_response = REACT_TAG_PATTERN.sub("", response).strip()
+                
+                try:
+                    if clean_response:  # Only send if there's content after stripping
+                        reply = await message.reply(
+                            content=clean_response[:2000],
+                            mention_author=False,
+                            suppress_embeds=False
+                        )
+                except discord.HTTPException as e:
+                    print(f"⚠️ Failed to reply: {e}")
+
+    async def _apply_emoji_reactions(self, message: discord.Message, response: str):
+        """🌸 Extract [REACT:emoji] tags from response and apply them to the original message."""
+        try:
+            # Extract emoji from [REACT:emoji] tags
+            match = REACT_TAG_PATTERN.search(response)
+            if match:
+                emoji_str = match.group(1).strip()
+                
+                # Try to react with the emoji
+                try:
+                    await message.add_reaction(emoji_str)
+                    
+                    # ✅ Record this emoji in recent_react_emoji for this channel
+                    channel_id = str(message.channel.id)
+                    if channel_id not in self.recent_react_emoji:
+                        self.recent_react_emoji[channel_id] = []
+                    
+                    # Keep only last N emoji to avoid repeats
+                    self.recent_react_emoji[channel_id].append(emoji_str)
+                    if len(self.recent_react_emoji[channel_id]) > RECENT_EMOJI_MEMORY:
+                        self.recent_react_emoji[channel_id].pop(0)
+                    
+                    print(f"✅ Reacted to {message.author.name}'s message with {emoji_str}")
+                except discord.HTTPException as e:
+                    print(f"⚠️ Failed to add reaction {emoji_str}: {e}")
+        except Exception as e:
+            print(f"⚠️ Error extracting emoji reactions: {e}")
+
+    async def reload_all_modules(self):
+        """🌸 Dynamically reload all custom modules (for development/debugging).
+        Delegates to reload_manager.py so the module list / cog re-registration
+        logic lives in its own file instead of bloating bot_service.py.
+        The /reload slash command (system_commands.py) calls this too."""
+        from reload_manager import reload_all
+        return await reload_all(self)
+
+    @tasks.loop(seconds=1)
+    async def sync_loop(self):
+        """🌸 Periodic sync of bot presence/activity from status.json"""
+        try:
+            # Wait for bot to be ready before attempting to change presence
+            if not self.is_ready():
+                return
+            
+            if not os.path.exists(self.status_file):
+                return
+
+            with open(self.status_file, "r") as f:
+                status_data = json.load(f)
+
+                bubble    = status_data.get("bubble", "")
+                act_type  = status_data.get("type", "custom")
+                act_name  = status_data.get("name", "")
+
+                state_key = f"{bubble}|{act_type}|{act_name}"
+
+                if state_key != self.last_state:
+                    activity = None
+
+                    if act_type == "custom" and bubble:
+                        activity = discord.CustomActivity(name=bubble)
+                    elif act_type == "watching" and act_name:
+                        activity = discord.Activity(type=discord.ActivityType.watching, name=act_name)
+                    elif act_type == "listening" and act_name:
+                        activity = discord.Activity(type=discord.ActivityType.listening, name=act_name)
+                    elif act_type == "streaming" and act_name:
+                        activity = discord.Streaming(name=act_name, url="https://twitch.tv/discord")
+                    elif act_type == "playing" and act_name:
+                        activity = discord.Game(name=act_name)
+                    elif bubble:
+                        activity = discord.CustomActivity(name=bubble)
+
+                    await self.change_presence(activity=activity, status=discord.Status.online)
+                    self.last_state = state_key
+        except Exception as e:
+            print(f"⚠️ Sync Loop Error: {e}")
+
+    async def log_to_inbox(self, message: discord.Message):
+        """🌸 Log mentions and DMs to inbox for record-keeping"""
+        try:
+            # You can implement custom logging logic here
+            pass
+        except Exception as e:
+            print(f"⚠️ Failed to log to inbox: {e}")
+
+    async def download_attachments(self, message: discord.Message):
+        """🌸 Download and store attachments from messages"""
+        try:
+            if not message.attachments:
+                return
+            
+            for attachment in message.attachments:
+                filepath = os.path.join(self.download_dir, attachment.filename)
+                await attachment.save(filepath)
+                print(f"📥 Downloaded: {attachment.filename}")
+        except Exception as e:
+            print(f"⚠️ Failed to download attachments: {e}")
+
+    async def forward_dm_to_channel(self, message: discord.Message):
+        """🌸 Forward DMs to owner's inbox channel"""
+        try:
+            # This forwards DMs to a specific channel
+            # You can set the channel ID in your config
+            inbox_channel_id = None  # Set your inbox channel ID here
+            if not inbox_channel_id:
+                return
+            
+            channel = self.get_channel(inbox_channel_id)
+            if not channel:
+                return
+            
+            embed = discord.Embed(
+                title=f"📬 DM from {message.author}",
+                description=message.content or "(no text)",
+                color=0x3498db,
+                timestamp=datetime.now()
+            )
+            embed.set_author(name=str(message.author), icon_url=message.author.avatar.url if message.author.avatar else None)
+            
+            if message.attachments:
+                embed.add_field(
+                    name="Attachments",
+                    value="\n".join([a.filename for a in message.attachments]),
+                    inline=False
+                )
+            
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"⚠️ Failed to forward DM: {e}")
+
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+
+        is_dm       = isinstance(message.channel, discord.DMChannel)
+        is_mentioned = self.user.mentioned_in(message)
+
+        if is_dm or is_mentioned:
+            await self.log_to_inbox(message)
+            if message.attachments:
+                await self.download_attachments(message)
+
+        # 📬 Forward DMs to owner inbox channel
+        if is_dm:
+            await self.forward_dm_to_channel(message)
+
+        # ✅ msg_cache now lives in shared.py
+        cid = str(message.channel.id)
+        if cid not in shared.msg_cache:
+            shared.msg_cache[cid] = []
+        shared.msg_cache[cid].insert(0, message)
+        shared.msg_cache[cid] = shared.msg_cache[cid][:5]
+
+        if message.author.id == self.owner_id:
+            if message.content == "!sync":
+                try:
+                    await self.tree.sync()
+                    await message.channel.send("🧹 **Bridge Re-Synced!**")
+                except Exception as e:
+                    await message.channel.send(f"❌ Sync failed: {e}")
+
+            elif message.content == "!reload":
+                # 🌸 DEPRECATED: Use /reload slash command instead
+                try:
+                    summary = await self.reload_all_modules()
+                    await self.tree.sync()
+                    n_ok  = len(summary["modules_reloaded"])
+                    n_bad = len(summary["modules_failed"])
+                    status = f"✅ **{n_ok} modules reloaded**"
+                    if n_bad:
+                        status += f" • ⚠️ {n_bad} failed: `{', '.join(summary['modules_failed'])}`"
+                    status += "\n✅ **Commands synced!** 🌸✨\n\n💡 **Tip:** Use `/reload` slash command instead of `!reload` 💕"
+                    await message.channel.send(status)
+                    print(f"🔄 Full refresh completed via !reload by {message.author} at {datetime.now().strftime('%H:%M:%S')}")
+                except Exception as e:
+                    await message.channel.send(f"❌ **Reload/Sync Failed:** `{str(e)[:100]}` 🥺")
+
+        # 🎲 Mention / reply-to-bot reaction — random message roulette
+        # (single shared typing pulse for the whole flow)
+        if is_mentioned or await self.is_reply_to_bot(message):
+            await self.handle_mention_reaction(message)
+
+        await self.process_commands(message)
+
+    async def on_ready(self):
+        """🌸 Fires once the gateway handshake is complete and self.guilds
+        is actually populated — this is the earliest point a full guild
+        data sync is possible. Runs in the background (not awaited here)
+        so a big/slow guild chunking doesn't hold up anything else."""
+        print(f"🌸 Logged in as {self.user} — {len(self.guilds)} guild(s) connected.")
+
+        if not self._initial_guild_sync_done:
+            self._initial_guild_sync_done = True
+            asyncio.create_task(self.sync_all_guilds())
+
+    async def on_guild_join(self, guild: discord.Guild):
+        """🌸 Sync a newly-joined guild's data immediately instead of
+        waiting for the bot to restart before metadata.db/roles.db/
+        channels.db know it exists."""
+        print(f"➕ Joined new guild: {guild.name} ({guild.id}) — syncing...")
+        await self.sync_guild_to_db(guild)
+
+    async def setup_hook(self):
+        """🌸 Setup hook — runs once on startup before connecting."""
+        connector    = aiohttp.TCPConnector(limit=10, force_close=True, enable_cleanup_closed=True)
+        self.session = aiohttp.ClientSession(connector=connector)
+
+        # 🌸 Full guild data sync (metadata/roles/channels/members) now
+        # happens in on_ready instead — self.guilds is still empty here,
+        # since setup_hook runs before the gateway sends GUILD_CREATE.
+
+        # Register all cogs via the new discord_commands module
+        await register_all_cogs(self)
+
+        print("⏳ Syncing Bridge Commands...")
+        
+        # 🌸 REFACTORED: Test guild ID now lives in discord_config.json
+        TEST_GUILD_ID = get_test_guild_id()
+        if TEST_GUILD_ID:
+            try:
+                synced_guild = await self.tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+                print(f"\n✅ Commands Synced to Test Guild (ID: {TEST_GUILD_ID})!")
+                print(f"📊 Total: {len(synced_guild)} commands\n")
+                for i, cmd in enumerate(synced_guild, 1):
+                    print(f"  {i:2d}. 🌸 /{cmd.name:<30} (ID: {cmd.id})")
+            except Exception as e:
+                print(f"⚠️ Test guild sync failed: {e}")
+        else:
+            print("⚠️ No test_guild_id configured in discord_config.json")
+        
+        # 🌍 Global sync
+        try:
+            synced = await self.tree.sync()
+            print(f"\n✅ Synced {len(synced)} commands globally!")
+            print(f"📊 Command Summary:")
+            for i, cmd in enumerate(synced, 1):
+                print(f"  {i:2d}. /{cmd.name:<30} (ID: {cmd.id})")
+        except Exception as e:
+            print(f"⚠️ Global sync failed: {e}")
+        
+        self.sync_loop.start()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--token",
+        required=False,
+        help="Optional: path to a token file to override key_config.DISCORD_TOKEN.",
+    )
+    args = parser.parse_args()
+
+    try:
+        if args.token:
+            with open(args.token, "r") as f:
+                tkn = f.read().strip()
+        else:
+            tkn = key_config.DISCORD_TOKEN
+
+        if not tkn:
+            raise RuntimeError(
+                "No Discord token found — set DISCORD_TOKEN in auth/key_config.py "
+                "or pass --token pointing at a token file."
+            )
+
+        bot = EnchantedBot(intents=discord.Intents.all())
+        bot.run(tkn, reconnect=True)
+    except Exception as e:
+        print(f"❌ Startup Error: {e}")
