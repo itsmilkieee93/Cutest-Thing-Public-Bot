@@ -101,7 +101,7 @@ class PhotoEditorCog(commands.Cog):
         await loading_msg.edit(embed=embed, attachments=[file])
 
     # ── /editimage ───────────────────────────────────────────────────────────
-    @app_commands.command(name="editimage", description="Edit an image 🌸✨")
+    @app_commands.command(name="edit-image", description="Edit an image 🌸✨")
     @app_commands.describe(
         image="The image to edit",
         filter="Optional filter to apply",

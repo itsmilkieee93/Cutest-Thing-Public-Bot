@@ -1,0 +1,104 @@
+"""
+🌸 gemini_service.py
+GeminiService — wraps the Google Gemini API with API-key rotation and
+dynamic per-guild personality (see personality.py).
+
+Extracted out of bot_service.py so Gemini logic lives in its own file,
+same as GroqService (groq_ai.py) and RouletteService (roulette.py).
+"""
+
+import time
+import random
+from google import genai
+from google.genai import types
+
+import key_config  # already on sys.path via bot_service.py's auth/ insert
+from personality import get_personality_for_nickname
+
+
+class GeminiService:
+    def __init__(self, bot=None):
+        # 🌸 Back-reference to the bot so we can resolve the CURRENT
+        # per-guild nickname for dynamic personality (see personality.py).
+        # May be None if constructed standalone — get_ai_response falls
+        # back to the default nickname in that case.
+        self.bot = bot
+
+        self.api_keys          = list(key_config.GEMINI_API_KEYS)
+        self.current_key_index = 0
+
+        if self.api_keys:
+            self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
+        else:
+            print("❌ ERROR: No API keys found in key_config.GEMINI_API_KEYS!")
+
+        self.default_model = "gemma-4-26b-a4b-it"
+        print(f"🌸 Cutest Thing is online with {len(self.api_keys)} hearts (API Keys)!")
+
+    def rotate_key(self):
+        if len(self.api_keys) <= 1:
+            time.sleep(random.uniform(5, 12))
+            return
+
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        new_key = self.api_keys[self.current_key_index]
+        self.client = genai.Client(api_key=new_key)
+        print(f"🔄 Swapping to API Key #{self.current_key_index + 1}...")
+        time.sleep(random.uniform(5, 12))
+
+    def get_ai_response(
+        self,
+        prompt: str,
+        guild_id: int = None,
+        model_id: str = None,
+        personality_override: str = None,
+    ):
+        model_to_use = model_id or self.default_model
+
+        # 🌸 Resolve the bot's CURRENT nickname in guild_id (if we have a
+        # bot reference and a guild) and build personality instructions
+        # from it live — same dynamic system groq_ai.py uses. Falls back
+        # to the default nickname if bot/guild_id is missing or the bot
+        # has no per-guild nickname set yet.
+        if personality_override and personality_override.strip():
+            personality = personality_override.strip()
+        else:
+            nickname = None
+            if self.bot and guild_id:
+                guild = self.bot.get_guild(guild_id)
+                if guild and guild.me:
+                    nickname = guild.me.nick
+            personality = get_personality_for_nickname(nickname)
+
+        config = types.GenerateContentConfig(
+            system_instruction=personality,
+            tools=[{"google_search": {}}],
+            temperature=0.7,
+            top_p=0.96,
+            top_k=60,
+        )
+
+        for attempt in range(len(self.api_keys)):
+            try:
+                full_content = prompt
+                if "youtube.com" in prompt or "youtu.be" in prompt:
+                    full_content = f"Please analyze this YouTube link: {prompt}"
+
+                response = self.client.models.generate_content(
+                    model=model_to_use,
+                    contents=full_content,
+                    config=config
+                )
+                return response.text
+
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "quota" in err or "exhausted" in err:
+                    print(f"⚠️ Limit reached on Key #{self.current_key_index + 1}. Waiting...")
+                    time.sleep(5)
+                    self.rotate_key()
+                    continue
+                else:
+                    return f"Service Error: {err}"
+
+        return "Noo!! All my energy cells are empty! 😭 Try again in a bit 🥲 "

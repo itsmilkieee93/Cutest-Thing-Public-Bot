@@ -141,7 +141,7 @@ class PexelsCog(commands.Cog):
 
     # ── /pexels photo ──────────────────────────────────────────────────────────
     @pexels.command(
-        name="pexels-photo",
+        name="photo",
         description="Fetch a random photo from Pexels! 🖼️✨"
     )
     @app_commands.describe(
