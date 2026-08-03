@@ -53,14 +53,18 @@ def _result_embed(
     interaction: discord.Interaction,
     title: str,
     response_text: str,
+    footer_note: str = "",
 ) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=response_text,
         color=random.choice(PASTEL_COLORS),
     )
+    footer_text = f"Requested by {interaction.user.display_name}"
+    if footer_note:
+        footer_text += f" • {footer_note}"
     embed.set_footer(
-        text=f"Requested by {interaction.user.display_name}",
+        text=footer_text,
         icon_url=interaction.user.display_avatar.url,
     )
     return embed
@@ -78,10 +82,29 @@ def _error_embed(message: str) -> discord.Embed:
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.choices(model=MODEL_CHOICES)
-async def gemini_cmd(interaction: discord.Interaction, model: str = DEFAULT_MODEL, *, prompt: str):
+@app_commands.describe(
+    thinking="Enable thinking mode (only applied if the chosen model supports it) 🧠",
+    no_personality="Disable the bot's personality for this reply (neutral, no character) 🎭",
+)
+async def gemini_cmd(
+    interaction: discord.Interaction,
+    model: str = DEFAULT_MODEL,
+    thinking: bool = False,
+    no_personality: bool = False,
+    *,
+    prompt: str,
+):
     await interaction.response.defer()
+
+    # 🌸 Let the user know upfront if thinking was requested but the model
+    # they picked doesn't actually support it, instead of silently ignoring it.
+    thinking_supported = interaction.client.ai.model_supports_thinking(model)
+    loading_desc = "Consulting the AI, one moment! ✨\n\nHang tight... 💕"
+    if thinking and not thinking_supported:
+        loading_desc += f"\n\n⚠️ *Thinking mode isn't supported on `{model}` — continuing without it.*"
+
     loading_msg = await interaction.followup.send(
-        embed=_loading_embed("🧠 Thinking...", "Consulting the AI, one moment! ✨\n\nHang tight... 💕"),
+        embed=_loading_embed("🧠 Thinking...", loading_desc),
         wait=True,
     )
     try:
@@ -90,7 +113,13 @@ async def gemini_cmd(interaction: discord.Interaction, model: str = DEFAULT_MODE
         history.append({"role": "user", "content": prompt})
 
         response_text = await asyncio.to_thread(
-            interaction.client.ai.get_ai_response, prompt, interaction.guild_id, model
+            interaction.client.ai.get_ai_response,
+            prompt,
+            interaction.guild_id,
+            model,
+            None,           # personality_override
+            thinking,       # enable_thinking
+            no_personality, # disable_personality
         )
 
         history.append({"role": "assistant", "content": response_text})
@@ -98,18 +127,27 @@ async def gemini_cmd(interaction: discord.Interaction, model: str = DEFAULT_MODE
 
         await bridge_log(interaction, "gemini", prompt, response_text)
 
+        footer_bits = []
+        if thinking and thinking_supported:
+            footer_bits.append("🧠 Thinking on")
+        if no_personality:
+            footer_bits.append("🎭 Personality off")
+        footer_note = " • ".join(footer_bits)
+
         if len(response_text) > 4096:
             # Embed descriptions cap at 4096 chars — chunk into multiple embeds
             chunks = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
             await loading_msg.edit(
-                embed=_result_embed(interaction, "🌸 Gemini Response (1/{})".format(len(chunks)), chunks[0])
+                embed=_result_embed(
+                    interaction, "🌸 Gemini Response (1/{})".format(len(chunks)), chunks[0], footer_note
+                )
             )
             for idx, chunk in enumerate(chunks[1:], start=2):
                 await interaction.channel.send(
-                    embed=_result_embed(interaction, f"🌸 Gemini Response ({idx}/{len(chunks)})", chunk)
+                    embed=_result_embed(interaction, f"🌸 Gemini Response ({idx}/{len(chunks)})", chunk, footer_note)
                 )
         else:
-            await loading_msg.edit(embed=_result_embed(interaction, "🌸 Gemini Response", response_text))
+            await loading_msg.edit(embed=_result_embed(interaction, "🌸 Gemini Response", response_text, footer_note))
     except Exception as e:
         await loading_msg.edit(embed=_error_embed(f"`{str(e)[:200]}`"))
 
@@ -117,15 +155,27 @@ async def gemini_cmd(interaction: discord.Interaction, model: str = DEFAULT_MODE
 @app_commands.command(name="gemini-reply", description="Make Gemini reply to a specific message! 🎯")
 @app_commands.autocomplete(message_id=reply_to_autocomplete)
 @app_commands.choices(model=MODEL_CHOICES)
+@app_commands.describe(
+    thinking="Enable thinking mode (only applied if the chosen model supports it) 🧠",
+    no_personality="Disable the bot's personality for this reply (neutral, no character) 🎭",
+)
 async def ai_reply_cmd(
     interaction: discord.Interaction,
     message_id:  str,
     instruction: str = "Reply naturally.",
     model:       str = DEFAULT_MODEL,
+    thinking:    bool = False,
+    no_personality: bool = False,
 ):
     await interaction.response.defer(ephemeral=True)
+
+    thinking_supported = interaction.client.ai.model_supports_thinking(model)
+    loading_desc = "Reading the message and drafting a reply! ✨\n\nHang tight... 💕"
+    if thinking and not thinking_supported:
+        loading_desc += f"\n\n⚠️ *Thinking mode isn't supported on `{model}` — continuing without it.*"
+
     loading_msg = await interaction.followup.send(
-        embed=_loading_embed("🎯 Preparing reply...", "Reading the message and drafting a reply! ✨\n\nHang tight... 💕"),
+        embed=_loading_embed("🎯 Preparing reply...", loading_desc),
         wait=True,
         ephemeral=True,
     )
@@ -138,26 +188,40 @@ async def ai_reply_cmd(
 
         # 🌸 No need to load/inject personality manually here — get_ai_response
         # already builds it dynamically (from the bot's current per-guild
-        # nickname, see personality.py) and sets it as the system_instruction.
+        # nickname, see personality.py) and sets it as the system_instruction —
+        # unless no_personality is set, in which case it's skipped entirely.
         ai_prompt = (
             f"CONTEXT: Replying to {target_message.author.name}: \"{target_message.content}\"\n"
             f"USER DIRECTION: {instruction}"
         )
         response_text = await asyncio.to_thread(
-            interaction.client.ai.get_ai_response, ai_prompt, interaction.guild_id, model
+            interaction.client.ai.get_ai_response,
+            ai_prompt,
+            interaction.guild_id,
+            model,
+            None,           # personality_override
+            thinking,       # enable_thinking
+            no_personality, # disable_personality
         )
 
         await bridge_log(interaction, "ai-reply", f"ID: {message_id} | Instr: {instruction}", response_text)
 
+        footer_bits = []
+        if thinking and thinking_supported:
+            footer_bits.append("🧠 Thinking on")
+        if no_personality:
+            footer_bits.append("🎭 Personality off")
+        footer_note = " • ".join(footer_bits)
+
         if len(response_text) > 4096:
             chunks = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
-            await target_message.reply(embed=_result_embed(interaction, "🌸 Reply (1/{})".format(len(chunks)), chunks[0]))
+            await target_message.reply(embed=_result_embed(interaction, "🌸 Reply (1/{})".format(len(chunks)), chunks[0], footer_note))
             for idx, chunk in enumerate(chunks[1:], start=2):
                 await interaction.channel.send(
-                    embed=_result_embed(interaction, f"🌸 Reply ({idx}/{len(chunks)})", chunk)
+                    embed=_result_embed(interaction, f"🌸 Reply ({idx}/{len(chunks)})", chunk, footer_note)
                 )
         else:
-            await target_message.reply(embed=_result_embed(interaction, "🌸 Reply", response_text))
+            await target_message.reply(embed=_result_embed(interaction, "🌸 Reply", response_text, footer_note))
 
         await loading_msg.edit(embed=_result_embed(interaction, "✅ Sent!", "Your reply has been posted! 💕"))
     except Exception as e:

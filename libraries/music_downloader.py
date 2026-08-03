@@ -45,7 +45,7 @@ os.makedirs('temp', exist_ok=True)
 logger = logging.getLogger('MusicDownloader')
 logger.setLevel(logging.INFO)
 handler = logging.FileHandler(
-    '/sdcard/script/bot/log/music_downloader.log', encoding='utf-8'
+    'log/music_downloader.log', encoding='utf-8'
 )
 handler.setFormatter(logging.Formatter(
     '[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'

@@ -15,7 +15,7 @@ BOT = {
     # Multiple owner/trusted-user IDs, all granted the same owner-only
     # permissions as owner_id above. Add as many snowflakes as you want —
     # e.g. co-developers, a trusted mod, an alt account for testing.
-    "owner_ids": [1165555555268567040, 1234567890123456789],
+    "owner_ids": [1165555555268567040, 813617286127550485],
 
     # Server used for instant slash-command syncing during development.
     # Guild syncs are instant; global syncs can take up to 1 hour to propagate.

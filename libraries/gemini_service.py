@@ -35,6 +35,25 @@ class GeminiService:
         self.default_model = "gemma-4-26b-a4b-it"
         print(f"🌸 Cutest Thing is online with {len(self.api_keys)} hearts (API Keys)!")
 
+    # 🌸 Thinking-mode compatibility per model.
+    # Not every model on the /gemini command exposes a thinking budget —
+    # the fast Gemma 4 26B A4B (MoE) build doesn't support it, the dense
+    # Gemma 4 31B does, and the Gemini Flash-Lite tiers don't expose it
+    # either. Keep this map updated as new models get added to MODEL_CHOICES.
+    THINKING_CAPABLE_MODELS = {
+        "gemma-4-26b-a4b-it":    False,
+        "gemma-4-31b-it":        True,
+        "gemini-3.1-flash-lite": False,
+        "gemini-3.5-flash-lite": False,
+    }
+
+    @classmethod
+    def model_supports_thinking(cls, model_id: str) -> bool:
+        """🌸 Whether the given model_id supports a thinking_config.
+        Unknown models default to False so we never send an unsupported
+        param and blow up the request."""
+        return cls.THINKING_CAPABLE_MODELS.get(model_id, False)
+
     def rotate_key(self):
         if len(self.api_keys) <= 1:
             time.sleep(random.uniform(5, 12))
@@ -52,15 +71,21 @@ class GeminiService:
         guild_id: int = None,
         model_id: str = None,
         personality_override: str = None,
+        enable_thinking: bool = False,
+        disable_personality: bool = False,
     ):
         model_to_use = model_id or self.default_model
 
+        # 🌸 disable_personality wins outright — no system_instruction at all,
+        # for when someone wants a raw/neutral response with zero character.
+        if disable_personality:
+            personality = None
         # 🌸 Resolve the bot's CURRENT nickname in guild_id (if we have a
         # bot reference and a guild) and build personality instructions
         # from it live — same dynamic system groq_ai.py uses. Falls back
         # to the default nickname if bot/guild_id is missing or the bot
         # has no per-guild nickname set yet.
-        if personality_override and personality_override.strip():
+        elif personality_override and personality_override.strip():
             personality = personality_override.strip()
         else:
             nickname = None
@@ -70,13 +95,26 @@ class GeminiService:
                     nickname = guild.me.nick
             personality = get_personality_for_nickname(nickname)
 
-        config = types.GenerateContentConfig(
-            system_instruction=personality,
+        config_kwargs = dict(
             tools=[{"google_search": {}}],
             temperature=0.7,
             top_p=0.96,
             top_k=60,
         )
+        if personality:
+            config_kwargs["system_instruction"] = personality
+
+        # 🌸 Only attach a thinking_config when both the caller asked for it
+        # AND the chosen model actually supports it — otherwise we'd send a
+        # param the model rejects. Silently skipped when unsupported rather
+        # than erroring, since the caller may not know per-model support.
+        if enable_thinking and self.model_supports_thinking(model_to_use):
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                include_thoughts=False,
+                thinking_budget=-1,  # 🌸 dynamic/auto budget
+            )
+
+        config = types.GenerateContentConfig(**config_kwargs)
 
         for attempt in range(len(self.api_keys)):
             try:

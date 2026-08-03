@@ -56,6 +56,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ─────────────────────────────────────────────────────────────────────────────
 from libraries import *
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌐 Network watchdog config — Termux wifi↔mobile-data handoffs can leave
+# aiohttp's TCPConnector holding dead sockets without ever raising a clean
+# error (they just hang), so this probes real connectivity independently
+# of discord.py/aiohttp and recycles the session once it's back.
+# ─────────────────────────────────────────────────────────────────────────────
+NETWORK_PROBE_HOSTS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("discord.com", 443)]
+NETWORK_CHECK_ONLINE_INTERVAL = 30   # seconds between checks while healthy
+NETWORK_CHECK_OFFLINE_MIN = 5        # first retry after a drop
+NETWORK_CHECK_OFFLINE_MAX = 30       # backoff cap while still offline
+
 
 class EnchantedBot(commands.Bot):
     def __init__(self, *args, **kwargs):
@@ -113,6 +124,10 @@ class EnchantedBot(commands.Bot):
         self.download_dir = "downloads"
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
+
+        # 🌐 Network watchdog state — see network_watchdog() below
+        self._net_online = True
+        self._net_offline_backoff = NETWORK_CHECK_OFFLINE_MIN
 
     def _load_log_channel_ids(self, path: str) -> list[int]:
         """🌸 Reads one Discord channel snowflake ID per line from `path`.
@@ -490,6 +505,82 @@ class EnchantedBot(commands.Bot):
         except Exception as e:
             print(f"⚠️ Sync Loop Error: {e}")
 
+    async def _probe_internet(self) -> bool:
+        """🌐 Raw TCP probe, deliberately NOT using self.session — a wedged
+        aiohttp connector (stale sockets after a Termux wifi↔data handoff)
+        would otherwise report 'online' even while every real request just
+        hangs. Tries each host in NETWORK_PROBE_HOSTS until one connects."""
+        for host, port in NETWORK_PROBE_HOSTS:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=4
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _recover_after_reconnect(self):
+        """🌐 Runs once, right when connectivity flips offline → online.
+        Recycles self.session's connector (old sockets can be silently
+        dead after the interface switch) so Groq/Gemini/media calls stop
+        hanging on connections that look alive but aren't."""
+        try:
+            old_session = self.session
+            connector = aiohttp.TCPConnector(limit=10, force_close=True, enable_cleanup_closed=True)
+            self.session = aiohttp.ClientSession(connector=connector)
+            if old_session and not old_session.closed:
+                await old_session.close()
+            print("🌐🔄 aiohttp session recycled after reconnect.")
+        except Exception as e:
+            print(f"⚠️ Failed to recycle session after reconnect: {e}")
+
+        # discord.py's own gateway (bot.run(..., reconnect=True)) already
+        # retries the websocket with its own backoff — this just reports
+        # whether it's caught back up yet, no manual relogin needed.
+        if self.is_closed():
+            print("⚠️ Discord gateway still closed — waiting on discord.py's own reconnect loop.")
+        elif not self.is_ready():
+            print("⏳ Discord gateway not ready yet post-reconnect — waiting...")
+        else:
+            print("✅ Discord gateway confirmed alive post-reconnect.")
+
+    @tasks.loop(seconds=NETWORK_CHECK_OFFLINE_MIN)
+    async def network_watchdog(self):
+        """🌐 Detects wifi/data drops and retries until connectivity comes
+        back, then triggers recovery. Checks fast (backing off up to
+        NETWORK_CHECK_OFFLINE_MAX) while offline, and relaxes to
+        NETWORK_CHECK_ONLINE_INTERVAL once healthy again."""
+        try:
+            online = await self._probe_internet()
+
+            if online:
+                if not self._net_online:
+                    print("🌐✅ Internet back (wifi/data reconnected) — recovering...")
+                    await self._recover_after_reconnect()
+                self._net_online = True
+                self._net_offline_backoff = NETWORK_CHECK_OFFLINE_MIN
+                self.network_watchdog.change_interval(seconds=NETWORK_CHECK_ONLINE_INTERVAL)
+            else:
+                if self._net_online:
+                    print("🌐⚠️ Internet lost (wifi/data disconnected) — retrying...")
+                self._net_online = False
+                self._net_offline_backoff = min(
+                    self._net_offline_backoff * 2, NETWORK_CHECK_OFFLINE_MAX
+                )
+                self.network_watchdog.change_interval(seconds=self._net_offline_backoff)
+        except Exception as e:
+            print(f"⚠️ Network watchdog error: {e}")
+
+    @network_watchdog.before_loop
+    async def before_network_watchdog(self):
+        await self.wait_until_ready()
+
     async def log_to_inbox(self, message: discord.Message):
         """🌸 Log mentions and DMs to inbox for record-keeping"""
         try:
@@ -654,6 +745,7 @@ class EnchantedBot(commands.Bot):
             print(f"⚠️ Global sync failed: {e}")
         
         self.sync_loop.start()
+        self.network_watchdog.start()
 
 
 if __name__ == "__main__":
