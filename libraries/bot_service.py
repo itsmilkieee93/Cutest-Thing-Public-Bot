@@ -57,15 +57,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from libraries import *
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🌐 Network watchdog config — Termux wifi↔mobile-data handoffs can leave
-# aiohttp's TCPConnector holding dead sockets without ever raising a clean
-# error (they just hang), so this probes real connectivity independently
-# of discord.py/aiohttp and recycles the session once it's back.
+# 🌐 Network watchdog config — an interface change (Termux wifi↔mobile-data
+# handoff, Windows sleep/wake, a Linux box's ethernet flapping, VPN toggles,
+# etc.) can leave aiohttp's TCPConnector holding dead sockets without ever
+# raising a clean error — they just hang. This probes real connectivity with
+# plain asyncio TCP (no OS-specific APIs, works the same on Android/Termux,
+# Windows, and Linux/Ubuntu) independently of discord.py/aiohttp, and
+# recycles the session once it's back.
 # ─────────────────────────────────────────────────────────────────────────────
 NETWORK_PROBE_HOSTS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("discord.com", 443)]
 NETWORK_CHECK_ONLINE_INTERVAL = 30   # seconds between checks while healthy
 NETWORK_CHECK_OFFLINE_MIN = 5        # first retry after a drop
 NETWORK_CHECK_OFFLINE_MAX = 30       # backoff cap while still offline
+
+# 🌸 Same IS_TERMUX detection pattern already used elsewhere (ffmpeg
+# mediacodec flag, aria2c check) — only used here to word log messages
+# accurately per platform, doesn't change any actual probing logic.
+IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "")
+NET_LABEL = "wifi/data" if IS_TERMUX else "network"
+
+# 🔔 Reply-ping policy — pings ONLY the person being replied to (the
+# trigger). @everyone/@here and role mentions never notify anyone even if
+# they somehow end up in the reply text, and neither do any OTHER user
+# mentions the AI-generated text might contain (accidental @-ing a
+# bystander). Shared by every message.reply() call in handle_mention_reaction.
+SAFE_REPLY_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True)
 
 
 class EnchantedBot(commands.Bot):
@@ -372,7 +388,7 @@ class EnchantedBot(commands.Bot):
                 if intercepted is None:
                     intercepted = await handle_created_query(message, guild.id, shared)
                 if intercepted:
-                    await message.reply(intercepted, mention_author=False)
+                    await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                     return
 
             # 🌸 Prompt no longer carries the full guild_context dump — the
@@ -413,7 +429,8 @@ class EnchantedBot(commands.Bot):
                     if clean_response:  # Only send if there's content after stripping
                         reply = await message.reply(
                             content=clean_response[:2000],
-                            mention_author=False,
+                            mention_author=True,
+                            allowed_mentions=SAFE_REPLY_MENTIONS,
                             suppress_embeds=False
                         )
                 except discord.HTTPException as e:
@@ -507,9 +524,11 @@ class EnchantedBot(commands.Bot):
 
     async def _probe_internet(self) -> bool:
         """🌐 Raw TCP probe, deliberately NOT using self.session — a wedged
-        aiohttp connector (stale sockets after a Termux wifi↔data handoff)
-        would otherwise report 'online' even while every real request just
-        hangs. Tries each host in NETWORK_PROBE_HOSTS until one connects."""
+        aiohttp connector (stale sockets after an interface change, e.g.
+        Termux wifi↔data, Windows sleep/wake, Linux link flap) would
+        otherwise report 'online' even while every real request just hangs.
+        Tries each host in NETWORK_PROBE_HOSTS until one connects. Uses
+        plain asyncio, so this works identically on every platform."""
         for host, port in NETWORK_PROBE_HOSTS:
             try:
                 reader, writer = await asyncio.wait_for(
@@ -528,8 +547,8 @@ class EnchantedBot(commands.Bot):
     async def _recover_after_reconnect(self):
         """🌐 Runs once, right when connectivity flips offline → online.
         Recycles self.session's connector (old sockets can be silently
-        dead after the interface switch) so Groq/Gemini/media calls stop
-        hanging on connections that look alive but aren't."""
+        dead after the interface switch, on any OS) so Groq/Gemini/media
+        calls stop hanging on connections that look alive but aren't."""
         try:
             old_session = self.session
             connector = aiohttp.TCPConnector(limit=10, force_close=True, enable_cleanup_closed=True)
@@ -561,14 +580,14 @@ class EnchantedBot(commands.Bot):
 
             if online:
                 if not self._net_online:
-                    print("🌐✅ Internet back (wifi/data reconnected) — recovering...")
+                    print(f"🌐✅ Internet back ({NET_LABEL} reconnected) — recovering...")
                     await self._recover_after_reconnect()
                 self._net_online = True
                 self._net_offline_backoff = NETWORK_CHECK_OFFLINE_MIN
                 self.network_watchdog.change_interval(seconds=NETWORK_CHECK_ONLINE_INTERVAL)
             else:
                 if self._net_online:
-                    print("🌐⚠️ Internet lost (wifi/data disconnected) — retrying...")
+                    print(f"🌐⚠️ Internet lost ({NET_LABEL} disconnected) — retrying...")
                 self._net_online = False
                 self._net_offline_backoff = min(
                     self._net_offline_backoff * 2, NETWORK_CHECK_OFFLINE_MAX
