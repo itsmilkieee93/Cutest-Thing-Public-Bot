@@ -25,7 +25,7 @@ from groq_instruct import (
     IDENTITY_INSTRUCTIONS, DM_CONTEXT_INSTRUCTIONS,
     REACT_TAG_PATTERN, REACT_REQUEST_PATTERN, EXPLICIT_EMOJI_PATTERN,
     REACT_EMOJI_POOL, RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
-    _build_react_instructions, _strip_reasoning,
+    _build_react_instructions, _strip_reasoning, _build_owner_status,
     _check_base64_for_severe_terms, _contains_severe_term
 )
 
@@ -457,6 +457,7 @@ class GroqService:
         identity         = IDENTITY_INSTRUCTIONS.format(
             display_name=display_name or username,
             username=username,
+            owner_status=_build_owner_status(user_id),
         )
         if react_allowed:
             # 🌸 Pick a random example emoji that ISN'T one of this

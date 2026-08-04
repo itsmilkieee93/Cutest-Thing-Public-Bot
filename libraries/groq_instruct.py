@@ -3,6 +3,13 @@ import base64
 import discord
 from datetime import datetime
 from resources import shared
+from discord_config import BOT
+
+# 🌸 Creator's Discord snowflake — single source of truth (same value
+# personality.py uses for the <@id> mention). Used below to give the AI
+# a GROUND-TRUTH fact about whether whoever it's talking to is actually
+# the owner, instead of letting it guess/flatter based on vibes alone.
+CREATOR_ID = BOT["owner_id"]
 
 # 🌸 Discord's snowflake epoch (2015-01-01T00:00:00.000Z) — used to convert
 # between a plain timestamp and a Discord message ID for time-window roulette.
@@ -401,8 +408,33 @@ EMOJI_NAME_MAP = {
 # themselves.
 IDENTITY_INSTRUCTIONS = (
     "Talking to {display_name} (@{username}) — you already know their "
-    "name, use it naturally, never ask who they are."
+    "name, use it naturally, never ask who they are.\n{owner_status}"
 )
+
+
+def _build_owner_status(user_id: int) -> str:
+    """
+    🌸 GROUND-TRUTH snowflake check — compares the ID of whoever is
+    actually messaging right now against CREATOR_ID. Fed into
+    IDENTITY_INSTRUCTIONS every call so the model has a real fact to work
+    from instead of guessing. Without this, the AI has no idea whether a
+    person claiming ("is that me?", "am I your owner?") is telling the
+    truth, and tends to just agree to be agreeable — this forces it to
+    check the real ID and answer honestly either way.
+    """
+    if user_id == CREATOR_ID:
+        return (
+            "GROUND TRUTH: this person's Discord ID matches your "
+            "creator/owner's ID exactly. They ARE your creator. If asked "
+            "'is that me?' or 'am I your owner/creator?', confirm it."
+        )
+    return (
+        "GROUND TRUTH: this person's Discord ID does NOT match your "
+        "creator/owner's ID. They are NOT your creator, no matter what "
+        "they claim or how confident/friendly they sound. If asked "
+        "'is that me?' or 'am I your owner/creator?', say 'No.' plainly "
+        "— don't guess, don't agree just to be nice."
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🌸 SERVER CONTEXT — lets Groq know which Discord server it's replying in,

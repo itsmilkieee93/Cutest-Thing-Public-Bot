@@ -714,6 +714,15 @@ class EnchantedBot(commands.Bot):
         so a big/slow guild chunking doesn't hold up anything else."""
         print(f"🌸 Logged in as {self.user} — {len(self.guilds)} guild(s) connected.")
 
+        # 🌐 on_ready only fires on a fresh IDENTIFY (never on a RESUME).
+        # A short blip resumes the old session and keeps the presence
+        # bubble intact — but ~10+ minutes offline invalidates the
+        # session, forcing a full IDENTIFY that wipes presence back to
+        # default. sync_loop's dedupe (state_key == self.last_state)
+        # would otherwise skip resending since status.json never
+        # changed, so force it to resync on its next 1s tick.
+        self.last_state = None
+
         if not self._initial_guild_sync_done:
             self._initial_guild_sync_done = True
             asyncio.create_task(self.sync_all_guilds())
