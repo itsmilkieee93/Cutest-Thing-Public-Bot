@@ -395,9 +395,14 @@ class EnchantedBot(commands.Bot):
             # compact, DB-backed guild summary is now injected inside
             # groq_ai.get_ai_response via shared.get_guild_context_summary,
             # so this prompt stays just the user's actual message.
+            # 🌸 clean_content resolves mentions to readable @names/#channels
+            # instead of raw <@123456789012345> snowflakes — without this the
+            # AI sees unreadable numeric IDs and starts narrating that it
+            # "can't see who that tag is pointing to" instead of just
+            # replying to the actual message.
             prompt = (
                 f"User: {message.author.name}\n"
-                f"Message: {message.content}\n"
+                f"Message: {message.clean_content}\n"
             )
 
             # ✅ Check if user is asking for a reaction

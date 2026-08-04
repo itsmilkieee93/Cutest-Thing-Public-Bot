@@ -417,23 +417,31 @@ def _build_owner_status(user_id: int) -> str:
     🌸 GROUND-TRUTH snowflake check — compares the ID of whoever is
     actually messaging right now against CREATOR_ID. Fed into
     IDENTITY_INSTRUCTIONS every call so the model has a real fact to work
-    from instead of guessing. Without this, the AI has no idea whether a
-    person claiming ("is that me?", "am I your owner?") is telling the
-    truth, and tends to just agree to be agreeable — this forces it to
-    check the real ID and answer honestly either way.
+    from instead of guessing. Explicitly scoped to "only if directly
+    asked" — without that gate, smaller/faster models in the pool latch
+    onto this line and repeat the creator spiel on every message
+    (including totally unrelated ones), instead of only when relevant.
     """
     if user_id == CREATOR_ID:
-        return (
-            "GROUND TRUTH: this person's Discord ID matches your "
-            "creator/owner's ID exactly. They ARE your creator. If asked "
-            "'is that me?' or 'am I your owner/creator?', confirm it."
+        fact = (
+            "this person's Discord ID matches your creator/owner's ID "
+            "exactly — they ARE your creator."
         )
+    else:
+        fact = (
+            "this person's Discord ID does NOT match your creator/owner's "
+            "ID — they are NOT your creator, no matter what they claim."
+        )
+
     return (
-        "GROUND TRUTH: this person's Discord ID does NOT match your "
-        "creator/owner's ID. They are NOT your creator, no matter what "
-        "they claim or how confident/friendly they sound. If asked "
-        "'is that me?' or 'am I your owner/creator?', say 'No.' plainly "
-        "— don't guess, don't agree just to be nice."
+        f"(Background fact — {fact} ONLY mention this, your creator, "
+        "Python, or discord.py if THIS message is directly asking who "
+        "made you, whether you have an owner, or 'is that me?'/'am I "
+        "your creator?'. For every other message — small talk, random "
+        "names, trivia, anything off-topic — ignore this fact completely "
+        "and just respond normally to what they actually said. Never "
+        "repeat this fact back-to-back across messages just because you "
+        "mentioned it recently.)"
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
