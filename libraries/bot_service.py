@@ -40,6 +40,7 @@ from groq_instruct import (
     _build_react_instructions, EMOJI_NAME_MAP
 )
 from groq_ai import GroqService
+from groq_pexels import handle_pexels_photo_request
 from roulette import RouletteService
 from discord_commands import register_all_cogs
 from resources import shared
@@ -387,6 +388,10 @@ class EnchantedBot(commands.Bot):
                     intercepted = await handle_role_query(message, guild.id, shared)
                 if intercepted is None:
                     intercepted = await handle_created_query(message, guild.id, shared)
+                if intercepted is None:
+                    # 🌸 "send/show/find/get me a pic of X" — raw Pexels CDN
+                    # link, Discord auto-embeds it (suppress_embeds=False below).
+                    intercepted = await handle_pexels_photo_request(message, guild.id, shared)
                 if intercepted:
                     await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                     return
