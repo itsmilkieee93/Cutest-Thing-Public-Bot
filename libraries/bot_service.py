@@ -40,7 +40,7 @@ from groq_instruct import (
     _build_react_instructions, EMOJI_NAME_MAP
 )
 from groq_ai import GroqService
-from groq_pexels import handle_pexels_photo_request
+from groq_pexels import handle_media_request
 from roulette import RouletteService
 from discord_commands import register_all_cogs
 from resources import shared
@@ -389,11 +389,21 @@ class EnchantedBot(commands.Bot):
                 if intercepted is None:
                     intercepted = await handle_created_query(message, guild.id, shared)
                 if intercepted is None:
-                    # 🌸 "send/show/find/get me a pic of X" — raw Pexels CDN
-                    # link, Discord auto-embeds it (suppress_embeds=False below).
-                    intercepted = await handle_pexels_photo_request(message, guild.id, shared)
+                    # 🌸 AI-classified media request — one Groq call decides
+                    # if this is "send me a pic/video/vector/cartoon of X",
+                    # then dispatches to Pexels (photo/video) or Pixabay
+                    # (vector/cartoon) and returns a discord.Embed with the
+                    # image set via set_image() — no raw link text visible,
+                    # unlike the old bare-URL auto-embed approach.
+                    intercepted = await handle_media_request(message, guild.id, shared)
                 if intercepted:
-                    await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                    # 🌸 handle_media_request returns a discord.Embed (image
+                    # embedded cleanly, no visible link); every other
+                    # interceptor above returns a plain string reply.
+                    if isinstance(intercepted, discord.Embed):
+                        await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                    else:
+                        await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                     return
 
             # 🌸 Prompt no longer carries the full guild_context dump — the
