@@ -348,6 +348,105 @@ class EnchantedBot(commands.Bot):
         except Exception:
             return False
 
+    @staticmethod
+    def _extract_message_text(msg: discord.Message) -> str:
+        """🌸 Pulls readable text out of a discord.Message regardless of
+        whether the bot sent it as plain content or an embed — the
+        server-info/avatar/owner/etc. interceptors in this file all reply
+        with discord.Embed, not plain text, so msg.content alone would be
+        empty for those. Joins embed title/description/fields into one
+        flat string so it reads naturally when dropped into a prompt.
+        Used by _reply_to_bot_context below to give Groq the ACTUAL
+        content of an old bot message when that message was never saved
+        into Groq's own memory.db (true for every interceptor reply,
+        since they short-circuit BEFORE get_ai_response is ever called —
+        see handle_mention_reaction).
+        """
+        parts = []
+        if msg.content:
+            parts.append(msg.content.strip())
+
+        for embed in msg.embeds:
+            if embed.title:
+                parts.append(embed.title.strip())
+            if embed.description:
+                parts.append(embed.description.strip())
+            for field in embed.fields:
+                name  = (field.name or "").strip()
+                value = (field.value or "").strip()
+                if name or value:
+                    parts.append(f"{name}: {value}".strip(": "))
+
+        return "\n".join(p for p in parts if p).strip()
+
+    async def _reply_to_bot_context(self, message: discord.Message) -> tuple[int | None, str | None]:
+        """🌸 Returns (message_id, text) for the bot message `message` is
+        replying to — the snowflake to anchor Groq's random memory slice
+        around (see groq_ai.get_ai_response's reply_to_message_id param),
+        and the ACTUAL readable content of that old message as a
+        fallback for when it was never saved into Groq's own memory.db
+        at all — true for every interceptor reply (avatar/owner/server-info/
+        media/etc. in handle_mention_reaction above), since those
+        short-circuit and reply BEFORE get_ai_response is ever called, so
+        they have no history row to anchor onto. See groq_ai's FALLBACK
+        CONTEXT block for how reply_to_message_text gets used in that
+        case. Returns (None, None) if this isn't a reply-to-bot at all.
+
+        🌸 FAST PATH: message.reference.resolved is already populated by
+        discord.py for most replies (Discord sends the replied-to message
+        inline with the gateway payload) — checked FIRST to skip the
+        extra fetch_message() API call. Falls through to fetch_message()
+        only when resolved is missing/stale (very old message discord.py's
+        cache dropped, or a discord.DeletedReferencedMessage stub).
+
+        🌸 TRIGGER RESOLUTION: bot replies are always sent via
+        message.reply(...), so replied_to.reference (if present) points
+        back to the ORIGINAL user message that triggered it — the actual
+        question ("The Earth Diameter is", "give me an anime image") that
+        produced this bot answer. Without this, the fallback text is just
+        the bot's half of the exchange ("about 12,742 km" on its own,
+        with no clue what "12,742 km" is even an answer TO). We resolve
+        that trigger the same resolved-first/fetch-fallback way and
+        prepend it, so the fallback context reads as a full Q→A pair
+        instead of a dangling answer.
+        """
+        ref = message.reference
+        if not ref or not ref.message_id:
+            return None, None
+
+        resolved = ref.resolved
+        replied_to = resolved if isinstance(resolved, discord.Message) else None
+
+        if replied_to is None:
+            try:
+                replied_to = await message.channel.fetch_message(ref.message_id)
+            except Exception:
+                return None, None
+
+        if replied_to.author.id != self.user.id:
+            return None, None
+
+        answer_text = self._extract_message_text(replied_to)
+
+        # 🌸 Walk one hop further back: what user message did THIS bot
+        # message reply to? If found, prepend it so the fallback shows
+        # the question and the answer together.
+        trigger_ref = replied_to.reference
+        if trigger_ref and trigger_ref.message_id:
+            trigger_msg = trigger_ref.resolved if isinstance(trigger_ref.resolved, discord.Message) else None
+            if trigger_msg is None:
+                try:
+                    trigger_msg = await message.channel.fetch_message(trigger_ref.message_id)
+                except Exception:
+                    trigger_msg = None
+
+            if trigger_msg is not None and trigger_msg.author.id != self.user.id:
+                question_text = self._extract_message_text(trigger_msg)
+                if question_text:
+                    answer_text = f"{trigger_msg.author.display_name} asked: {question_text}\nAnswer: {answer_text}"
+
+        return replied_to.id, answer_text
+
     async def handle_mention_reaction(self, message: discord.Message):
         """🌸 Mention / reply reaction handler (e.g. random message roulette).
         Combines message content + Groq AI response + emoji reaction.
@@ -426,6 +525,19 @@ class EnchantedBot(commands.Bot):
             # ✅ Determine which emoji to suggest (if allowed to react)
             react_allowed = user_asking_for_react or random.random() < AUTO_REACT_CHANCE
 
+            # 🌸 If this message is a reply to an OLD bot message (not just
+            # the newest one in the channel), grab that bot message's
+            # snowflake AND its actual text/embed content in one pass.
+            # The snowflake anchors Groq's random memory slice around
+            # that point in time; the text is the FALLBACK for when that
+            # old message was never saved into Groq's memory at all —
+            # true for every interceptor reply (avatar/owner/server-info/
+            # etc. above), since those short-circuit and return BEFORE
+            # get_ai_response is ever called, so they have no history row
+            # to anchor onto. See groq_ai.get_ai_response's fallback
+            # context block for how reply_to_message_text gets used.
+            reply_to_message_id, reply_to_message_text = await self._reply_to_bot_context(message)
+
             response = await self.groq.get_ai_response(
                 prompt,
                 username=message.author.name,
@@ -435,7 +547,10 @@ class EnchantedBot(commands.Bot):
                 channel=message.channel,
                 recent_react_emoji=self.recent_react_emoji.get(str(message.channel.id), []),
                 react_allowed=react_allowed,  # ✅ ADDED: Pass react_allowed
-                shared=shared
+                shared=shared,
+                message_id=message.id,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_message_text=reply_to_message_text,
             )
 
             if response:

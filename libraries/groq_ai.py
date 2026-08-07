@@ -406,7 +406,7 @@ class GroqService:
             print(f"⚠️ Output safeguard check error (failing open): {e}")
             return True
 
-    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, model_id: str = None, react_allowed: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None) -> str | None:
+    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, model_id: str = None, react_allowed: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
         stalls the bot's event loop. Loads this user's saved chat history
@@ -429,6 +429,27 @@ class GroqService:
         `react_allowed` gates whether Groq is told it may emit a
         [REACT:...] tag this turn at all — see REACT_REQUEST_PATTERN /
         AUTO_REACT_CHANCE where the caller decides this.
+
+        🌸 SNOWFLAKE-ANCHORED MEMORY: `message_id` is this user message's
+        own Discord snowflake (message.id) and `reply_to_message_id` is
+        the snowflake of the bot message THIS message is replying to (if
+        any — see bot_service.is_reply_to_bot / message.reference). Every
+        turn saved to history now carries its own "message_id", so when
+        someone replies to an old bot message instead of just chatting in
+        the current thread, the random recent-history window below is
+        anchored to END at that old point in time instead of always
+        grabbing the newest tail — see the slicing block for details.
+
+        🌸 FALLBACK CONTEXT: `reply_to_message_text` is the ACTUAL text/
+        embed content of that replied-to bot message, extracted straight
+        from Discord by bot_service._reply_to_bot_context — independent
+        of whether it's in Groq's memory at all. Needed because interceptor
+        replies (avatar/owner/server-info/media/etc. in handle_mention_reaction)
+        never go through get_ai_response, so they never get saved to
+        history and can never be found by the anchor search below. When
+        that search comes up empty but reply_to_message_text is non-empty,
+        that raw text gets injected directly into the prompt instead —
+        see the FALLBACK CONTEXT block right after the anchor search.
         """
         if not self.client:
             return None
@@ -506,6 +527,25 @@ class GroqService:
         ) if guild and guild_summary else ""
         
         personality      = f"{personality}\n\n{react_directives}\n\n{identity}\n\n{server_context}\n\n{server_override}\n{guild_summary}".strip()
+        if reply_to_message_id is not None:
+            # 🌸 Only added when the user actually swiped-replied to an old
+            # bot message — tells Groq how to read the [REPLYING TO THIS]
+            # flags that may appear in recent_history below. Covers BOTH
+            # cases: a real anchored exchange found in memory, and the
+            # FALLBACK CONTEXT pseudo-turn appended when the replied-to
+            # message was an interceptor reply never saved to history
+            # (see the slicing block below). Either way, by the time this
+            # instruction matters a flagged turn is present in
+            # recent_history — if somehow neither fired (e.g. the
+            # replied-to message had zero extractable text), this is just
+            # harmless unused instruction text.
+            anchor_instructions = (
+                "⚠️ The user replied directly to one specific earlier message, marked with "
+                "[REPLYING TO THIS ⬇️] and [THIS IS THE MESSAGE BEING REPLIED TO] tags below. "
+                "Treat THAT exchange as the primary context for their current message — not "
+                "whatever else appears nearby in the history."
+            )
+            personality = f"{personality}\n\n{anchor_instructions}"
         # 🌸 user_id here is always the Discord snowflake ID of whoever
         # actually pinged/replied to the bot (passed straight through from
         # message.author.id in on_message / handle_mention_reaction), so
@@ -522,12 +562,91 @@ class GroqService:
         # user_id's shared history) to Groq to keep input tokens small and
         # vary the model's context a bit turn to turn. `history` itself
         # stays FULL (up to 200 turns) — it's what gets appended to and
-        # saved back to bot_history.db below, so nothing is lost from
-        # long-term memory. `recent_history` is just the window actually
-        # sent to the API this call: random.randint(0, 5) * 2 gives an
-        # even count of 0, 2, 4, 6, 8, or 10 messages.
-        recent_turn_count = random.randint(1, 6) * 2
-        recent_history    = history[-recent_turn_count:] if recent_turn_count else []
+        # saved back to memory.db below, so nothing is lost from long-term
+        # memory. `recent_history` is just the window actually sent to
+        # the API this call: random.randint(2, 8) * 2 gives an even count
+        # of 4, 6, 8, 10, 12, 14, or 16 messages.
+        #
+        # 🌸 ANCHOR POINT: normally the window is just the newest tail of
+        # `history` (someone continuing the live conversation). But if
+        # `reply_to_message_id` is set — meaning the user swiped up and
+        # replied to an OLD bot message instead of the most recent one —
+        # we instead anchor the window to END right after that old
+        # assistant turn, so the random slice pulls the messages
+        # surrounding THAT point in time rather than today's tail. This
+        # only works for turns saved after this feature shipped (they
+        # carry a "message_id" key); older turns without one are just
+        # skipped when searching for the anchor, so nothing crashes on
+        # legacy rows — it just falls back to normal tail slicing.
+        recent_turn_count = random.randint(2, 8) * 2
+        anchor_end = len(history)
+
+        if reply_to_message_id is not None:
+            for idx in range(len(history) - 1, -1, -1):
+                turn = history[idx]
+                if (
+                    turn.get("role") == "assistant"
+                    and turn.get("message_id") == reply_to_message_id
+                ):
+                    # 🌸 +1 so the slice INCLUDES this assistant turn
+                    # itself (and its matching user turn right before
+                    # it), not just everything strictly older than it.
+                    anchor_end = idx + 1
+                    break
+            # 🌸 If no match is found (message too old to still be in the
+            # last 200 saved turns, or it predates this feature), anchor_end
+            # just stays len(history) — same behavior as before, no crash.
+
+        window_start   = max(0, anchor_end - recent_turn_count)
+
+        # 🌸 HIGHLIGHT FLAG: when there's a real anchor (reply_to_message_id
+        # matched something in history), tag the anchored user+assistant
+        # pair so Groq can tell "this exact exchange is what they're
+        # replying to" apart from the rest of the window, which is just
+        # loose surrounding context. Without this, a window that happens
+        # to sandwich the anchor next to something more recent/salient
+        # (e.g. a GitHub link exchange saved right after it) can pull
+        # Groq's attention toward the WRONG turn — it has no way to know
+        # which pair in the flat list is the one actually being replied
+        # to. anchor_start marks where the flagged pair begins (usually
+        # anchor_end - 2, i.e. the user turn immediately followed by the
+        # assistant turn that matched reply_to_message_id).
+        is_anchored  = reply_to_message_id is not None and anchor_end != len(history)
+        anchor_start = anchor_end - 2 if is_anchored else None
+
+        recent_history = []
+        for i, t in enumerate(history[window_start:anchor_end], start=window_start):
+            content = t["content"]
+            if is_anchored and i == anchor_start:
+                content = f"[REPLYING TO THIS ⬇️] {content}"
+            elif is_anchored and i == anchor_start + 1:
+                content = f"[THIS IS THE MESSAGE BEING REPLIED TO] {content}"
+            recent_history.append({"role": t["role"], "content": content})
+
+        # 🌸 FALLBACK CONTEXT: fires when this WAS a genuine reply-to-bot
+        # (reply_to_message_id is set) but the anchor search above found
+        # NOTHING in Groq's memory — meaning the replied-to message was
+        # never saved as a history turn at all. This is true for every
+        # interceptor reply (avatar/owner/verification/server-info/media/
+        # etc. in bot_service.handle_mention_reaction) since those
+        # short-circuit and reply BEFORE get_ai_response is ever called.
+        # Without this, "summarize it" replying to a server-info embed
+        # would fall back to plain tail slicing and Groq would answer
+        # about whatever's in today's tail instead (e.g. its own GitHub
+        # self-intro) — see the screenshots that prompted this fix.
+        # Injected as its own flagged pseudo-turn at the END of
+        # recent_history (appended, not spliced into `history` — this
+        # never gets saved back to memory.db, it's request-only) so it
+        # reads the same way to Groq as a real anchored exchange above.
+        if (
+            reply_to_message_id is not None
+            and not is_anchored
+            and reply_to_message_text
+        ):
+            recent_history.append({
+                "role": "assistant",
+                "content": f"[THIS IS THE MESSAGE BEING REPLIED TO] {reply_to_message_text}",
+            })
 
         def _call():
             # 1. Buat parameter dasar yang selalu digunakan semua model
@@ -538,7 +657,11 @@ class GroqService:
                     *recent_history,
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.7,
+                # 🌸 Randomized per-call (0.10-0.99, 2 decimal places) so
+                # replies aren't stuck at one fixed creativity level every
+                # turn — same spirit as max_tokens below already varying
+                # per call. round() to 2dp keeps the value clean in logs.
+                "temperature": round(random.uniform(0.10, 0.99), 2),
                 "max_tokens": random.randint(100, 1000),
             }
 
@@ -591,8 +714,19 @@ class GroqService:
                     # 🌸 Full prompt+response transcript → log/groq_ai.log
                     self._log_ai_transcript(username, user_id, model_to_use, guild, channel, prompt, reply)
 
-                history.append({"role": "user", "content": prompt})
-                history.append({"role": "assistant", "content": reply})
+                # 🌸 message_id on the user turn = this incoming message's
+                # own snowflake. The assistant turn doesn't have its sent
+                # message's snowflake yet at this point (message.reply()
+                # hasn't happened — that's back in bot_service.py), so it's
+                # tagged with the SAME message_id as the user turn it's
+                # replying to. That's enough for the anchor search above:
+                # replying to a bot message later just needs to match
+                # message_id somewhere on an "assistant" row, and since the
+                # user+assistant pair share one id, a reply targeting
+                # either the user's message or the bot's reply resolves to
+                # the same anchor point.
+                history.append({"role": "user", "content": prompt, "message_id": message_id})
+                history.append({"role": "assistant", "content": reply, "message_id": message_id})
                 await shared.save_groq_memory(model_to_use, username, user_id, history[-200:], guild_id)
 
                 # 🌸 Success log — fired for EVERY completed Groq reply, not

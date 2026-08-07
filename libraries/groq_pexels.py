@@ -488,10 +488,14 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
         "q":           query,
         "image_type":  image_type,
         "safesearch":  "true",
-        # 🌸 Randomize sort order so repeated requests for the same
-        # query don't always surface the same top hits — Pixabay only
-        # accepts "popular" or "latest" here (no third mode).
-        "order":       random.choice(["popular", "latest"]),
+        # 🌸 Always "popular" — NOT randomized between popular/latest
+        # anymore. "latest" pulls from Pixabay's newest uploads, which is
+        # a much less curated pool (anyone can upload/tag loosely), and
+        # was the main source of off-topic/low-quality results slipping
+        # through (e.g. a random 3D render surfacing for an anime query).
+        # Variety now comes purely from the random page + aspect-ratio
+        # pick below, without sacrificing result relevance.
+        "order":       "popular",
         "per_page":    per_page,
     }
 
@@ -551,6 +555,17 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             logger.info(f"No Pixabay {image_type} hits found for query '{query}'")
             return None
 
+        # 🌸 Quality floor: even under order="popular", a deep random page
+        # can land on hits with near-zero engagement — often mistagged or
+        # off-topic uploads (a big source of the "sometimes weird image"
+        # problem). Prefer hits with at least a modest number of likes
+        # when the batch has any; if literally everything on this page is
+        # low-engagement (a genuinely niche query), fall back to using
+        # all of them rather than returning nothing.
+        MIN_LIKES = 5
+        well_liked = [h for h in hits if (h.get("likes") or 0) >= MIN_LIKES]
+        candidates = well_liked if well_liked else hits
+
         # 🌸 Pick whichever hit has the aspect ratio closest to a mild
         # landscape (1.3:1) rather than always taking hits[0] — Pixabay
         # illustrations/vectors are very often tall portraits (aspect
@@ -565,7 +580,7 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             h = hit.get("webformatHeight") or 1
             return abs((w / h) - TARGET_ASPECT)
 
-        hit = min(hits, key=_aspect_score)
+        hit = min(candidates, key=_aspect_score)
         hit_id = hit.get("id")
 
         # 🌸 Prefer webformatURL over largeImageURL/vectorURL for Discord
