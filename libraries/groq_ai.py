@@ -493,13 +493,14 @@ class GroqService:
             react_directives = REACT_INSTRUCTIONS_DISALLOWED
 
         # 🌸 Server context — pulled from the v10 REST API and cached (see
-        # EnchantedBot.get_server_context_text) so Groq always knows what
-        # server it's replying in, same idea as IDENTITY_INSTRUCTIONS but
-        # for "where" instead of "who". Falls back to DM_CONTEXT_INSTRUCTIONS
-        # when guild is None, or "" if there's no bot back-reference at all
-        # (e.g. running this service standalone outside EnchantedBot).
-        if self.bot:
-            server_context = self.bot.get_server_context_text(guild)
+        # GroqMentionService.get_server_context_text in groq_service.py) so
+        # Groq always knows what server it's replying in, same idea as
+        # IDENTITY_INSTRUCTIONS but for "where" instead of "who". Falls
+        # back to DM_CONTEXT_INSTRUCTIONS when guild is None, or "" if
+        # there's no bot back-reference at all (e.g. running this service
+        # standalone outside EnchantedBot).
+        if self.bot and getattr(self.bot, "groq_mentions", None):
+            server_context = self.bot.groq_mentions.get_server_context_text(guild)
         else:
             server_context = DM_CONTEXT_INSTRUCTIONS if guild is None else ""
 
