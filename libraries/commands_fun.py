@@ -4,6 +4,7 @@ import random
 import json
 import aiohttp
 from resources.shared import bridge_log, joke_emojis, quote_emojis
+from config_loader import is_owner
 
 # =====================================================================
 # 🔴 GLOBAL COMMAND: /joke-unf  (needs a View, so defined at module level)
@@ -77,6 +78,39 @@ async def joke_unf(interaction: discord.Interaction, category: str = "Any", publ
         await interaction.response.defer(ephemeral=True)
     except discord.errors.NotFound:
         return
+
+    # 🔒 Server + channel gate — bot owner bypasses everything below.
+    if not is_owner(interaction.user.id):
+        guild = interaction.guild
+
+        if guild is None:
+            await interaction.followup.send(
+                "🚫 **Unavailable here.** `/joke-unf` can only be used in a server marked "
+                "**NSFW / Age-Restricted / Explicit**, inside an age-restricted channel.",
+                ephemeral=True
+            )
+            return
+
+        server_is_explicit = guild.nsfw_level in (
+            discord.NSFWLevel.explicit,
+            discord.NSFWLevel.age_restricted,
+        )
+        if not server_is_explicit:
+            await interaction.followup.send(
+                "🚫 **Server Not Eligible.** This server isn't marked **NSFW / Age-Restricted / Explicit** "
+                "in Discord's Server Settings, so `/joke-unf` is disabled here.",
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not getattr(channel, "nsfw", False):
+            await interaction.followup.send(
+                "🚫 **Wrong Channel.** This server qualifies, but `/joke-unf` must be run in an "
+                "**age-restricted (NSFW) channel**. 🔞",
+                ephemeral=True
+            )
+            return
 
     status = "🌐 PUBLIC" if public else "🔐 PRIVATE (EPHEMERAL)"
     embed  = discord.Embed(

@@ -27,30 +27,42 @@ Design:
       * vector -> Pixabay ?image_type=vector
       * cartoon (illustration/clipart/drawing/sketch/animated) ->
         Pixabay ?image_type=illustration
+        
+  (2026 update: video results went BACK to a plain str — a bare .mp4
+  CDN link, no embed wrapper, no caption. Discord's own crawler renders
+  a native inline video player for a bare link; wrapping it in a
+  discord.Embed just produces a broken/blank image box since embeds
+  don't support a true playable video field. See _build_video_reply().)
   - 45% of the time (CAPTION_CHANCE), a short cute one-liner from a second
-    quick Groq call becomes the embed's description (images) or is
-    prepended above the bare link (video — Discord embeds can't play
-    video via set_image, so video replies stay a plain text + link
-    message like before). The rest of the time it's just the bare image/
-    embed or bare video link, no caption.
-  - Photo/vector/cartoon results are returned as a discord.Embed with the
-    image URL set via set_image() — this renders the image cleanly with
-    NO raw link text visible in the message (unlike a bare-URL reply,
-    where Discord shows the link text above its own auto-generated
-    embed). Video results are returned as a plain string (bare .mp4 CDN
-    link, optionally with a caption line above it) since Discord embeds
-    don't support playable video — only a raw link/attachment triggers
-    Discord's native video player.
-  - Pexels: photo["src"]["large2x"] for photos, a direct .mp4
-    video_files link for videos. Pixabay: hit["webformatURL"], falling
-    back to hit["largeImageURL"]/hit["vectorURL"].
+    quick Groq call becomes the embed's description. Photo/vector/
+    cartoon only — video has no caption at all now.
+  - Photo (Pexels) / vector / cartoon (Pixabay) results are returned as a
+    discord.Embed — set_image() (no raw link text visible, unlike a
+    bare-URL reply where Discord shows the link text above its own
+    auto-generated embed). Both providers now get Discord-style linked
+    attribution: embed.title links to the original post (Pexels photo
+    page / Pixabay pageURL) and embed.set_author() links the
+    photographer's/uploader's name to their profile, with an avatar icon
+    when the provider has one (Pixabay only — Pexels has no avatar
+    field). Pexels photos additionally use avg_color as the embed's
+    accent color instead of the flat kawaii pink.
+  - Video results are a bare str (the direct .mp4 link) — see
+    _build_video_reply().
+  - Pexels: photo["src"]["large2x"] for the image, photo["url"] for the
+    post link, photo["photographer"]/["photographer_url"] for the
+    author byline, photo["avg_color"] for the embed accent color, and a
+    direct .mp4 video_files link for videos. Pixabay: hit["webformatURL"]
+    for the image (falling back to hit["largeImageURL"]/["vectorURL"]),
+    hit["pageURL"] for the post link, hit["user"]/["user_id"] for the
+    author byline (profile URL is built manually — Pixabay doesn't
+    return one), hit["userImageURL"] for the author avatar.
   - Returns None if classification says "not a media request", the
     relevant API key is missing, the request fails, or nothing is found —
     caller falls through to the next interceptor / Groq's full reply as
-    normal. Otherwise returns EITHER a discord.Embed (photo/vector/
-    cartoon) or a plain str (video) — bot_service.py's reply site must
-    branch on isinstance(intercepted, discord.Embed) to know whether to
-    call message.reply(embed=...) or message.reply(content=...).
+    normal. Otherwise returns a discord.Embed (photo/vector/cartoon) or a
+    bare str (video) — bot_service.py's reply site must check
+    isinstance(intercepted, discord.Embed) to decide between
+    message.reply(embed=...) and message.reply(content=...).
 
 Pixabay notes:
   - Auth is a `key` query param, NOT a header (different from Pexels).
@@ -228,16 +240,17 @@ CAPTION_SYSTEM_PROMPT = (
 )
 
 
-async def _maybe_caption_text(query: str, kind: str) -> str | None:
-    """🌸 With CAPTION_CHANCE probability, asks Groq for a short cute
-    caption. Returns the caption string, or None if the dice roll didn't
-    hit / Groq call failed / result was empty — callers decide what to
-    do with a None (image path puts it in the embed description if
-    present; video path prepends it above the bare link if present).
+async def _maybe_caption_text(query: str, kind: str, force: bool = False) -> str | None:
+    """🌸 With CAPTION_CHANCE probability (or always, if force=True), asks
+    Groq for a short cute caption. Returns the caption string, or None if
+    the dice roll didn't hit / Groq call failed / result was empty —
+    callers decide what to do with a None (image path puts it in the
+    embed description if present; video path prepends it above the bare
+    link if present).
 
     kind is used only for the log line / prompt phrasing.
     """
-    if random.random() >= CAPTION_CHANCE:
+    if not force and random.random() >= CAPTION_CHANCE:
         return None
 
     client = _get_groq_client()
@@ -265,34 +278,80 @@ async def _maybe_caption_text(query: str, kind: str) -> str | None:
         return None
 
 
-async def _build_image_embed(query: str, image_url: str, kind: str) -> discord.Embed:
+async def _build_image_embed(
+    query: str,
+    image_url: str,
+    kind: str,
+    post_url: str | None = None,
+    post_title: str | None = None,
+    author_name: str | None = None,
+    author_url: str | None = None,
+    author_avatar_url: str | None = None,
+    color: int = 0xFFB6D9,
+    provider: str = "Pexels",
+) -> discord.Embed:
     """🌸 Builds a discord.Embed with the image set via set_image() — this
     is what actually hides the raw link text; a bare-URL reply always
     shows the link above Discord's own auto-embed, but embed.set_image()
     renders the image with nothing else visible. The optional cute
     caption (per CAPTION_CHANCE) becomes the embed description instead
     of a prepended text line.
+
+    Attribution — rewritten to satisfy Pexels' literal required phrasing
+    ("Photo by [Name] on Pexels", linked to the photo page) as ONE
+    unified, immediately-visible credit line rather than splitting the
+    name and the "on Pexels"/"on Pixabay" part across embed.title and
+    embed.set_author() the way this used to work. A reviewer (or a user)
+    glancing at the embed without clicking anything now sees the full
+    phrase at once, in embed.set_author():
+      - name  -> "Photo by {author_name} on {provider}" (or "Image by
+        ..." for Pixabay/vector/cartoon, since those aren't literally
+        "photos").
+      - url   -> the photo/post page itself (post_url, e.g. the Pexels
+        /photo/... page), NOT the photographer's profile — Pexels'
+        guideline is specifically "with a link to the photo page on
+        Pexels", not to the profile. This is also more useful to a user
+        wanting to see the original.
+      - icon_url -> author_avatar_url when the provider has one
+        (Pixabay's userImageURL; Pexels has no avatar field).
+    embed.title is no longer used for attribution at all — it's freed up
+    for the caption/description to do its normal job, so the credit line
+    can't be mistaken for a generic title.
     """
     caption = await _maybe_caption_text(query, kind)
+
     embed = discord.Embed(
         description=caption if caption else None,
-        color=0xFFB6D9,  # 🌸 soft pink, matches the kawaii branding
+        color=color,
     )
+
+    if author_name and post_url:
+        noun = "Photo" if provider == "Pexels" else "Image"
+        embed.set_author(
+            name=f"{noun} by {author_name} on {provider}",
+            url=post_url,
+            icon_url=author_avatar_url or None,
+        )
+    elif author_name:
+        # 🌸 Fallback if a post_url is somehow missing — still show the
+        # required phrase, just without it being a clickable link.
+        noun = "Photo" if provider == "Pexels" else "Image"
+        embed.set_author(name=f"{noun} by {author_name} on {provider}")
+
     embed.set_image(url=image_url)
     return embed
 
 
-async def _maybe_caption_video_text(query: str, video_url: str) -> str:
-    """🌸 Video results can't use discord.Embed.set_image() (Discord
-    embeds don't support a playable video field the way set_image works
-    for stills) — only a raw link or file attachment triggers Discord's
-    native video player. So video replies stay a plain string: optional
-    cute caption line above the bare .mp4 CDN link, same as before.
+async def _build_video_reply(query: str, video_url: str) -> str:
+    """🌸 Video results are sent as a BARE .mp4 CDN link — no
+    discord.Embed wrapper, no AI caption, no CAPTION_CHANCE roll. Discord
+    embeds don't support a playable video field the way set_image() works
+    for stills (set_image() on a .mp4 just renders blank/broken), so the
+    only way to get Discord's native inline video player is a plain link
+    with nothing else around it. Returning a bare str (not a discord.Embed)
+    is what triggers that — the caller sends it as message content.
     """
-    caption = await _maybe_caption_text(query, "video")
-    if not caption:
-        return video_url
-    return f"{caption}\n{video_url}"
+    return video_url
 
 
 # ── Auth helpers ────────────────────────────────────────────────────────
@@ -314,6 +373,65 @@ def _get_pixabay_key() -> str | None:
     return key or None
 
 
+# ── Pexels photographer avatar lookup ──────────────────────────────────────
+#
+# 🌸 The Pexels API's Photo object does NOT include an avatar field (only
+# photographer / photographer_id / photographer_url) — confirmed against
+# their documented schema. The avatar image DOES exist on-CDN at
+# images.pexels.com/users/avatars/{photographer_id}/{slug}-{n}.jpeg, but
+# the {slug}-{n} part isn't derivable from anything the API gives us, so
+# it can't be constructed — it has to be read off the photographer's
+# public profile page (which photographer_url already points to).
+#
+# Cached per photographer_id so this is a one-time cost per photographer,
+# not a per-photo-request cost — most queries will re-hit a handful of
+# popular photographers repeatedly. Failures (missing id, page fetch
+# error, no <img> match) are cached as None too, so a photographer with
+# no parseable avatar doesn't get re-fetched on every future request for
+# them either.
+_avatar_cache: dict[int, str | None] = {}
+_AVATAR_IMG_RE = re.compile(
+    r'https://images\.pexels\.com/users/avatars/\d+/[^"\'\s]+\.(?:jpe?g|png)'
+)
+
+
+async def _get_pexels_avatar_url(photographer_id: int | None, profile_url: str | None) -> str | None:
+    """🌸 Best-effort fetch of a photographer's avatar CDN URL by scraping
+    their public Pexels profile page for the first images.pexels.com/
+    users/avatars/... URL. Returns None on any failure — this is purely
+    cosmetic (an icon next to the credit line), never something that
+    should block or fail the actual embed."""
+    if not photographer_id or not profile_url:
+        return None
+
+    if photographer_id in _avatar_cache:
+        return _avatar_cache[photographer_id]
+
+    avatar_url = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                profile_url,
+                timeout=aiohttp.ClientTimeout(total=6),
+                headers={"User-Agent": "Mozilla/5.0 (compatible; CutestThingBot/1.0)"},
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    match = _AVATAR_IMG_RE.search(html)
+                    if match:
+                        avatar_url = match.group(0)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.info(f"Avatar lookup failed for photographer_id={photographer_id}: {e}")
+    except Exception as e:
+        # 🌸 Deliberately broad — this is a nice-to-have scrape against an
+        # undocumented, unversioned HTML page. Any parse weirdness here
+        # should degrade to "no avatar", never break the photo reply.
+        logger.info(f"Unexpected avatar lookup error for photographer_id={photographer_id}: {e}")
+
+    _avatar_cache[photographer_id] = avatar_url
+    return avatar_url
+
+
 # ── Single entry point: classify once, dispatch to the right API ──────────
 
 async def handle_media_request(message, guild_id: int, shared) -> discord.Embed | str | None:
@@ -324,17 +442,18 @@ async def handle_media_request(message, guild_id: int, shared) -> discord.Embed 
     that decides intent + kind + query, then dispatches to Pexels (photo/
     video) or Pixabay (vector/cartoon).
 
-    Returns a discord.Embed (photo/vector/cartoon — image set via
-    set_image(), no visible link text) on success for image kinds, OR a
-    plain str (bare .mp4 CDN link, optionally with a caption line above
-    it — Discord embeds can't play video) for video kind, OR None if the
-    message isn't a media request / the relevant API key is missing /
-    the request fails / nothing is found — caller falls through to the
-    next interceptor or Groq's full reply normally.
+    Returns:
+      - discord.Embed for photo (Pexels) / vector / cartoon (Pixabay).
+      - a bare str (the raw .mp4 CDN link, no caption) for video, so
+        Discord's own embed crawler renders a native inline video player
+        instead of a broken image box inside a discord.Embed.
+      - None if the message isn't a media request / the relevant API key
+        is missing / the request fails / nothing is found — caller falls
+        through to the next interceptor or Groq's full reply normally.
 
     bot_service.py's reply site must check isinstance(result,
     discord.Embed) to know whether to call message.reply(embed=...) or
-    message.reply(content=...).
+    message.reply(content=...) (str case, video).
     """
     classification = await _classify_media_request(message.content)
     if not classification or not classification["is_media_request"]:
@@ -395,8 +514,22 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
             logger.info(f"No Pexels photos found for query '{query}'")
             return None
         photo = photos[0]
-        image_url = photo["src"]["large2x"]
+        image_url = photo["src"]["original"]
         photo_id = photo.get("id")
+        post_url = photo.get("url")
+        photographer = photo.get("photographer")
+        photographer_url = photo.get("photographer_url")
+        photographer_id = photo.get("photographer_id")
+
+        # 🌸 avg_color comes back as "#RRGGBB" — discord.Embed(color=...)
+        # wants an int, so strip the # and base-16 parse it. Falls back
+        # to the flat kawaii pink if avg_color is missing/malformed for
+        # some reason (shouldn't normally happen on a Pexels photo hit).
+        avg_color_hex = photo.get("avg_color")
+        try:
+            embed_color = int(avg_color_hex.lstrip("#"), 16) if avg_color_hex else 0xFFB6D9
+        except (ValueError, AttributeError):
+            embed_color = 0xFFB6D9
     except (KeyError, TypeError, IndexError) as e:
         logger.error(f"Parse error for Pexels photo query '{query}': {e}")
         return None
@@ -405,13 +538,25 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
         f"📷 Media request (photo) | User: {message.author} ({message.author.id}) "
         f"| Query: '{query}' | Photo ID: {photo_id} | Guild: {guild_id}"
     )
-    return await _build_image_embed(query, image_url, "photo")
+
+    # 🌸 Best-effort avatar lookup — see _get_pexels_avatar_url(). Never
+    # raises; None just means no icon on the credit line, same as before.
+    avatar_url = await _get_pexels_avatar_url(photographer_id, photographer_url)
+
+    return await _build_image_embed(
+        query, image_url, "photo",
+        post_url=post_url,
+        author_name=photographer,
+        author_avatar_url=avatar_url,
+        color=embed_color,
+        provider="Pexels",
+    )
 
 
 async def _fetch_pexels_video(message, guild_id: int, query: str) -> str | None:
-    """🌸 Hits Pexels /videos/search and returns a direct .mp4 CDN link
-    (Discord only auto-embeds direct media files, not page URLs), or
-    None on any failure/empty result."""
+    """🌸 Hits Pexels /videos/search and returns the bare .mp4 CDN link
+    as a plain string (no embed, no caption) so Discord's native inline
+    video player picks it up, or None on any failure/empty result."""
     headers = _get_pexels_headers()
     if not headers:
         logger.warning("PEXELS_API_KEY missing — skipping Pexels video intercept.")
@@ -466,7 +611,7 @@ async def _fetch_pexels_video(message, guild_id: int, query: str) -> str | None:
         f"🎬 Media request (video) | User: {message.author} ({message.author.id}) "
         f"| Query: '{query}' | Video ID: {vid_id} | Guild: {guild_id}"
     )
-    return await _maybe_caption_video_text(query, video_url)
+    return await _build_video_reply(query, video_url)
 
 
 async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) -> discord.Embed | None:
@@ -603,6 +748,21 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
         if not image_url:
             logger.info(f"No usable image URL in Pixabay hit for query '{query}'")
             return None
+
+        # 🌸 Attribution — same discord-style linked title/author pattern
+        # as the Pexels photo path. pageURL is the actual Pixabay post;
+        # Pixabay doesn't hand back a ready-made profile URL like Pexels'
+        # photographer_url does, so it's built from the documented
+        # /users/{user}-{user_id}/ pattern using "user" + "user_id" off
+        # the same hit. userImageURL becomes the author icon.
+        post_url = hit.get("pageURL")
+        credit_user = hit.get("user")
+        credit_user_id = hit.get("user_id")
+        credit_avatar_url = hit.get("userImageURL")
+        author_url = (
+            f"https://pixabay.com/users/{credit_user}-{credit_user_id}/"
+            if credit_user and credit_user_id else None
+        )
     except (KeyError, TypeError, IndexError) as e:
         logger.error(f"Parse error for Pixabay query '{query}': {e}")
         return None
@@ -611,4 +771,10 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
         f"🎨 Media request ({kind}) | User: {message.author} ({message.author.id}) "
         f"| Query: '{query}' | image_type: {image_type} | Pixabay ID: {hit_id} | Guild: {guild_id}"
     )
-    return await _build_image_embed(query, image_url, "image")
+    return await _build_image_embed(
+        query, image_url, "image",
+        post_url=post_url,
+        author_name=credit_user,
+        author_avatar_url=credit_avatar_url,
+        provider="Pixabay",
+    )
