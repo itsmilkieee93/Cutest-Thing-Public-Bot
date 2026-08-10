@@ -180,6 +180,126 @@ async def handle_server_info_query(message: discord.Message, guild_id: int, shar
         return None
 
 
+# 🌸 SERVER DESCRIPTION QUERY DETECTION — "server description", "what's the
+# description", "look at this server description" — a SPECIFIC field ask
+# that used to get swallowed by the broad SERVER_INFO_PATTERN above (which
+# fired on "look at this server..." too and dumped the WHOLE overview
+# instead of answering the actual question). Kept separate from
+# server_info/handle_server_info_query so classify_server_query can route
+# "description" asks to a handler that answers ONLY the description field,
+# with an honest "it's empty" instead of silently listing member count etc.
+SERVER_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:server\s+description|description\s+(?:of\s+)?(?:this\s+)?(?:server|guild)|"
+    r"(?:what'?s?|show|look\s+at|check|read)\s+(?:the\s+|this\s+)?(?:server\s+)?description)\b",
+    re.IGNORECASE
+)
+
+
+async def handle_server_description_query(message: discord.Message, guild_id: int, shared) -> str | None:
+    """
+    🌸 REGEX SERVER DESCRIPTION HANDLER — intercepts "server description",
+    "what's the description", "look at this server description" before
+    they hit Groq or the generic server_info catch-all. Answers ONLY the
+    description field, straight from metadata.db, instead of the AI
+    guessing/hallucinating something plausible-sounding when the field is
+    actually blank (most servers never set one — Discord's description
+    field is opt-in, separate from the vanity/about text).
+    """
+    match = SERVER_DESCRIPTION_PATTERN.search(message.content)
+    if not match:
+        return None
+
+    try:
+        meta = await shared.get_guild_metadata(guild_id)
+        guild_name = (meta.get("name") if meta else None) or (message.guild.name if message.guild else "this server")
+        description = meta.get("description") if meta else None
+
+        if description:
+            return f"📝 **{guild_name}**'s description:\n> {description}"
+        return f"📝 **{guild_name}** doesn't have a description set yet — it's empty! 🌸"
+    except Exception as e:
+        print(f"⚠️ Server description query error: {e}")
+        return None
+
+
+# 🌸 ALL-METADATA QUERY DETECTION — "give me all metadata", "show everything
+# about this server", "full server details/info", "dump server data" — an
+# explicit ask for the COMPLETE metadata.db row, not just one field.
+# Distinct from SERVER_INFO_PATTERN (which is a curated highlight reel of
+# ~5 fields) — this one is a full field-by-field dump for people who
+# specifically want "all"/"everything"/"full"/"complete".
+ALL_METADATA_PATTERN = re.compile(
+    r"\b(?:all|every|full|complete|entire)\s+(?:the\s+)?(?:server\s+)?(?:metadata|meta\s*data|details|info(?:rmation)?|data)\b"
+    r"|\b(?:metadata|meta\s*data)\s+(?:of|for|about)\s+(?:this\s+)?(?:server|guild)\b"
+    r"|\bshow\s+(?:me\s+)?everything\s+(?:about\s+)?(?:this\s+)?(?:server|guild)\b",
+    re.IGNORECASE
+)
+
+
+async def handle_all_metadata_query(message: discord.Message, guild_id: int, shared) -> str | None:
+    """
+    🌸 REGEX ALL-METADATA HANDLER — intercepts explicit "give me everything/
+    all metadata/full details" asks before they hit Groq. Unlike
+    handle_server_info_query (a curated ~5-field highlight reel), this
+    dumps every field metadata.db actually has for the guild, field by
+    field, so nothing gets left out just because it wasn't deemed
+    "highlight-worthy" by the curated handler.
+    """
+    match = ALL_METADATA_PATTERN.search(message.content)
+    if not match:
+        return None
+
+    try:
+        meta = await shared.get_guild_metadata(guild_id)
+        if not meta:
+            return None
+
+        guild_name = meta.get("name", "Unknown Server")
+        lines = [f"📋 **{guild_name}** — full metadata:"]
+
+        field_labels = [
+            ("description", "📝 Description"),
+            ("owner_id", "👑 Owner ID"),
+            ("member_count", "👥 Members"),
+            ("verification_level", "🛡️ Verification"),
+            ("preferred_locale", "🌐 Locale"),
+            ("boost_tier", "🚀 Boost Tier"),
+            ("boost_count", "💎 Boosts"),
+            ("created_at", "📅 Created"),
+            ("vanity_url", "🔗 Vanity URL"),
+            ("nsfw_level", "🔞 NSFW Level"),
+            ("explicit_content_filter", "🔍 Content Filter"),
+            ("features", "✨ Features"),
+        ]
+
+        for key, label in field_labels:
+            value = meta.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if key == "verification_level":
+                value = str(value).replace("_", " ").title()
+            elif key == "features" and isinstance(value, list):
+                value = ", ".join(value) if value else None
+                if not value:
+                    continue
+            lines.append(f"  {label}: {value}")
+
+        icon_hash = meta.get("icon")
+        if icon_hash:
+            lines.append(f"  🖼️ Icon: {_cdn_image_url('icons', guild_id, icon_hash)}")
+        banner_hash = meta.get("banner")
+        if banner_hash:
+            lines.append(f"  🎨 Banner: {_cdn_image_url('banners', guild_id, banner_hash)}")
+
+        if len(lines) == 1:
+            lines.append("  (nothing else on file yet — cache may need a refresh 🌸)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"⚠️ All-metadata query error: {e}")
+        return None
+
+
 # 🌸 CHANNEL COUNT QUERY DETECTION — "how many channels", "how much channel", "channel count", "list channels"
 CHANNEL_COUNT_PATTERN = re.compile(
     r"\b(how\s+(?:many|much)|count|list|show\s+all)\s+(?:channels?|text\s+channels?|voice\s+channels?)\b",
@@ -287,6 +407,54 @@ async def handle_created_query(message: discord.Message, guild_id: int, shared) 
         print(f"⚠️ Created-date query error: {e}")
         return None
 
+# 🌸 USER ACCOUNT-CREATION-DATE QUERY DETECTION — "when was my account
+# created", "when did I make my discord account", "how old is my account" —
+# bypass Groq entirely and decode straight from the message author's own
+# snowflake ID. Also supports asking about someone ELSE via a mention.
+USER_CREATED_QUERY_PATTERN = re.compile(
+    r"\bwhen\s+(?:was|is|did)\s+(?:my|his|her|their|this)\s+(?:discord\s+)?account\s+(?:was\s+|is\s+|did\s+)?(?:created|made|born|started)\b"
+    r"|\bhow\s+old\s+is\s+(?:my|his|her|their|this)\s+(?:discord\s+)?account\b",
+    re.IGNORECASE
+)
+
+async def handle_user_created_query(message: discord.Message, guild_id: int, shared) -> str | None:
+    """
+    🌸 REGEX USER-ACCOUNT-AGE HANDLER — intercepts "when was my account
+    created" style questions before they hit Groq.
+
+    Unlike handle_created_query (server), this needs ZERO database lookups:
+    a Discord user ID IS a snowflake, and a snowflake's first 42 bits ARE
+    the creation timestamp — discord.utils.snowflake_time() decodes it
+    locally with no API call and no chance of staleness.
+
+    Examples that match:
+      • "when was my account created"
+      • "when did I make my discord account"
+      • "how old is my account"
+
+    If the message @mentions someone, answers about THEM instead of the
+    author (e.g. "when was @someone's account created").
+    """
+    match = USER_CREATED_QUERY_PATTERN.search(message.content)
+    if not match:
+        return None
+
+    try:
+        # 🌸 Exclude the bot itself from mentions — pinging @Cutest Thing to
+        # ASK the question is not the same as asking ABOUT Cutest Thing's
+        # account. Only a mention of someone ELSE redirects the target.
+        real_mentions = [u for u in message.mentions if not u.bot]
+        target = real_mentions[0] if real_mentions else message.author
+
+        created_dt = discord.utils.snowflake_time(target.id)
+        pretty_date = created_dt.strftime("%B %d, %Y")
+        pretty_time = created_dt.strftime("%I:%M %p UTC")
+
+        who = "Your" if target.id == message.author.id else f"**{target.display_name}**'s"
+        return f"🎂 {who} Discord account was created on **{pretty_date}** at **{pretty_time}** 🌸"
+    except Exception as e:
+        print(f"⚠️ User account-created query error: {e}")
+        return None 
 
 # 🌸 Lets Groq express itself with an actual Discord reaction instead of (or
 # alongside) text — e.g. "react to this with 🤗" — by having it emit a
@@ -950,6 +1118,102 @@ def _strip_reasoning(text: str) -> str:
     text = THINK_BLOCK_PATTERN.sub("", text)
     text = THINK_TAG_PATTERN.sub("", text)
     return text.strip()
+
+
+# 🌸 SERVER-QUERY CLASSIFIER — AI-FIRST router for the server-info regex
+# interceptors above. Runs BEFORE the regex chain (not instead of it):
+# one cheap Groq call decides which server-info handler (if any) the
+# message is asking for, so a paraphrase like "who owns this place" or
+# "how old is this discord" routes straight to the right handler without
+# needing its own hand-written pattern. The regex chain in
+# handle_mention_reaction is still tried as a FALLBACK whenever this
+# classifier errors, times out, or returns a label it doesn't recognize —
+# it is never removed, only skipped when the AI call already succeeded.
+#
+# Deliberately the smallest/fastest model in MODEL_POOL (not a bigger
+# model, and not a second SAFEGUARD-style reasoning model) — this is a
+# single-word classification, so it's tuned for minimum input+output
+# tokens rather than quality: short system prompt, no few-shot examples,
+# max_tokens=6, temperature=0.
+CLASSIFIER_MODEL = "llama-3.1-8b-instant"
+
+# 🌸 Label -> handler map. Each label corresponds 1:1 to one of the
+# handle_*_query functions above/below. "none" means "not a server-info
+# question" (or classifier couldn't decide) — falls through to the
+# regular regex chain -> Groq chat model, same as today.
+SERVER_QUERY_LABELS = (
+    "avatar", "banner", "owner", "verification", "member_count",
+    "age", "boost", "locale", "description", "all_metadata", "server_info",
+    "channel_count", "role_list", "role_query", "created", "user_created", "none",
+)
+
+# 🌸 CHEAP LOCAL PRE-FILTER — gates whether classify_server_query (a real
+# Groq API call: full policy as input tokens + a label as output tokens)
+# is even worth making. Before this existed, EVERY mention triggered that
+# call, including things like "ur cute 🥺" or "lol how are u" that have
+# zero chance of being server-related — pure wasted tokens + latency on
+# the vast majority of messages, which are just casual chat.
+#
+# This is deliberately generous/over-inclusive (a superset of everything
+# the 16 labels above could plausibly refer to, plus loose synonyms like
+# "discord"/"place"/"guild") — false positives just mean the classifier
+# runs and confidently returns "none", exactly what happens today. False
+# NEGATIVES are the only real risk (a paraphrase the classifier would've
+# caught getting skipped entirely), so the bar for "does this look
+# server-ish at all" is kept low on purpose.
+SERVER_QUERY_HINT_PATTERN = re.compile(
+    r"\b(server|guild|discord|place|channel|role|member|avatar|banner|"
+    r"icon|pfp|owner|owns|created|founded|made|started|verification|"
+    r"boost|nitro|locale|language|region|description|about|info|"
+    r"metadata|details|account|old|age)\b",
+    re.IGNORECASE
+)
+
+
+def _looks_server_related(content: str) -> bool:
+    """🌸 Zero-token local gate — True if the message contains ANY word
+    that could plausibly relate to a server-info question. Only when this
+    is True do we spend a Groq call on classify_server_query; otherwise
+    we skip straight to the regular regex chain / chat model, saving a
+    full classifier round-trip on the majority of casual mentions."""
+    return bool(content) and bool(SERVER_QUERY_HINT_PATTERN.search(content))
+
+# 🌸 Kept intentionally short — every extra sentence here is extra input
+# tokens on EVERY single mention, not just server-info ones. One line per
+# label, no examples, no chain-of-thought instructions (this model isn't
+# a reasoning model, so asking it to "think step by step" would just add
+# output tokens for no benefit).
+#
+# 🌸 PRIORITY ORDER matters here: specific single-field labels (avatar,
+# banner, owner, verification, member_count, age, boost, locale,
+# description) must always win over the two catch-alls (server_info,
+# all_metadata) when a message could plausibly match both — e.g. "look at
+# this server description" mentions "server" AND "description", but the
+# person wants ONLY the description field, not the whole curated overview.
+# The policy spells this out explicitly instead of relying on label order
+# in the tuple, since the classifier model reads prompt text, not Python.
+SERVER_QUERY_CLASSIFIER_POLICY = (
+    "Classify a Discord message about THIS server/guild into exactly one label.\n"
+    "PRIORITY: if a SPECIFIC field is named (description, avatar, banner, "
+    "owner, verification, member count, age, boost, locale), pick THAT "
+    "label even if generic words like \"server\"/\"about\"/\"info\" also "
+    "appear. Only use server_info or all_metadata when NO specific field "
+    "is named.\n"
+    "avatar=server icon/pfp. banner=server banner image. owner=who owns/created-by. "
+    "verification=verification level. member_count=how many members. "
+    "age=how old/when created (server). boost=boost/nitro status. "
+    "locale=server language/region. description=asking specifically for "
+    "the server's description/about text (e.g. \"server description\", "
+    "\"what's the description\", \"look at the description\"). "
+    "all_metadata=explicitly wants EVERYTHING/ALL/FULL/COMPLETE server "
+    "metadata dumped, not just a highlight. server_info=general \"what is "
+    "this server\" with NO specific field named. "
+    "channel_count=how many channels. role_list=list all roles. "
+    "role_query=who has a SPECIFIC named role. created=when server created "
+    "(duplicate of age, prefer age). user_created=when a specific USER's "
+    "account/join date was created. none=not about this server/guild at all.\n"
+    "Reply with EXACTLY one label word, nothing else."
+)
 
 
 # 🌸 gpt-oss-safeguard-20b is OpenAI's "bring your own policy" safety

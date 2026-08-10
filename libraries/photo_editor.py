@@ -5,12 +5,108 @@ Mirrors the loading-embed pattern from summarize.py.
 """
 
 import io
+import logging
+import os
 import random
+import sys
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from photo_editor_s import PhotoEditor
+logger = logging.getLogger(__name__)
+
+
+# Ensure photo_editor logs go to a file regardless of other config
+_photo_editor_handler = logging.FileHandler("photo_editor_debug.log", encoding="utf-8")
+_photo_editor_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logger = logging.getLogger(__name__)
+logger.addHandler(_photo_editor_handler)
+logger.setLevel(logging.INFO)
+# ─────────────────────────────────────────────────────────────────────────────
+# The compiled native extension lives in libraries/clang/ (a subfolder next
+# to this file), not alongside photo_editor.py itself — add it to sys.path
+# so `import photo_editor_native` can find it there.
+# ─────────────────────────────────────────────────────────────────────────────
+_NATIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clang")
+
+if os.path.isdir(_NATIVE_DIR):
+    _so_files = [f for f in os.listdir(_NATIVE_DIR) if f.startswith("photo_editor_native") and f.endswith(".so")]
+    if _so_files:
+        logger.info("photo_editor: found native .so in %s: %s", _NATIVE_DIR, ", ".join(_so_files))
+    else:
+        logger.warning("photo_editor: %s exists but no photo_editor_native*.so found in it", _NATIVE_DIR)
+else:
+    logger.warning("photo_editor: native dir %s does not exist — will fall back to photo_editor_s", _NATIVE_DIR)
+
+if _NATIVE_DIR not in sys.path:
+    sys.path.insert(0, _NATIVE_DIR)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prefer the compiled pybind11 extension (photo_editor_native) for speed;
+# fall back to the pure-Python implementation (photo_editor_s) if the
+# native module is missing, fails to import (wrong ABI/platform), or
+# doesn't expose the expected PhotoEditor interface.
+# ─────────────────────────────────────────────────────────────────────────────
+USING_NATIVE_BACKEND = False
+
+try:
+    from photo_editor_native import PhotoEditor as _PhotoEditorNative  # type: ignore
+
+    # Sanity-check the native module exposes the methods we call before
+    # committing to it — a partial/mismatched build shouldn't crash later
+    # at request time, it should fall back now instead.
+    # Note: the native PhotoEditor has no FILTERS class attribute (only
+    # photo_editor_s does) — the module-level filter list below is
+    # hardcoded instead of read off PhotoEditor.FILTERS for that reason.
+    _required = (
+        "apply_filter", "adjust_temperature", "adjust_brightness",
+        "adjust_contrast", "adjust_saturation", "adjust_sharpness",
+        "resize", "crop_square", "rotate", "flip_horizontal",
+        "flip_vertical", "to_bytes", "to_bytes_under_limit",
+    )
+    _missing = [a for a in _required if not hasattr(_PhotoEditorNative, a)]
+    if _missing:
+        raise ImportError(
+            "photo_editor_native.PhotoEditor is missing expected methods: "
+            + ", ".join(_missing)
+        )
+
+    USING_NATIVE_BACKEND = True
+    _native_module = sys.modules.get("photo_editor_native")
+    _native_path = getattr(_native_module, "__file__", "unknown location")
+    logger.info("photo_editor: using native (pybind11) backend, loaded from %s", _native_path)
+    
+    # Wrap the native backend to normalize the resize() interface:
+    # C++ expects resize(width, height=-1, keep_aspect=True) where -1 means auto-scale.
+    # Python expects resize(width, height=None, keep_aspect=True) where None means auto-scale.
+    # Translate height=None to -1 for C++, and vice versa for Python.
+    class PhotoEditor(_PhotoEditorNative):
+        def resize(self, width: int, height=None, keep_aspect: bool = True):
+            """Normalize height: None (Python convention) → -1 (C++ convention)."""
+            if height is None:
+                height = -1
+            return super().resize(width, height, keep_aspect)
+
+except Exception as e:
+    logger.warning(
+        "photo_editor: native backend unavailable (%s: %s) — falling back to photo_editor_s",
+        type(e).__name__,
+        e,
+    )
+    from photo_editor_s import PhotoEditor  # pure-Python fallback
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supported filter names, shown as slash-command choices.
+# Hardcoded (rather than read from PhotoEditor.FILTERS) because the native
+# backend doesn't expose a FILTERS attribute — only photo_editor_s does.
+# Keep this list in sync with FILTERS in photo_editor_s.py and the filter
+# names documented in bindings.cpp / photo_editor.hpp.
+# ─────────────────────────────────────────────────────────────────────────────
+FILTER_NAMES = [
+    "blur", "sharpen", "contour", "emboss", "edge_enhance", "smooth",
+    "detail", "grayscale", "invert", "sepia", "posterize", "solarize",
+    "vignette",
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pastel palette & loading GIFs  (from summarize.py / chatting_fun.py)
@@ -33,7 +129,7 @@ LOADING_GIFS = [
 
 FILTER_CHOICES = [
     app_commands.Choice(name=name.replace("_", " ").title(), value=name)
-    for name in PhotoEditor.FILTERS.keys()
+    for name in FILTER_NAMES
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,12 +288,13 @@ class PhotoEditorCog(commands.Cog):
                 return
 
         except Exception as e:
+            backend = "native" if USING_NATIVE_BACKEND else "fallback (photo_editor_s)"
             await loading_msg.edit(
                 embed=discord.Embed(
                     title="⚠️ Edit failed",
                     description=f"`{str(e)[:300]}`",
                     color=random.choice(PASTEL_COLORS),
-                )
+                ).set_footer(text=f"backend: {backend}")
             )
             return
 
@@ -235,3 +332,4 @@ class PhotoEditorCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PhotoEditorCog(bot))
+

@@ -412,7 +412,7 @@ async def _get_pexels_avatar_url(photographer_id: int | None, profile_url: str |
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 profile_url,
-                timeout=aiohttp.ClientTimeout(total=6),
+                timeout=aiohttp.ClientTimeout(total=1),
                 headers={"User-Agent": "Mozilla/5.0 (compatible; CutestThingBot/1.0)"},
             ) as resp:
                 if resp.status == 200:
@@ -498,7 +498,7 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
                 f"{PEXELS_API_BASE}/v1/search",
                 headers=headers,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
                     logger.warning(f"Pexels returned {resp.status} for query '{query}'")

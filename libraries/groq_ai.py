@@ -26,7 +26,8 @@ from groq_instruct import (
     REACT_TAG_PATTERN, REACT_REQUEST_PATTERN, EXPLICIT_EMOJI_PATTERN,
     REACT_EMOJI_POOL, RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
     _build_react_instructions, _strip_reasoning, _build_owner_status,
-    _check_base64_for_severe_terms, _contains_severe_term
+    _check_base64_for_severe_terms, _contains_severe_term,
+    CLASSIFIER_MODEL, SERVER_QUERY_LABELS, SERVER_QUERY_CLASSIFIER_POLICY,
 )
 
 # 🌸 Dynamic personality — instructions are generated live from the bot's
@@ -405,6 +406,49 @@ class GroqService:
         except Exception as e:
             print(f"⚠️ Output safeguard check error (failing open): {e}")
             return True
+
+    async def classify_server_query(self, message_content: str, username: str) -> str:
+        """
+        🌸 AI-FIRST server-query router. One cheap Groq call (smallest
+        model in MODEL_POOL, max_tokens=6, temperature=0) decides which
+        server-info handler this message wants, so paraphrases that don't
+        match any hand-written regex still route correctly.
+
+        Returns one of SERVER_QUERY_LABELS. Returns "none" on ANY
+        problem — no client, API error, timeout, empty reply, or a label
+        that isn't in SERVER_QUERY_LABELS — so the caller's regex chain
+        always runs as the fallback. This call is intentionally
+        best-effort: it should never be the reason a server-info question
+        goes unanswered.
+        """
+        if not self.client:
+            return "none"
+
+        def _call():
+            return self.client.chat.completions.create(
+                model=CLASSIFIER_MODEL,
+                messages=[
+                    {"role": "system", "content": SERVER_QUERY_CLASSIFIER_POLICY},
+                    {"role": "user", "content": message_content},
+                ],
+                temperature=0,
+                max_tokens=6,
+            )
+
+        try:
+            response = await asyncio.to_thread(_call)
+            label = (response.choices[0].message.content or "").strip().lower()
+            # 🌸 Defensive parse: strip stray punctuation/quotes the model
+            # sometimes wraps a single-word answer in, then take just the
+            # first token in case it still adds a trailing word.
+            label = re.sub(r"[^a-z_]", " ", label).split()
+            label = label[0] if label else ""
+            if label not in SERVER_QUERY_LABELS:
+                return "none"
+            return label
+        except Exception as e:
+            print(f"⚠️ Server-query classifier error (falling back to regex) for {username}: {e}")
+            return "none"
 
     async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, model_id: str = None, react_allowed: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
         """

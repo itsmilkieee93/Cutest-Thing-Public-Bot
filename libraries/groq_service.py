@@ -34,8 +34,11 @@ from groq_instruct import (
     handle_server_owner_query, handle_server_verification_query,
     handle_member_count_query, handle_server_age_query,
     handle_boost_status_query, handle_locale_query,
+    handle_user_created_query,
+    handle_server_description_query, handle_all_metadata_query,
     REACT_TAG_PATTERN, REACT_REQUEST_PATTERN,
     RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
+    _looks_server_related,
 )
 from groq_pexels import handle_media_request
 from resources import shared
@@ -512,15 +515,72 @@ class GroqMentionService:
         async with message.channel.typing():
             guild = message.guild
 
-            # 🌸 REGEX INTERCEPTORS — cheap, instant, token-free answers for
-            # specific question shapes, pulled straight from the SQLite
-            # guild cache instead of ever hitting Groq. Falls through to
-            # Groq normally if none match (or no cache yet).
+            # 🌸 SERVER-QUERY DISPATCH — AI-FIRST, regex-FALLBACK.
+            #
+            # 0. server_hint is a zero-token LOCAL keyword gate checked
+            #    BEFORE spending a Groq call on classify_server_query.
+            #    Casual chat like "ur cute 🥺" or "lol how are u" has no
+            #    server-ish keywords at all, so it skips that call entirely
+            #    — same end behavior as a "none" classification (falls
+            #    through to the regex chain below), just zero API cost for
+            #    the majority of mentions that were never going to be
+            #    server questions anyway.
+            #    NOTE: this only gates the classifier call itself. The
+            #    regex chain and handle_media_request below still run for
+            #    EVERY guild message regardless of server_hint — media
+            #    requests ("send me a pic of X") have nothing to do with
+            #    server metadata and must not be skipped by this gate.
+            # 1. Only when server_hint is True: classify_server_query makes
+            #    ONE cheap Groq call (smallest model, 6 output tokens) to
+            #    label the message. A label hit dispatches straight to
+            #    that ONE handler — no need to run the other 13 regexes
+            #    first, so paraphrases the regexes would've missed ("who
+            #    owns this place", "how old is this discord") still land
+            #    on the right handler.
+            # 2. If the classifier returns "none" (not server-related, or
+            #    the call errored/timed out/gave a junk label — see
+            #    classify_server_query's fail-open contract), we fall
+            #    through to the EXACT SAME regex chain as before, in the
+            #    same most-specific-first order. Nothing above is removed;
+            #    this only skips it on a successful AI classification.
             if guild:
-                # 🌸 Most specific/rare patterns checked first (avatar, banner,
-                # owner, verification, boosts) so they never get shadowed by the more
-                # general "what is this server" catch-all below.
-                intercepted = await handle_server_avatar_query(message, guild.id, shared)
+                server_hint = _looks_server_related(message.content)
+                label = await self.bot.groq.classify_server_query(message.content, message.author.name) if server_hint else "none"
+
+                LABEL_HANDLERS = {
+                    "avatar": handle_server_avatar_query,
+                    "banner": handle_server_banner_query,
+                    "owner": handle_server_owner_query,
+                    "verification": handle_server_verification_query,
+                    "member_count": handle_member_count_query,
+                    "age": handle_server_age_query,
+                    "boost": handle_boost_status_query,
+                    "locale": handle_locale_query,
+                    "description": handle_server_description_query,
+                    "all_metadata": handle_all_metadata_query,
+                    "server_info": handle_server_info_query,
+                    "channel_count": handle_channel_count_query,
+                    "role_list": handle_role_list_query,
+                    "role_query": handle_role_query,
+                    "created": handle_created_query,
+                    "user_created": handle_user_created_query,
+                }
+
+                intercepted = None
+                handler = LABEL_HANDLERS.get(label)
+                if handler is not None:
+                    intercepted = await handler(message, guild.id, shared)
+                    # 🌸 The classifier picked a category but the handler's
+                    # OWN regex still didn't match this exact phrasing (or
+                    # the guild cache had nothing to answer with) — don't
+                    # just give up, drop into the full regex chain below so
+                    # every other pattern still gets a shot.
+
+                if intercepted is None:
+                    # 🌸 Most specific/rare patterns checked first (avatar, banner,
+                    # owner, verification, boosts) so they never get shadowed by the more
+                    # general "what is this server" catch-all below.
+                    intercepted = await handle_server_avatar_query(message, guild.id, shared)
                 if intercepted is None:
                     intercepted = await handle_server_banner_query(message, guild.id, shared)
                 if intercepted is None:
@@ -536,6 +596,17 @@ class GroqMentionService:
                 if intercepted is None:
                     intercepted = await handle_locale_query(message, guild.id, shared)
                 if intercepted is None:
+                    # 🌸 Specific-field asks (description, then "give me
+                    # everything") must be tried BEFORE the generic
+                    # server_info catch-all below — SERVER_INFO_PATTERN is
+                    # broad enough to match "look at this server
+                    # description" too, which would otherwise dump the
+                    # whole curated overview instead of answering just the
+                    # field that was actually asked for.
+                    intercepted = await handle_server_description_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_all_metadata_query(message, guild.id, shared)
+                if intercepted is None:
                     intercepted = await handle_server_info_query(message, guild.id, shared)
                 if intercepted is None:
                     intercepted = await handle_channel_count_query(message, guild.id, shared)
@@ -545,6 +616,8 @@ class GroqMentionService:
                     intercepted = await handle_role_query(message, guild.id, shared)
                 if intercepted is None:
                     intercepted = await handle_created_query(message, guild.id, shared)
+                if intercepted is None:
+                    intercepted = await handle_user_created_query(message, guild.id, shared)
                 if intercepted is None:
                     # 🌸 AI-classified media request — one Groq call decides
                     # if this is "send me a pic/video/vector/cartoon of X",
