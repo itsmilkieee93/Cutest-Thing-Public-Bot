@@ -24,6 +24,7 @@ server-info question" path.
 
 import time
 import random
+import re
 import discord
 from datetime import datetime
 
@@ -42,6 +43,11 @@ from groq_instruct import (
 )
 from groq_pexels import handle_media_request
 from resources import shared
+
+# 🌸 Referential word gate for reply-context folding — see the comment
+# in handle_mention_reaction where this is used. Compiled once at import
+# time instead of per-call.
+_REFERENTIAL_WORD_PATTERN = re.compile(r"\b(it|that|this|its|it's)\b", re.IGNORECASE)
 
 # 🔔 Reply-ping policy — pings ONLY the person being replied to (the
 # trigger). @everyone/@here and role mentions never notify anyone even if
@@ -515,6 +521,46 @@ class GroqMentionService:
         async with message.channel.typing():
             guild = message.guild
 
+            # 🌸 Resolve reply context EARLY (moved up from below the
+            # server-query dispatch block) — a follow-up like "when did it
+            # get made" or "when did it was made" has NO server/guild
+            # keyword in message.content on its own; "it" only resolves
+            # once you know the PREVIOUS message was about the server.
+            # Without this, _looks_server_related/classify_server_query/
+            # the regex chain all only ever saw the bare current message
+            # and had no way to know "it" = the server, so the question
+            # fell through to the generic chat model, which has no access
+            # to metadata.db and just guesses/hallucinates "idk, discord
+            # doesn't show that" instead of answering from the DB.
+            reply_to_message_id, reply_to_message_text = await self._reply_to_bot_context(message)
+            if reply_to_message_id is None:
+                reply_to_message_id, reply_to_message_text = await self._implicit_reply_context(message)
+
+            # 🌸 Combined text used ONLY for server-query hint/classification/
+            # regex matching below — message.clean_content sent to Groq
+            # chat later is untouched, so this doesn't change what the
+            # user "said" from the AI's perspective, just what the
+            # interceptors are allowed to look at when deciding intent.
+            #
+            # 🌸 IMPORTANT: reply_to_message_text is ONLY folded in when
+            # the current message contains a referential word (it/that/
+            # this/etc) AND still doesn't look server-related without it.
+            # Reply context exists to rescue a genuinely ambiguous
+            # follow-up like "when did it get made" — "it" is a dangling
+            # reference that only resolves via the previous message.
+            #
+            # Without the referential-word check, EVERY reply to one of
+            # the bot's OWN server-info answers looked server-related
+            # forever after, no matter what the user actually typed —
+            # "cool", "lol", a plain "?" — because reply_to_message_text
+            # is the BOT's own wording, which is packed with "server"/
+            # "created"/"old" by definition. That made every follow-up
+            # in that reply chain re-trigger the exact same copy-pasted
+            # answer instead of falling through to normal conversation.
+            dispatch_text = message.content
+            if reply_to_message_text and _REFERENTIAL_WORD_PATTERN.search(message.content):
+                dispatch_text = f"{reply_to_message_text}\n{message.content}"
+
             # 🌸 SERVER-QUERY DISPATCH — AI-FIRST, regex-FALLBACK.
             #
             # 0. server_hint is a zero-token LOCAL keyword gate checked
@@ -544,8 +590,8 @@ class GroqMentionService:
             #    same most-specific-first order. Nothing above is removed;
             #    this only skips it on a successful AI classification.
             if guild:
-                server_hint = _looks_server_related(message.content)
-                label = await self.bot.groq.classify_server_query(message.content, message.author.name) if server_hint else "none"
+                server_hint = _looks_server_related(dispatch_text)
+                label = await self.bot.groq.classify_server_query(dispatch_text, message.author.name) if server_hint else "none"
 
                 LABEL_HANDLERS = {
                     "avatar": handle_server_avatar_query,
@@ -569,12 +615,26 @@ class GroqMentionService:
                 intercepted = None
                 handler = LABEL_HANDLERS.get(label)
                 if handler is not None:
-                    intercepted = await handler(message, guild.id, shared)
-                    # 🌸 The classifier picked a category but the handler's
-                    # OWN regex still didn't match this exact phrasing (or
-                    # the guild cache had nothing to answer with) — don't
-                    # just give up, drop into the full regex chain below so
-                    # every other pattern still gets a shot.
+                    # 🌸 The AI classifier already decided what this
+                    # message wants, often using phrasing/reply-context
+                    # its handler's own regex can't parse on its own
+                    # (message.content only, no reply context, rigid word
+                    # order). Trust that classification for every label
+                    # EXCEPT role_query — that handler's regex isn't just
+                    # a gate, it also EXTRACTS the role name via a capture
+                    # group, so skipping it would leave nothing to look
+                    # up. Every other handler only ever reads guild_id/
+                    # message.guild/message.mentions once past the gate,
+                    # so skipping their gate is safe.
+                    if label == "role_query":
+                        intercepted = await handler(message, guild.id, shared)
+                    else:
+                        intercepted = await handler(message, guild.id, shared, skip_pattern_check=True)
+                    # 🌸 The classifier picked a category but the handler
+                    # still had nothing to answer with (e.g. the guild
+                    # cache had no data) — don't just give up, drop into
+                    # the full regex chain below so every other pattern
+                    # still gets a shot.
 
                 if intercepted is None:
                     # 🌸 Most specific/rare patterns checked first (avatar, banner,
@@ -666,28 +726,10 @@ class GroqMentionService:
             # ✅ Determine which emoji to suggest (if allowed to react)
             react_allowed = user_asking_for_react or random.random() < AUTO_REACT_CHANCE
 
-            # 🌸 If this message is a reply to ANYTHING with extractable
-            # content — an old bot message, another bot's embed (e.g. a
-            # Tracky subscriber-update card), or another user's message —
-            # grab that message's snowflake AND its actual text/embed
-            # content in one pass. The snowflake anchors Groq's random
-            # memory slice around that point in time when it's one of
-            # OUR OWN saved turns; the text is the FALLBACK for every
-            # other case — old bot interceptor replies never saved to
-            # memory at all, and third-party messages that were never
-            # ours to save in the first place. See groq_ai.get_ai_response's
-            # fallback context block for how reply_to_message_text gets used.
-            reply_to_message_id, reply_to_message_text = await self._reply_to_bot_context(message)
-
-            # 🌸 If that wasn't a formal reply at all (no message.reference —
-            # e.g. someone forwards a message, then pings the bot in a
-            # SEPARATE follow-up message right after instead of swipe-
-            # replying to the forward), fall back to whatever landed
-            # immediately before this one in the channel. See
-            # _implicit_reply_context for the same-author/recency guards
-            # that keep this from grabbing unrelated messages.
-            if reply_to_message_id is None:
-                reply_to_message_id, reply_to_message_text = await self._implicit_reply_context(message)
+            # 🌸 reply_to_message_id / reply_to_message_text were already
+            # resolved earlier (before the server-query dispatch block
+            # above) so that dispatch could see reply context too — no
+            # need to fetch them again here, just reuse the same values.
 
             response = await self.bot.groq.get_ai_response(
                 prompt,

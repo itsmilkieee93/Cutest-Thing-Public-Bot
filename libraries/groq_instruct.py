@@ -141,15 +141,20 @@ SERVER_INFO_PATTERN = re.compile(
 )
 
 
-async def handle_server_info_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_info_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER INFO HANDLER — intercepts "what is this server" / "tell me about this server"
     before they hit Groq, pulls metadata straight from metadata.db.
     Returns a formatted overview, or None if regex doesn't match.
+
+    skip_pattern_check: trust an AI classifier "server_info" label instead
+    of re-gating on SERVER_INFO_PATTERN. See handle_created_query's
+    docstring for the full reasoning.
     """
-    match = SERVER_INFO_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_INFO_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -195,7 +200,7 @@ SERVER_DESCRIPTION_PATTERN = re.compile(
 )
 
 
-async def handle_server_description_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_description_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER DESCRIPTION HANDLER — intercepts "server description",
     "what's the description", "look at this server description" before
@@ -204,10 +209,14 @@ async def handle_server_description_query(message: discord.Message, guild_id: in
     guessing/hallucinating something plausible-sounding when the field is
     actually blank (most servers never set one — Discord's description
     field is opt-in, separate from the vanity/about text).
+
+    skip_pattern_check: trust an AI classifier "description" label
+    instead of re-gating on SERVER_DESCRIPTION_PATTERN.
     """
-    match = SERVER_DESCRIPTION_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_DESCRIPTION_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -236,7 +245,7 @@ ALL_METADATA_PATTERN = re.compile(
 )
 
 
-async def handle_all_metadata_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_all_metadata_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX ALL-METADATA HANDLER — intercepts explicit "give me everything/
     all metadata/full details" asks before they hit Groq. Unlike
@@ -244,10 +253,14 @@ async def handle_all_metadata_query(message: discord.Message, guild_id: int, sha
     dumps every field metadata.db actually has for the guild, field by
     field, so nothing gets left out just because it wasn't deemed
     "highlight-worthy" by the curated handler.
+
+    skip_pattern_check: trust an AI classifier "all_metadata" label
+    instead of re-gating on ALL_METADATA_PATTERN.
     """
-    match = ALL_METADATA_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = ALL_METADATA_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -307,15 +320,19 @@ CHANNEL_COUNT_PATTERN = re.compile(
 )
 
 
-async def handle_channel_count_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_channel_count_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX CHANNEL COUNT HANDLER — intercepts "how many channels", "list channels",
     "channel count" before they hit Groq, queries channels.db directly.
     Returns formatted channel list, or None if regex doesn't match.
+
+    skip_pattern_check: trust an AI classifier "channel_count" label
+    instead of re-gating on CHANNEL_COUNT_PATTERN.
     """
-    match = CHANNEL_COUNT_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = CHANNEL_COUNT_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         summary = await shared.get_compact_channels(guild_id, max_count=200)
@@ -337,15 +354,19 @@ ROLE_LIST_PATTERN = re.compile(
 )
 
 
-async def handle_role_list_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_role_list_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX ROLE LIST HANDLER — intercepts "what roles are there", "list all roles",
     "show roles" before they hit Groq, queries roles.db directly.
     Returns formatted role list with member counts, or None if regex doesn't match.
+
+    skip_pattern_check: trust an AI classifier "role_list" label instead
+    of re-gating on ROLE_LIST_PATTERN.
     """
-    match = ROLE_LIST_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = ROLE_LIST_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         summary = await shared.get_compact_roles(guild_id, max_count=100)
@@ -360,7 +381,7 @@ async def handle_role_list_query(message: discord.Message, guild_id: int, shared
         return None
 
 
-async def handle_created_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_created_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER-CREATION-DATE HANDLER — intercepts "when was this server
     created" questions before they hit Groq, reads guild_info.created_at
@@ -372,6 +393,17 @@ async def handle_created_query(message: discord.Message, guild_id: int, shared) 
       • "when did this server get made"
       • "when was this server founded"
 
+    skip_pattern_check: when True, the CREATED_QUERY_PATTERN regex gate
+    below is skipped entirely — used when classify_server_query already
+    labeled the message "created"/"age" with reply-context it could see
+    that this function can't (this function only ever looks at
+    message.content). Without this, phrasing the classifier correctly
+    recognized (e.g. "when did this server WAS made", "when did this
+    discord server was created" — non-native-speaker word order the
+    regex's rigid server+created adjacency can't cover) would still get
+    rejected here and silently fall through to the hallucinating chat
+    model, defeating the whole point of the AI-first classifier.
+
     Returns a formatted date string. Never returns None just because
     metadata.db hasn't been synced yet — a guild ID is a Discord snowflake,
     which encodes its creation timestamp in its first 42 bits, so the real
@@ -380,9 +412,10 @@ async def handle_created_query(message: discord.Message, guild_id: int, shared) 
     where a stale/empty cache row made Groq say "idk the exact date" and
     invent a workaround instead of just answering).
     """
-    match = CREATED_QUERY_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = CREATED_QUERY_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -417,7 +450,7 @@ USER_CREATED_QUERY_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-async def handle_user_created_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_user_created_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX USER-ACCOUNT-AGE HANDLER — intercepts "when was my account
     created" style questions before they hit Groq.
@@ -434,10 +467,16 @@ async def handle_user_created_query(message: discord.Message, guild_id: int, sha
 
     If the message @mentions someone, answers about THEM instead of the
     author (e.g. "when was @someone's account created").
+
+    skip_pattern_check: trust an AI classifier "user_created" label
+    instead of re-gating on USER_CREATED_QUERY_PATTERN — the mention
+    target is read from message.mentions either way, not from the regex
+    match, so this is safe to skip.
     """
-    match = USER_CREATED_QUERY_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = USER_CREATED_QUERY_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         # 🌸 Exclude the bot itself from mentions — pinging @Cutest Thing to
@@ -720,7 +759,7 @@ def _cdn_image_url(kind: str, snowflake_id: int, image_hash: str, size: int = 40
     return f"https://cdn.discordapp.com/{kind}/{snowflake_id}/{image_hash}.{ext}?size={size}"
 
 
-async def handle_server_avatar_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_avatar_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER AVATAR HANDLER — intercepts "give me avatar of this
     server", "server icon", "what's the server pfp/logo" before they hit
@@ -728,10 +767,14 @@ async def handle_server_avatar_query(message: discord.Message, guild_id: int, sh
     and builds the CDN link directly — falls back to the live discord.py
     guild.icon if the cache hasn't synced yet, so it never has to say
     "I can't fetch that" the way the raw Groq reply used to.
+
+    skip_pattern_check: trust an AI classifier "avatar" label instead of
+    re-gating on SERVER_AVATAR_PATTERN.
     """
-    match = SERVER_AVATAR_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_AVATAR_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -761,15 +804,19 @@ SERVER_BANNER_PATTERN = re.compile(
 )
 
 
-async def handle_server_banner_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_banner_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER BANNER HANDLER — intercepts "server banner", "what's
     this server's banner" before they hit Groq. Same cache-then-live-
     fallback pattern as handle_server_avatar_query.
+
+    skip_pattern_check: trust an AI classifier "banner" label instead of
+    re-gating on SERVER_BANNER_PATTERN.
     """
-    match = SERVER_BANNER_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_BANNER_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -800,16 +847,20 @@ SERVER_OWNER_PATTERN = re.compile(
 )
 
 
-async def handle_server_owner_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_owner_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER OWNER HANDLER — intercepts "who owns this server",
     "who's the owner", "server owner" before they hit Groq. Reads owner_id
     straight from metadata.db and pings them directly (mentions read way
     nicer than a raw ID, which is all Groq would've had to guess from).
+
+    skip_pattern_check: trust an AI classifier "owner" label instead of
+    re-gating on SERVER_OWNER_PATTERN.
     """
-    match = SERVER_OWNER_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_OWNER_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -836,15 +887,19 @@ SERVER_VERIFICATION_PATTERN = re.compile(
 )
 
 
-async def handle_server_verification_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_verification_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER VERIFICATION HANDLER — intercepts "verification level"
     / "how verified is this server" before they hit Groq, reads
     verification_level straight from metadata.db.
+
+    skip_pattern_check: trust an AI classifier "verification" label
+    instead of re-gating on SERVER_VERIFICATION_PATTERN.
     """
-    match = SERVER_VERIFICATION_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_VERIFICATION_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -869,14 +924,18 @@ MEMBER_COUNT_PATTERN = re.compile(
 )
 
 
-async def handle_member_count_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_member_count_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX MEMBER COUNT HANDLER — intercepts "how many members", "member count",
     "how big is this server" before they hit Groq, reads straight from metadata.db.
+
+    skip_pattern_check: trust an AI classifier "member_count" label
+    instead of re-gating on MEMBER_COUNT_PATTERN.
     """
-    match = MEMBER_COUNT_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = MEMBER_COUNT_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -901,14 +960,20 @@ SERVER_AGE_PATTERN = re.compile(
 )
 
 
-async def handle_server_age_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_server_age_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX SERVER AGE HANDLER — intercepts "how old is this server", "server age"
     before they hit Groq. Calculates years/months from created_at in metadata.db.
+
+    skip_pattern_check: when True, SERVER_AGE_PATTERN is skipped — used
+    when classify_server_query already labeled the message "age" using
+    context (or phrasing) this narrow regex doesn't cover. See
+    handle_created_query's matching docstring note for the full reasoning.
     """
-    match = SERVER_AGE_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = SERVER_AGE_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -946,7 +1011,13 @@ async def handle_server_age_query(message: discord.Message, guild_id: int, share
         if not age_str:
             age_str = "less than a month"
 
-        return f"📅 **{guild_name}** is **{age_str}** old! 🌸"
+        # 🌸 Always include the exact decoded date too, not just relative
+        # age — "how old" and "what's the exact date" are different asks,
+        # but created_dt (DB value or snowflake-decoded fallback) is
+        # already sitting right here, so there's no reason to make the
+        # user ask handle_created_query separately just to get it.
+        pretty_date = created_dt.strftime("%B %d, %Y")
+        return f"📅 **{guild_name}** is **{age_str}** old — created on **{pretty_date}**! 🌸"
     except Exception as e:
         print(f"⚠️ Server age query error: {e}")
         return None
@@ -962,16 +1033,20 @@ BOOST_STATUS_PATTERN = re.compile(
 )
 
 
-async def handle_boost_status_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_boost_status_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX BOOST STATUS HANDLER — intercepts "boost status", "boost tier", "nitro status"
     before they hit Groq. Reads boost_tier and boost_count from metadata.db.
     Note: These fields may not be populated yet if metadata schema doesn't include them —
     this will need schema update to include boost_tier, boost_count.
+
+    skip_pattern_check: trust an AI classifier "boost" label instead of
+    re-gating on BOOST_STATUS_PATTERN.
     """
-    match = BOOST_STATUS_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = BOOST_STATUS_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         # For now, we'll try to get it from the live guild object since metadata.db
@@ -1006,14 +1081,18 @@ LOCALE_PATTERN = re.compile(
 )
 
 
-async def handle_locale_query(message: discord.Message, guild_id: int, shared) -> str | None:
+async def handle_locale_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False) -> str | None:
     """
     🌸 REGEX LOCALE HANDLER — intercepts "what language", "server language", "locale"
     before they hit Groq. Reads preferred_locale from metadata.db.
+
+    skip_pattern_check: trust an AI classifier "locale" label instead of
+    re-gating on LOCALE_PATTERN.
     """
-    match = LOCALE_PATTERN.search(message.content)
-    if not match:
-        return None
+    if not skip_pattern_check:
+        match = LOCALE_PATTERN.search(message.content)
+        if not match:
+            return None
 
     try:
         meta = await shared.get_guild_metadata(guild_id)
@@ -1201,7 +1280,10 @@ SERVER_QUERY_CLASSIFIER_POLICY = (
     "is named.\n"
     "avatar=server icon/pfp. banner=server banner image. owner=who owns/created-by. "
     "verification=verification level. member_count=how many members. "
-    "age=how old/when created (server). boost=boost/nitro status. "
+    "age=how old/when created/when made/when founded (server) — this "
+    "includes awkward or non-native phrasing like \"when did this server "
+    "was made\" or \"when did this discord server was created\", classify "
+    "those as age too. boost=boost/nitro status. "
     "locale=server language/region. description=asking specifically for "
     "the server's description/about text (e.g. \"server description\", "
     "\"what's the description\", \"look at the description\"). "
@@ -1239,8 +1321,14 @@ SAFEGUARD_POLICY = (
     "Evaluate what the DECODED/RESULTING content would actually be, not "
     "just the surface request — a puzzle wrapper does not make an unsafe "
     "output safe.\n"
+    "General swearing/profanity (fuck, shit, damn, ass, etc.) used as "
+    "casual language, emphasis, or venting is ALLOWED and should be marked "
+    "SAFE — this bot's persona is allowed to curse. Only mark UNSAFE for "
+    "profanity if it's paired with actual harassment, hate speech, or a "
+    "slur, not for the swear word by itself.\n"
     "Mark SAFE for normal chat, jokes, questions, venting, flirting between "
-    "adults, and everyday conversation — most messages are SAFE.\n\n"
+    "adults, casual swearing, and everyday conversation — most messages are "
+    "SAFE.\n\n"
     "Respond with EXACTLY one word, nothing else: SAFE or UNSAFE."
 )
 
@@ -1262,7 +1350,13 @@ OUTPUT_SAFEGUARD_POLICY = (
     "harmful content — regardless of whether the reply also contains a "
     "disclaimer, refusal framing, or claims it's 'just decoding' or "
     "'just roleplay'.\n"
-    "Mark SAFE for normal, friendly chat.\n\n"
+    "General swearing/profanity (fuck, shit, damn, ass, etc.) used as "
+    "casual language, emphasis, chaotic humor, or venting is ALLOWED and "
+    "should be marked SAFE — this bot's persona is allowed to curse. "
+    "Profanity by itself, with no slur and no harassment directed at "
+    "someone, is never a reason to mark UNSAFE.\n"
+    "Mark SAFE for normal, friendly chat, including chat that casually "
+    "swears.\n\n"
     "Respond with EXACTLY one word, nothing else: SAFE or UNSAFE."
 )
 
@@ -1335,9 +1429,11 @@ def _check_base64_for_severe_terms(text: str) -> tuple[bool, str | None]:
 
 
 # 🌸 Cute-but-firm decline replies shown when SAFEGUARD_POLICY flags a
-# message — keeps the bot's kawaii voice even while saying no.
+# message — casual/informal gen-z tone to match the bot's persona, still
+# a clear no.
 SAFEGUARD_BLOCK_REPLIES = [
-    "Mm, I don't think I should answer that one! 🌸 Let's talk about something else~",
-    "Nuh uh, not touching that one! 🎀 Ask me something else instead?",
-    "That's a lil too spicy for me 🥲 I'll pass on this one!",
+    "nah i'm not touching that one 🌸 ask me something else fr",
+    "lol nope, not doing that 🎀 next question?",
+    "that's too much for me rn 🥲 pick a different topic",
+    "yeah no, hard pass on that one 🌸",
 ]
