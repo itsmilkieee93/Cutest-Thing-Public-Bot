@@ -5,6 +5,7 @@ from discord.ext import commands
 import yt_dlp
 import os
 import re
+import sys
 import asyncio
 import aiohttp
 import random
@@ -52,6 +53,16 @@ handler.setFormatter(logging.Formatter(
 ))
 if not logger.handlers:
     logger.addHandler(handler)
+    # 🌸 Also stream to stdout (dynamically, so it picks up log_webhook's
+    # sys.stdout Tee even if start_log_webhook() runs after this import)
+    class _LiveStdoutStream:
+        def write(self, msg):
+            sys.stdout.write(msg)
+        def flush(self):
+            sys.stdout.flush()
+    _stdout_handler = logging.StreamHandler(_LiveStdoutStream())
+    _stdout_handler.setFormatter(logging.Formatter('[MusicDownloader] [%(levelname)s] %(message)s'))
+    logger.addHandler(_stdout_handler)
 
 # ─── YTMusic (safe init) ───────────────────────────────────────────────────────
 try:

@@ -75,6 +75,12 @@ def get_log_channel_ids() -> list[int]:
     return cfg.BOT.get("log_channel_ids", []) if cfg else []
 
 
+def get_log_webhook_url() -> str:
+    """Get the log-shipping webhook URL (bot.log → private channel) from config."""
+    cfg = _load()
+    return cfg.WEBHOOKS.get("log_webhook_url") if cfg else None
+
+
 def get_command_id(category: str, command: str) -> int:
     """
     Get a specific command ID from config.

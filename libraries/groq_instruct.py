@@ -1440,7 +1440,11 @@ SERVER_QUERY_CLASSIFIER_POLICY = (
     "channel_count=how many channels. role_list=list all roles. "
     "role_query=who has a SPECIFIC named role. created=when server created "
     "(duplicate of age, prefer age). user_created=when a specific USER's "
-    "account/join date was created. none=not about this server/guild at all.\n"
+    "account/join date was created. none=not about this server/guild at "
+    "all, INCLUDING opinions/compliments/comments about the server that "
+    "aren't asking for any data (e.g. \"is that a cool server\", \"nice "
+    "server\", \"i like this server\") — those are none even though they "
+    "contain the word \"server\".\n"
     "Reply with EXACTLY one label word, nothing else."
 )
 

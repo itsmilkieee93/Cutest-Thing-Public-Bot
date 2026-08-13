@@ -28,6 +28,16 @@ _handler.setFormatter(logging.Formatter(
 ))
 if not logger.handlers:
     logger.addHandler(_handler)
+    # 🌸 Also stream to stdout (dynamically, so it picks up log_webhook's
+    # sys.stdout Tee even if start_log_webhook() runs after this import)
+    class _LiveStdoutStream:
+        def write(self, msg):
+            sys.stdout.write(msg)
+        def flush(self):
+            sys.stdout.flush()
+    _stdout_handler = logging.StreamHandler(_LiveStdoutStream())
+    _stdout_handler.setFormatter(logging.Formatter('[Pexels] [%(levelname)s] %(message)s'))
+    logger.addHandler(_stdout_handler)
 
 # ─── Data Directory ───────────────────────────────────────────────────────────
 DATA_DIR          = "data/pexels"

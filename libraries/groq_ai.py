@@ -54,6 +54,12 @@ except Exception as _exa_import_err:
 # stdout. The `if not groq_logger.handlers` guard keeps this safe to import
 # more than once (e.g. via importlib.reload) without stacking duplicate
 # handlers and writing every line twice.
+#
+# 🌸 NOT relayed to stdout on purpose — the rich version of this data
+# (with the tenor thumbnail) already goes to Discord as a real embed via
+# _build_success_embed / _build_rate_limit_embed. Relaying groq_logger
+# too would've meant every rate-limit event showed up TWICE: once as the
+# nice thumbnail embed, once as a plain-text log_webhook embed.
 os.makedirs("logs", exist_ok=True)
 groq_logger = logging.getLogger("groq_ratelimit")
 groq_logger.setLevel(logging.INFO)
@@ -63,12 +69,14 @@ if not groq_logger.handlers:
     groq_logger.addHandler(_groq_log_handler)
     groq_logger.propagate = False
 
+from log_webhook import add_stdout_relay
+
 
 # 🌸 Full conversation transcript logger — every completed Groq call (both
 # the user's prompt AND the model's reply) gets appended to log/groq_ai.log.
 # Separate file/dir from logs/bot.log on purpose: that one is just
 # ratelimit-header telemetry, this one is the actual chat content, so they
-# don't get mixed together. Same reload-safe handler guard as groq_logger.
+# don't get mixed together. File-only on purpose — kept exactly as before.
 os.makedirs("log", exist_ok=True)
 groq_ai_logger = logging.getLogger("groq_ai_transcript")
 groq_ai_logger.setLevel(logging.INFO)
@@ -77,6 +85,19 @@ if not groq_ai_logger.handlers:
     _groq_ai_log_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
     groq_ai_logger.addHandler(_groq_ai_log_handler)
     groq_ai_logger.propagate = False
+
+# 🌸 Separate, relay-ONLY logger (no file handler) for the flattened,
+# single-line version of each transcript entry — see _log_ai_transcript.
+# Kept apart from groq_ai_logger so log/groq_ai.log's format never changes
+# and this one never accidentally gets a file handler of its own.
+#
+# ⚠️ Streams full user prompts + full AI replies to Discord #status via
+# log_webhook. Fine for an owner-only/private status channel — worth
+# knowing if anyone else ever gets access to it.
+_groq_ai_relay_logger = logging.getLogger("groq_ai_transcript_relay")
+_groq_ai_relay_logger.setLevel(logging.INFO)
+_groq_ai_relay_logger.propagate = False
+add_stdout_relay(_groq_ai_relay_logger, prefix="GroqAI")
 
 
 class GroqService:
@@ -302,6 +323,25 @@ class GroqService:
                 f"{separator}"
             )
             groq_ai_logger.info(entry)
+
+            # 🌸 The file entry above is deliberately multi-line for
+            # readability in log/groq_ai.log — but log_webhook's Tee
+            # queues per PHYSICAL LINE, so relaying that same multi-line
+            # block to stdout would fragment one conversation across many
+            # separate queued lines, getting interleaved with unrelated
+            # log output from other modules in the same batch window.
+            # Relay a single collapsed line instead, truncated so one
+            # entry can't dominate a whole Discord batch on its own.
+            def _flatten(text: str, limit: int = 300) -> str:
+                flat = " ".join(text.split())
+                return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+            relay_line = (
+                f"{username} ({user_id}) @ {guild_part} / {channel_part} "
+                f"[{model_id}] PROMPT: {_flatten(prompt)} "
+                f"| RESPONSE: {_flatten(reply)}"
+            )
+            _groq_ai_relay_logger.info(relay_line)
         except Exception as e:
             print(f"⚠️ Failed to write groq_ai.log entry: {e}")
 

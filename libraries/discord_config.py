@@ -10,32 +10,38 @@ BOT = {
     # Your personal Discord user ID (Developer Mode on → right-click your
     # name → Copy User ID). Grants owner-only commands like !sync / !reload.
     # Kept for backward compatibility — prefer "owner_ids" below for new code.
-    "owner_id": 1165555555268567040,
+    "owner_id": 000000000000000000,
 
     # Multiple owner/trusted-user IDs, all granted the same owner-only
     # permissions as owner_id above. Add as many snowflakes as you want —
     # e.g. co-developers, a trusted mod, an alt account for testing.
-    "owner_ids": [1165555555268567040, 813617286127550485],
+    "owner_ids": [000000000000000000, 000000000000000001],
 
     # Server used for instant slash-command syncing during development.
     # Guild syncs are instant; global syncs can take up to 1 hour to propagate.
-    "test_guild_id": 1385237763816816710,
+    "test_guild_id": 000000000000000000,
 
     # Servers allowed to use restricted commands (e.g. /msg) (separated by commas)
-    "allowed_server_ids": [1385237763816816710, 1239881782308900874],
+    "allowed_server_ids": [000000000000000000, 000000000000000001],
 
     # User IDs banned from using specific commands — every command/interaction
     # should check this and silently ignore (or send a short refusal) before
     # doing anything else. Add as many snowflakes as needed.
-    "blocked_user_ids": [9876543210987654321],
+    "blocked_user_ids": [000000000000000000],
 
     # Unix timestamp for the bot's "creation date", shown in /about.
-    "birthday_ts": 1776210930,
+    "birthday_ts": 0000000000,
 
     # Channel ID(s) where bridge_log() posts the "Command Executed! 🌟" embed
     # for every slash command run. Add as many channels as you want — e.g.
     # a private dev log + a public activity feed.
-    "log_channel_ids": [1439421632056655983],
+    "log_channel_ids": [000000000000000000],
+}
+
+WEBHOOKS = {
+    # Private channel webhook that bot.log (stdout/stderr) gets streamed to
+    # by log_shipper.py. Server Settings → Integrations → Webhooks → New.
+    "log_webhook_url": "https://discord.com/api/webhooks/000000000000000000/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 }
 
 COMMANDS = {
@@ -45,61 +51,62 @@ COMMANDS = {
     # right-click a command → Copy Command ID.
 
     "ai": {  # AI chat commands
-        "gemini": 1499372361869299712,
-        "gemini_reply": 1509113355128799312,
-        "openrouter": 1509097665122795590,
-        "openrouter_reply": 1509116087776706562,
-        "cloudflare_ai": 1509160938438266882,
-        "cloudflare_ai_reply": 1509160938438266883,
+        "gemini": 000000000000000000,
+        "gemini_reply": 000000000000000001,
+        "openrouter": 000000000000000002,
+        "openrouter_reply": 000000000000000003,
+        "cloudflare_ai": 000000000000000004,
+        "cloudflare_ai_reply": 000000000000000005,
     },
     "messaging": {  # Send / edit / relay message commands
-        "msg": 1499363515725512709,
-        "edit_msg": 1499363515725512711,
-        "dm_user": 1499378105595465841,
-        "forward_msg": 1507682331853328443,
-        "embed_msg": 1507682332071559174,
+        "msg": 000000000000000000,
+        "edit_msg": 000000000000000001,
+        "dm_user": 000000000000000002,
+        "forward_msg": 000000000000000003,
+        "embed_msg": 000000000000000004,
     },
     "interaction": {  # Reactions & moderation commands
-        "react": 1498221002205827194,
-        "unreact": 1498229098277896203,
-        "clear_msg": 1499801891813462288,
-        "safs": 1506177506724679760,
-        "unf": 1506177506724679761,
+        "react": 000000000000000000,
+        "unreact": 000000000000000001,
+        "clear_msg": 000000000000000002,
+        "safs": 000000000000000003,
+        "unf": 000000000000000004,
     },
     "system": {  # Bot status & utility commands
-        "info": 1507682331853328436,
-        "about": 1507682331853328438,
-        "speed_test": 1507682332071559170,
-        "encrypt": 1507682332071559171,
-        "decrypt": 1507682332071559172,
-        "upload": 1507682331853328442,
+        "info": 000000000000000000,
+        "about": 000000000000000001,
+        "speed_test": 000000000000000002,
+        "encrypt": 000000000000000003,
+        "decrypt": 000000000000000004,
+        "upload": 000000000000000005,
     },
     "math": {  # Math solver commands
-        "math": 1507682332071559175,
-        "math_ref": 1507682332071559176,
+        "math": 000000000000000000,
+        "math_ref": 000000000000000001,
     },
     "knowledge": {  # Fun facts, quotes & info-lookup commands
-        "fact": 1498340229441126430,
-        "quote": 1499378105595465842,
-        "advice": 1498340229441126431,
-        "dadjoke": 1499378105595465840,
-        "question": 1498992621777981620,
-        "wikipedia": 1507682331853328435,
-        "wiki_news": 1507682331853328439,
-        "news": 1507682331853328440,
-        "weather": 1507682331853328444,
-        "praise": 1503056320821985332,
-        "joke_unf": 1499363515725512707,
+        "fact": 000000000000000000,
+        "quote": 000000000000000001,
+        "advice": 000000000000000002,
+        "dadjoke": 000000000000000003,
+        "question": 000000000000000004,
+        "wikipedia": 000000000000000005,
+        "wiki_news": 000000000000000006,
+        "news": 000000000000000007,
+        "weather": 000000000000000008,
+        "praise": 000000000000000009,
+        "joke_unf": 000000000000000010,
     },
     "media": {  # Music & YouTube commands
-        "music": 1507682331853328441,
-        "download_music": 1507682332071559173,
-        "youtube": 1507682332071559169,
-        "livestream_chat": 1507682332071559177,
-        "my_channel": 1507682332071559178,
+        "music": 000000000000000000,
+        "download_music": 000000000000000001,
+        "youtube": 000000000000000002,
+        "livestream_chat": 000000000000000003,
+        "my_channel": 000000000000000004,
     },
     "images": {  # Photo search commands
-        "photo": 1507682332545650718,
-        "pexels": 1507682332545650719,
+        "photo": 000000000000000000,
+        "pexels": 000000000000000001,
     },
 }
+

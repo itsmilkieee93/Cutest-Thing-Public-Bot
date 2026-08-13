@@ -557,8 +557,23 @@ class GroqMentionService:
             # "created"/"old" by definition. That made every follow-up
             # in that reply chain re-trigger the exact same copy-pasted
             # answer instead of falling through to normal conversation.
+            # 🌸 FIX: try the CURRENT message alone first. If it already
+            # looks server-related by itself (e.g. "is that cool server" —
+            # contains "that" AND "server"), it's almost certainly a NEW
+            # question, not a dangling reference to the bot's last answer.
+            # Folding reply_to_message_text in on top of an already-
+            # server-shaped message just drowns the classifier in the
+            # bot's OLD wording and re-triggers the same handler on every
+            # reply in that thread. Reply context is now only folded in
+            # when the message DOESN'T look server-related on its own —
+            # the actual "dangling pronoun" case ("when did it get made"
+            # has no server keyword by itself) is unaffected.
             dispatch_text = message.content
-            if reply_to_message_text and _REFERENTIAL_WORD_PATTERN.search(message.content):
+            if (
+                reply_to_message_text
+                and not _looks_server_related(message.content)
+                and _REFERENTIAL_WORD_PATTERN.search(message.content)
+            ):
                 dispatch_text = f"{reply_to_message_text}\n{message.content}"
 
             # 🌸 SERVER-QUERY DISPATCH — AI-FIRST, regex-FALLBACK.
@@ -591,7 +606,6 @@ class GroqMentionService:
             #    this only skips it on a successful AI classification.
             if guild:
                 server_hint = _looks_server_related(dispatch_text)
-                label = await self.bot.groq.classify_server_query(dispatch_text, message.author.name) if server_hint else "none"
 
                 LABEL_HANDLERS = {
                     "avatar": handle_server_avatar_query,
@@ -612,9 +626,24 @@ class GroqMentionService:
                     "user_created": handle_user_created_query,
                 }
 
+                # 🌸 STRATEGY COIN-FLIP — per user request, randomly pick
+                # whether the AI classifier or the regex chain gets first
+                # crack at this message, instead of always trusting the
+                # classifier. Whichever one DOESN'T go first still runs as
+                # the fallback if the first pick comes back empty — this
+                # is purely about ORDER, nothing loses coverage. Only
+                # applies when server_hint is True; if the message doesn't
+                # look server-related at all, there's nothing to flip a
+                # coin over and we skip straight to "none" like before.
+                strategy = random.choice(["ai", "regex"]) if server_hint else "regex"
+
                 intercepted = None
-                handler = LABEL_HANDLERS.get(label)
-                if handler is not None:
+
+                async def _try_ai():
+                    label = await self.bot.groq.classify_server_query(dispatch_text, message.author.name)
+                    handler = LABEL_HANDLERS.get(label)
+                    if handler is None:
+                        return None
                     # 🌸 The AI classifier already decided what this
                     # message wants, often using phrasing/reply-context
                     # its handler's own regex can't parse on its own
@@ -627,57 +656,69 @@ class GroqMentionService:
                     # message.guild/message.mentions once past the gate,
                     # so skipping their gate is safe.
                     if label == "role_query":
-                        intercepted = await handler(message, guild.id, shared)
-                    else:
-                        intercepted = await handler(message, guild.id, shared, skip_pattern_check=True)
-                    # 🌸 The classifier picked a category but the handler
-                    # still had nothing to answer with (e.g. the guild
-                    # cache had no data) — don't just give up, drop into
-                    # the full regex chain below so every other pattern
-                    # still gets a shot.
+                        return await handler(message, guild.id, shared)
+                    return await handler(message, guild.id, shared, skip_pattern_check=True)
 
-                if intercepted is None:
+                async def _try_regex():
                     # 🌸 Most specific/rare patterns checked first (avatar, banner,
                     # owner, verification, boosts) so they never get shadowed by the more
                     # general "what is this server" catch-all below.
-                    intercepted = await handle_server_avatar_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_server_banner_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_server_owner_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_server_verification_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_member_count_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_server_age_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_boost_status_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_locale_query(message, guild.id, shared)
-                if intercepted is None:
-                    # 🌸 Specific-field asks (description, then "give me
-                    # everything") must be tried BEFORE the generic
-                    # server_info catch-all below — SERVER_INFO_PATTERN is
-                    # broad enough to match "look at this server
-                    # description" too, which would otherwise dump the
-                    # whole curated overview instead of answering just the
-                    # field that was actually asked for.
-                    intercepted = await handle_server_description_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_all_metadata_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_server_info_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_channel_count_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_role_list_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_role_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_created_query(message, guild.id, shared)
-                if intercepted is None:
-                    intercepted = await handle_user_created_query(message, guild.id, shared)
+                    result = await handle_server_avatar_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_server_banner_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_server_owner_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_server_verification_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_member_count_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_server_age_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_boost_status_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_locale_query(message, guild.id, shared)
+                    if result is None:
+                        # 🌸 Specific-field asks (description, then "give me
+                        # everything") must be tried BEFORE the generic
+                        # server_info catch-all below — SERVER_INFO_PATTERN is
+                        # broad enough to match "look at this server
+                        # description" too, which would otherwise dump the
+                        # whole curated overview instead of answering just the
+                        # field that was actually asked for.
+                        result = await handle_server_description_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_all_metadata_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_server_info_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_channel_count_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_role_list_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_role_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_created_query(message, guild.id, shared)
+                    if result is None:
+                        result = await handle_user_created_query(message, guild.id, shared)
+                    return result
+
+                if strategy == "ai":
+                    intercepted = await _try_ai()
+                    if intercepted is None:
+                        # 🌸 AI picked nothing usable (label was "none", or the
+                        # handler had nothing to answer with) — fall back to
+                        # the regex chain so coverage never drops just because
+                        # the coin flip landed on "ai" first.
+                        intercepted = await _try_regex()
+                else:
+                    intercepted = await _try_regex()
+                    if intercepted is None and server_hint:
+                        # 🌸 Regex chain came up empty but the message still
+                        # looks server-ish — give the AI classifier a shot
+                        # before giving up entirely, same as the "ai" branch
+                        # falling back to regex above.
+                        intercepted = await _try_ai()
                 if intercepted is None:
                     # 🌸 AI-classified media request — one Groq call decides
                     # if this is "send me a pic/video/vector/cartoon of X",

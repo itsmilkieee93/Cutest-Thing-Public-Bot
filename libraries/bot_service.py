@@ -16,6 +16,12 @@ from collections import deque
 # 🌸 NEW: Config loader for Discord snowflake IDs
 from config_loader import get_owner_id, get_test_guild_id
 
+# 🌸 Live stdout/stderr → Discord webhook (color-coded success/warning/error
+# embeds), set in discord_config.py → WEBHOOKS["log_webhook_url"]. Started
+# as early as possible so even startup prints/tracebacks get captured.
+from log_webhook import start_log_webhook
+start_log_webhook()
+
 # 🌸 key_config.py lives at auth/key_config.py, gitignored — see generate_key_config.py.
 # Path is relative to CWD (bot root), matching this file's existing convention
 # of using relative paths like "gemini/configuration/gen_ai" instead of __file__-based ones.
