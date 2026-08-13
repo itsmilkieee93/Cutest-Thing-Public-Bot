@@ -69,6 +69,12 @@ def get_birthday_ts() -> int:
     return cfg.BOT.get("birthday_ts", 0) if cfg else 0
 
 
+def get_log_channel_ids() -> list[int]:
+    """Get every bridge_log() destination channel ID from config."""
+    cfg = _load()
+    return cfg.BOT.get("log_channel_ids", []) if cfg else []
+
+
 def get_command_id(category: str, command: str) -> int:
     """
     Get a specific command ID from config.

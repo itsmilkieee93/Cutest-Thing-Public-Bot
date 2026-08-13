@@ -31,6 +31,11 @@ BOT = {
 
     # Unix timestamp for the bot's "creation date", shown in /about.
     "birthday_ts": 1776210930,
+
+    # Channel ID(s) where bridge_log() posts the "Command Executed! 🌟" embed
+    # for every slash command run. Add as many channels as you want — e.g.
+    # a private dev log + a public activity feed.
+    "log_channel_ids": [1439421632056655983],
 }
 
 COMMANDS = {

@@ -9,6 +9,7 @@ import discord
 from datetime import datetime
 from groq import Groq
 from groq import RateLimitError as GroqRateLimitError
+from groq import APIStatusError as GroqAPIStatusError
 
 from resources import shared
 
@@ -28,12 +29,25 @@ from groq_instruct import (
     _build_react_instructions, _strip_reasoning, _build_owner_status,
     _check_base64_for_severe_terms, _contains_severe_term,
     CLASSIFIER_MODEL, SERVER_QUERY_LABELS, SERVER_QUERY_CLASSIFIER_POLICY,
+    _wants_web_search, _search_domains_for_prompt, SEARCH_INTENT_CLASSIFIER_POLICY,
 )
 
 # 🌸 Dynamic personality — instructions are generated live from the bot's
 # CURRENT per-guild nickname (set via /server-persona-set), instead of a
 # static auth/personality.txt file. See personality.py for details.
 from personality import get_personality_for_nickname
+
+# 🌸 Exa web search — PRIMARY search path now, ahead of groq/compound-mini
+# (see GroqService.__init__ and the _wants_web_search branch in
+# get_ai_response below). Wrapped in try/except so a missing exa_py
+# package or unset EXA_API_KEY degrades gracefully to the existing
+# compound/browser_search chain instead of crashing bot startup —
+# ExaSearchService is None in that case and every call site checks for it.
+try:
+    from groq_exa_search import ExaSearchService
+except Exception as _exa_import_err:
+    ExaSearchService = None
+    print(f"⚠️ groq_exa_search import failed ({_exa_import_err}) — Exa search disabled, using compound only.")
 
 # 🌸 Dedicated file logger for Groq's x-ratelimit-* response headers — lets
 # you track API usage/limits over time in logs/bot.log without cluttering
@@ -94,6 +108,12 @@ class GroqService:
         else:
             self.client = None
             print("❌ ERROR: No API keys found in key_config.GROQ_API_KEYS!")
+
+        # 🌸 Exa search — see get_ai_response's _wants_web_search branch.
+        # None when the exa_py package isn't installed (import already
+        # failed and printed above) so every call site just checks
+        # `if self.exa` instead of needing its own try/except.
+        self.exa = ExaSearchService() if ExaSearchService else None
 
         # 🌸 llama-3.3-70b-versatile was deprecated by Groq on 2026-06-17
         # (shutting down ~August 2026) — this fallback now points at
@@ -450,6 +470,46 @@ class GroqService:
             print(f"⚠️ Server-query classifier error (falling back to regex) for {username}: {e}")
             return "none"
 
+    async def classify_search_intent(self, prompt: str, username: str) -> bool:
+        """
+        🌸 AI-FIRST search-intent router — same shape as
+        classify_server_query above, just a YES/NO instead of a label.
+        One cheap Groq call (smallest model in MODEL_POOL, max_tokens=4,
+        temperature=0) decides whether `prompt` needs a live web search,
+        so paraphrases the SEARCH_INTENT_PATTERN regex would miss (e.g.
+        "did they release the sequel yet", "how's Bitcoin doing rn")
+        still route to Exa correctly.
+
+        Returns True only on a clean "YES". Returns False on ANY problem
+        — no client, API error, timeout, empty reply, or anything that
+        isn't recognizably yes/no — so the caller's _wants_web_search
+        regex always runs as the fallback. This call is intentionally
+        best-effort: it should never be the reason a search request goes
+        unanswered, and it should never be the reason an ordinary chat
+        reply gets accidentally routed to Exa/compound either.
+        """
+        if not self.client or not prompt:
+            return False
+
+        def _call():
+            return self.client.chat.completions.create(
+                model=CLASSIFIER_MODEL,
+                messages=[
+                    {"role": "system", "content": SEARCH_INTENT_CLASSIFIER_POLICY},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=4,
+            )
+
+        try:
+            response = await asyncio.to_thread(_call)
+            verdict = (response.choices[0].message.content or "").strip().upper()
+            return verdict.startswith("YES")
+        except Exception as e:
+            print(f"⚠️ Search-intent classifier error (falling back to regex) for {username}: {e}")
+            return False
+
     async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, model_id: str = None, react_allowed: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
@@ -502,8 +562,51 @@ class GroqService:
             return random.choice(SAFEGUARD_BLOCK_REPLIES)
 
         # 🌸 Random model pick per turn (unless caller pinned model_id) —
-        # see MODEL_POOL up top for what's in rotation.
-        model_to_use     = model_id or random.choice(MODEL_POOL)
+        # see MODEL_POOL up top for what's in rotation. EXCEPTION: if the
+        # prompt looks like a search request, try Exa FIRST (see
+        # ExaSearchService in groq_exa_search.py) instead of forcing
+        # groq/compound-mini straight away. Exa does its own
+        # search+summarize outside of Groq entirely and hands back a
+        # short synthesized string, which sidesteps the whole
+        # compound/browser_search 413 saga at the root — that was always
+        # caused by raw Tavily search output sharing a TPM budget with
+        # the SAME Groq call generating the reply. If Exa is unavailable
+        # (no key, exa_py not installed, network blip, empty result) we
+        # fall straight back to groq/compound-mini, and the existing
+        # slim-retry → browser_search → no-search fallback chain further
+        # down still applies exactly as before.
+        #
+        # 🌸 AI-FIRST, REGEX 2ND: search intent is now decided by
+        # classify_search_intent (one cheap Groq call, same shape as
+        # classify_server_query) so paraphrases the regex net would miss
+        # ("did they release the sequel yet", "how's Bitcoin doing rn")
+        # still trigger Exa. _wants_web_search's SEARCH_INTENT_PATTERN
+        # regex is kept as the FALLBACK — only consulted when the
+        # classifier call itself fails/errors/times out (classify_search_intent
+        # already returns False in that case, which would otherwise look
+        # identical to a genuine "no search needed" verdict) — never
+        # removed, only skipped when the AI call already succeeded.
+        # Caller-pinned model_id (e.g. from an explicit /ask-with-model
+        # command) still wins over all of this — we only override the
+        # RANDOM/search-intent pick, never an explicit one.
+        exa_context = None
+        if model_id:
+            model_to_use = model_id
+        else:
+            wants_search = await self.classify_search_intent(prompt, username)
+            if not wants_search:
+                wants_search = _wants_web_search(prompt)
+
+            if wants_search:
+                if self.exa:
+                    exa_context = await self.exa.search(prompt)
+                if exa_context:
+                    non_compound_pool = [m for m in MODEL_POOL if "compound" not in m.lower()]
+                    model_to_use = random.choice(non_compound_pool) if non_compound_pool else self.default_model
+                else:
+                    model_to_use = "groq/compound-mini"
+            else:
+                model_to_use = random.choice(MODEL_POOL)
 
         # 🌸 Personality now follows the bot's CURRENT per-guild nickname
         # (set via /server-persona-set) instead of a static file — read
@@ -536,6 +639,20 @@ class GroqService:
         else:
             react_directives = REACT_INSTRUCTIONS_DISALLOWED
 
+        # 🌸 COMPOUND TOKEN BUDGET (part 2): server_context/guild_summary
+        # can be genuinely huge on an active server — full role/channel/
+        # member dumps easily run several thousand tokens on their own.
+        # That's fine for gpt-oss/llama/qwen (large context, no extra
+        # tool overhead), but compound/compound-mini ALSO pays token cost
+        # for the search tool's query + returned Tavily snippets on top
+        # of whatever system prompt we send, and a thin TPM budget can't
+        # absorb both. Search questions ("who's winning the world cup",
+        # "weather in Jakarta") essentially never need server role/channel
+        # data anyway, so just skip building it for compound calls —
+        # cheaper AND avoids pulling the model's attention toward
+        # server trivia instead of doing the actual search.
+        is_compound_call = "compound" in model_to_use.lower()
+
         # 🌸 Server context — pulled from the v10 REST API and cached (see
         # GroqMentionService.get_server_context_text in groq_service.py) so
         # Groq always knows what server it's replying in, same idea as
@@ -543,7 +660,9 @@ class GroqService:
         # back to DM_CONTEXT_INSTRUCTIONS when guild is None, or "" if
         # there's no bot back-reference at all (e.g. running this service
         # standalone outside EnchantedBot).
-        if self.bot and getattr(self.bot, "groq_mentions", None):
+        if is_compound_call:
+            server_context = ""
+        elif self.bot and getattr(self.bot, "groq_mentions", None):
             server_context = self.bot.groq_mentions.get_server_context_text(guild)
         else:
             server_context = DM_CONTEXT_INSTRUCTIONS if guild is None else ""
@@ -553,7 +672,7 @@ class GroqService:
         # full guild JSON into the prompt. shared.get_guild_context_summary
         # already does the GROUP BY queries + formatting — just await it.
         guild_summary = ""
-        if guild:
+        if guild and not is_compound_call:
             try:
                 guild_summary = await shared.get_guild_context_summary(guild.id)
             except Exception as e:
@@ -572,6 +691,22 @@ class GroqService:
         ) if guild and guild_summary else ""
         
         personality      = f"{personality}\n\n{react_directives}\n\n{identity}\n\n{server_context}\n\n{server_override}\n{guild_summary}".strip()
+
+        # 🌸 EXA SEARCH RESULT — only present when the model-selection
+        # block above got a live answer back from Exa for this prompt
+        # (see exa_context up top). Injected into the SYSTEM prompt, not
+        # the user-facing `prompt` itself, so it never gets saved into
+        # Groq memory / bloats future turns' history — it's a one-turn
+        # ephemeral grounding, same treatment as guild_summary above.
+        if exa_context:
+            personality = (
+                f"{personality}\n\n"
+                "🌸 LIVE SEARCH RESULT (via Exa, fetched just now for this question):\n"
+                f"{exa_context}\n\n"
+                "Use the above to answer accurately and in your own words/persona — don't just "
+                "repeat it verbatim, and don't contradict it with outdated knowledge."
+            )
+
         if reply_to_message_id is not None:
             # 🌸 Only added when the user actually swiped-replied to an old
             # bot message — tells Groq how to read the [REPLYING TO THIS]
@@ -625,6 +760,20 @@ class GroqService:
         # legacy rows — it just falls back to normal tail slicing.
         recent_turn_count = random.randint(2, 8) * 2
         anchor_end = len(history)
+
+        # 🌸 COMPOUND TOKEN BUDGET: groq/compound and groq/compound-mini
+        # burn noticeably more tokens per call than a plain chat model —
+        # the search tool's query + Tavily's returned snippets all get
+        # fed back into the model as EXTRA input tokens on top of
+        # whatever history we send, and Groq's free/on-demand TPM ceiling
+        # can be as low as ~6-12k tokens/minute. A history window sized
+        # fine for gpt-oss/llama can tip a compound call over that limit
+        # and 413 ("Request Entity Too Large"). Cap the window hard for
+        # compound so there's headroom left for the tool round-trip.
+        # On-demand free tier is especially tight, so clamp to just 2 turns
+        # (1 exchange) instead of 4 to maximize margin.
+        if is_compound_call:
+            recent_turn_count = min(recent_turn_count, 2)
 
         if reply_to_message_id is not None:
             for idx in range(len(history) - 1, -1, -1):
@@ -693,27 +842,100 @@ class GroqService:
                 "content": f"[THIS IS THE MESSAGE BEING REPLIED TO] {reply_to_message_text}",
             })
 
-        def _call():
+        def _call(slim: bool = False):
             # 1. Buat parameter dasar yang selalu digunakan semua model
+            # 🌸 slim=True drops recent_history entirely — used for the
+            # 413 ("Request Entity Too Large") retry below. Compound
+            # calls can tip over a thin TPM budget even with a small
+            # history window (search tool round-trip adds its own
+            # tokens on top), so on a genuine 413 the safest recovery is
+            # just the system prompt + the user's actual message, no
+            # conversational context at all.
+            messages = [{"role": "system", "content": personality}]
+            if not slim:
+                messages.extend(recent_history)
+            messages.append({"role": "user", "content": prompt})
+
+            # 🌸 Needed one line earlier than before (used for max_tokens
+            # below too now) — same value, just computed before kwargs
+            # instead of after.
+            model_lower = model_to_use.lower()
+
+            # 🌸 COMPOUND TOKEN BUDGET (part 3): even a FULLY slim request
+            # (no history, no server context — see used_slim_retry above)
+            # can still 413 on compound/compound-mini, because the
+            # search-tool round-trip's cost is on TOP of whatever we ask
+            # it to output, and Groq's free/on-demand TPM ceiling counts
+            # both. This is a known issue on Groq's side — their own
+            # community forum has reports of compound 413ing on bare
+            # one-line prompts with no system prompt at all — so trimming
+            # OUR side further has diminishing returns. What we CAN do is
+            # cap the output budget we ask for, since every token we
+            # request is TPM we're not leaving for the search round-trip.
+            max_tokens_ceiling = 300 if "compound" in model_lower else 1000
+
             kwargs = {
                 "model": model_to_use,
-                "messages": [
-                    {"role": "system", "content": personality},
-                    *recent_history,
-                    {"role": "user", "content": prompt},
-                ],
+                "messages": messages,
                 # 🌸 Randomized per-call (0.10-0.99, 2 decimal places) so
                 # replies aren't stuck at one fixed creativity level every
                 # turn — same spirit as max_tokens below already varying
                 # per call. round() to 2dp keeps the value clean in logs.
                 "temperature": round(random.uniform(0.10, 0.99), 2),
-                "max_tokens": random.randint(100, 1000),
+                "max_tokens": random.randint(100, max_tokens_ceiling),
             }
 
             # 2. Atur parameter reasoning secara dinamis sesuai tipe model
-            model_lower = model_to_use.lower()
 
-            if "qwen" in model_lower:
+            if "compound" in model_lower:
+                # 🌸 groq/compound & groq/compound-mini are agentic SYSTEMS,
+                # not plain chat models — they reject reasoning_format AND
+                # reasoning_effort with a 400. Web search fires automatically
+                # server-side (Tavily) whenever the system decides the query
+                # needs current info; nothing extra to pass for that. Same
+                # temperature/max_tokens kwargs above still apply fine.
+                #
+                # 🌸 search_settings.include_domains — restricts Tavily to a
+                # small trusted allowlist picked from the PROMPT's topic
+                # (sports/weather/news/reference — see
+                # SEARCH_TOPIC_DOMAINS in groq_instruct.py). Smaller,
+                # more relevant search results cost fewer tokens, which
+                # is what was tipping compound-mini into 413 ("Request
+                # Entity Too Large") on questions like the World Cup one
+                # that prompted this. Falls back to None (Groq's normal
+                # unrestricted search) when the prompt doesn't match any
+                # known topic — an open-ended search question still gets
+                # full search rather than a wrong/empty allowlist.
+                domains = _search_domains_for_prompt(prompt)
+                if domains:
+                    kwargs["search_settings"] = {"include_domains": domains}
+            elif browser_search_active and "gpt-oss-120b" in model_lower:
+                # 🌸 STAGE 2 SEARCH FALLBACK — Groq's browser_search tool is
+                # a SEPARATE search mechanism from compound's Tavily
+                # integration (different infra, different token-budget
+                # profile), so when compound keeps 413ing this gives live
+                # search a genuinely different path to succeed on instead
+                # of just giving up on real-time info. tool_choice="auto"
+                # lets the model decide whether the prompt actually needs
+                # a search instead of forcing one on every call to this
+                # fallback — "required" was firing browser_search even on
+                # prompts that didn't need it, burning tokens/latency for
+                # nothing. gpt-oss-120b with tool use wants
+                # max_completion_tokens instead of max_tokens, and top_p=1
+                # — matches Groq's documented working example for this tool.
+                kwargs.pop("max_tokens", None)
+                kwargs["max_completion_tokens"] = random.randint(200, 500)
+                kwargs["top_p"] = 1
+                # 🌸 Lower/narrower temperature than the usual randomized
+                # 0.10-0.99 range — this call is meant to ground a factual
+                # summary in real search results, not go for creative
+                # variety, so keep it closer to deterministic.
+                kwargs["temperature"] = round(random.uniform(0.10, 0.40), 2)
+                kwargs["tools"] = [{"type": "browser_search"}]
+                kwargs["tool_choice"] = "auto"
+                kwargs["reasoning_format"] = "hidden"
+                kwargs["reasoning_effort"] = "low"
+            elif "qwen" in model_lower:
                 # Qwen menolak reasoning_format, gunakan effort: none untuk mematikan thinking
                 kwargs["reasoning_effort"] = "none"
             elif "llama" in model_lower:
@@ -727,17 +949,34 @@ class GroqService:
                 if "gpt-oss" in model_lower:
                     kwargs["reasoning_effort"] = "low"                    
 
-            try:
-                # 3. Jalankan request dengan mendekompresi (unpack) kwargs
-                return self.client.chat.completions.with_raw_response.create(**kwargs)
+            # 3. Jalankan request dengan mendekompresi (unpack) kwargs
+            return self.client.chat.completions.with_raw_response.create(**kwargs)
 
-            except GroqRateLimitError:
-                # 🌸 Re-raise so it's caught by the outer try/except below
-                raise
-
-        for attempt in range(max(len(self.api_keys), 1)):
+        used_slim_retry = False
+        # 🌸 STAGE 2 flags — a 413 that survives the slim retry falls
+        # through to gpt-oss-120b + Groq's browser_search tool (a
+        # DIFFERENT search mechanism from compound's Tavily integration —
+        # see _call above). used_browser_search_fallback is the monotonic
+        # "already tried stage 2" marker (prevents retrying it twice);
+        # browser_search_active is only True WHILE that attempt is live,
+        # so _call knows to attach the tool — it gets flipped back off if
+        # we fall through to stage 3.
+        used_browser_search_fallback = False
+        browser_search_active = False
+        # 🌸 STAGE 3 — browser_search fallback 413'd too, so live search
+        # genuinely isn't happening this turn on either mechanism. Give up
+        # and answer from the model's own knowledge instead of returning
+        # None. See the GroqAPIStatusError handler below.
+        used_final_fallback = False
+        # 🌸 +3 (not +1) so the 413 slim-retry, the browser_search
+        # fallback, AND the final no-search fallback ALL get their own
+        # iteration even with a single API key — without the extra slots,
+        # a lone key runs the loop out of iterations partway through a
+        # `continue` chain and a later-stage retry never actually happens.
+        max_attempts = max(len(self.api_keys), 1) + 3
+        for attempt in range(max_attempts):
             try:
-                raw_response = await asyncio.to_thread(_call)
+                raw_response = await asyncio.to_thread(_call, used_slim_retry)
                 self._log_rate_limits(raw_response.headers, username, model_to_use)
 
                 completion = raw_response.parse()
@@ -813,6 +1052,90 @@ class GroqService:
 
                 self.rotate_key()
                 continue
+            except GroqAPIStatusError as e:
+                # 🌸 413 "Request Entity Too Large" — most common on
+                # compound/compound-mini, whose search-tool round-trip
+                # (query + Tavily snippets fed back in) adds tokens on
+                # top of whatever history we sent, tipping a thin TPM
+                # budget over the edge. ONE retry with recent_history
+                # dropped entirely (slim=True — just system prompt + the
+                # user's actual message) before falling back further. Any
+                # other non-429 status code (400, 500, etc.) falls
+                # through to the generic handler below unchanged — this
+                # branch only ever retries on a genuine 413.
+                if getattr(e, "status_code", None) == 413 and not used_slim_retry:
+                    err_headers = getattr(getattr(e, "response", None), "headers", None)
+                    if err_headers:
+                        self._log_rate_limits(err_headers, username, model_to_use)
+                    print(f"⚠️ Groq 413 on {model_to_use} — retrying once with history stripped...")
+                    used_slim_retry = True
+                    continue
+
+                # 🌸 STAGE 2 — a 413 that survives the slim retry means
+                # trimming OUR side of the request didn't help, which
+                # tracks: Groq's own community forum has reports of
+                # compound/compound-mini 413ing on bare one-line prompts
+                # with NO system prompt at all, because the search-tool
+                # round-trip's token cost is added server-side and isn't
+                # something we control from the request we send. Instead
+                # of giving up on live search immediately, try Groq's
+                # OTHER built-in search tool — browser_search on
+                # gpt-oss-120b — since it's separate infra from compound's
+                # Tavily integration and may not be hitting the same
+                # budget wall.
+                if (
+                    getattr(e, "status_code", None) == 413
+                    and used_slim_retry
+                    and is_compound_call
+                    and not used_browser_search_fallback
+                ):
+                    err_headers = getattr(getattr(e, "response", None), "headers", None)
+                    if err_headers:
+                        self._log_rate_limits(err_headers, username, model_to_use)
+                    print(f"⚠️ Groq 413 persisted on {model_to_use} — trying gpt-oss-120b + browser_search instead...")
+                    used_browser_search_fallback = True
+                    browser_search_active = True
+                    model_to_use = "openai/gpt-oss-120b"
+                    is_compound_call = False
+                    continue
+
+                # 🌸 STAGE 3 — the browser_search fallback ALSO 413'd, so
+                # live search genuinely isn't available on either
+                # mechanism this turn. Drop search entirely and retry ONCE
+                # more on a plain model from the pool — the user still
+                # gets an actual reply, just without real-time info, and
+                # we say so up front so the model doesn't confidently make
+                # something up in its place instead of just returning
+                # None (dead silence + a scary error dump to the log
+                # channel, which is what was happening before).
+                if (
+                    getattr(e, "status_code", None) == 413
+                    and used_browser_search_fallback
+                    and not used_final_fallback
+                ):
+                    err_headers = getattr(getattr(e, "response", None), "headers", None)
+                    if err_headers:
+                        self._log_rate_limits(err_headers, username, model_to_use)
+                    print(f"⚠️ Groq 413 persisted on browser_search too — dropping search entirely, retrying plain...")
+                    used_final_fallback = True
+                    browser_search_active = False
+                    fallback_pool = [
+                        m for m in MODEL_POOL
+                        if "compound" not in m.lower() and "gpt-oss-120b" not in m.lower()
+                    ]
+                    model_to_use = random.choice(fallback_pool) if fallback_pool else self.default_model
+                    prompt = (
+                        f"{prompt}\n\n(Note: live web search wasn't available just now — "
+                        "answer from what you already know, and briefly mention you couldn't "
+                        "pull live results instead of guessing at current facts.)"
+                    )
+                    continue
+
+                err_headers = getattr(getattr(e, "response", None), "headers", None)
+                if err_headers:
+                    self._log_rate_limits(err_headers, username, model_to_use)
+                print(f"⚠️ Groq APIStatusError (status_code={getattr(e, 'status_code', '?')}): {e}")
+                return None
             except Exception as e:
                 # 🌸 BUGFIX: this used to check `"rate" in str(e).lower()`,
                 # which false-positives on all kinds of unrelated errors —

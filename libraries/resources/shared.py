@@ -7,6 +7,18 @@ import asyncio
 import aiosqlite
 from datetime import datetime
 
+import importlib.util as _ilu
+
+# config_loader.py lives in libraries/, one level up from resources/.
+# Loaded by explicit path (not sys.path injection) so we don't disturb
+# import resolution for other modules like my_youtube_channel.py.
+_config_loader_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config_loader.py"
+)
+_spec = _ilu.spec_from_file_location("config_loader", _config_loader_path)
+config_loader = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(config_loader)
+
 # =====================================================================
 # 🌸 BRIDGE PROTOCOL: GLOBAL RESOURCES
 # =====================================================================
@@ -67,10 +79,9 @@ async def bridge_log(interaction: discord.Interaction, command_name: str, argume
     except Exception as e:
         print(f"❌ File Log Error: {e}")
 
-    log_channel_id = 1439421632056655983
-    channel = interaction.client.get_channel(log_channel_id)
+    log_channel_ids = config_loader.get_log_channel_ids()
 
-    if channel:
+    if log_channel_ids:
         embed = discord.Embed(
             title="Command Executed! 🌟",
             description=f"**Full Command:** `{detailed_command}`",
@@ -95,10 +106,16 @@ async def bridge_log(interaction: discord.Interaction, command_name: str, argume
         )
         embed.add_field(name="📤 Result", value=f"\n{output_preview or 'Executed successfully.'}\n", inline=False)
         embed.set_footer(text=f"Requested by {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
-        try:
-            await channel.send(embed=embed)
-        except Exception as e:
-            print(f"❌ Discord Log Error: {e}")
+
+        for log_channel_id in log_channel_ids:
+            channel = interaction.client.get_channel(log_channel_id)
+            if not channel:
+                print(f"❌ Discord Log Error: channel {log_channel_id} not found/cached.")
+                continue
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                print(f"❌ Discord Log Error ({log_channel_id}): {e}")
 
 
 # =====================================================================
