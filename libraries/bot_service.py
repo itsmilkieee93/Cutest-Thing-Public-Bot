@@ -14,7 +14,7 @@ from discord import app_commands
 from collections import deque
 
 # 🌸 NEW: Config loader for Discord snowflake IDs
-from config_loader import get_owner_id, get_test_guild_id
+from config_loader import get_owner_id, get_test_guild_id, get_log_channel_ids
 
 # 🌸 Live stdout/stderr → Discord webhook (color-coded success/warning/error
 # embeds), set in discord_config.py → WEBHOOKS["log_webhook_url"]. Started
@@ -95,11 +95,14 @@ class EnchantedBot(commands.Bot):
         # guild-data sync/cache that feeds them — see groq_service.py.
         self.groq_mentions = GroqMentionService(bot=self)
 
-        # 🌸 Groq activity/error log channels — auth/log_channels.txt, one
-        # Discord channel snowflake ID per line. Supports any number of
-        # channels; every configured channel gets BOTH the 429 rate-limit
-        # alerts and the per-message success logs (see _broadcast_log_embed).
-        self.log_channel_ids = self._load_log_channel_ids("auth/log_channels.txt")
+        # 🌸 REFACTORED: Groq activity/error log channels now live in
+        # discord_config.py → BOT["log_channel_ids"]. Supports any number
+        # of channels; every configured channel gets BOTH the 429
+        # rate-limit alerts and the per-message success logs (see
+        # _broadcast_log_embed).
+        self.log_channel_ids = get_log_channel_ids()
+        if not self.log_channel_ids:
+            print("⚠️ WARNING: log_channel_ids not set in discord_config.py!")
 
         # 🌸 channel_id -> unix timestamp of when Groq priority-reply is
         # allowed to fire again. Empty/expired = Groq is off cooldown.
@@ -112,28 +115,6 @@ class EnchantedBot(commands.Bot):
         # 🌐 Network watchdog state — see network_watchdog() below
         self._net_online = True
         self._net_offline_backoff = NETWORK_CHECK_OFFLINE_MIN
-
-    def _load_log_channel_ids(self, path: str) -> list[int]:
-        """🌸 Reads one Discord channel snowflake ID per line from `path`.
-        Blank lines and lines starting with '#' are skipped so the file can
-        be commented. Bad/non-numeric lines are warned about and skipped
-        rather than crashing startup."""
-        ids = []
-        try:
-            with open(path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.isdigit():
-                        ids.append(int(line))
-                    else:
-                        print(f"⚠️ log_channels.txt: skipping invalid line {line!r}")
-        except FileNotFoundError:
-            print(f"⚠️ {path} not found — Groq logging embeds are disabled until it's created.")
-        except Exception as e:
-            print(f"⚠️ Failed to load log channels: {e}")
-        return ids
 
     async def _broadcast_log_embed(self, embed: discord.Embed):
         """🌸 Sends `embed` to every channel in self.log_channel_ids.

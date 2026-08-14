@@ -42,6 +42,7 @@ from groq_instruct import (
     _looks_server_related,
 )
 from groq_pexels import handle_media_request
+from groq_music_suggestion import handle_music_request
 from resources import shared
 
 # 🌸 Referential word gate for reply-context folding — see the comment
@@ -727,10 +728,20 @@ class GroqMentionService:
                     # image set via set_image() — no raw link text visible,
                     # unlike the old bare-URL auto-embed approach.
                     intercepted = await handle_media_request(message, guild.id, shared)
+                if intercepted is None:
+                    # 🌸 AI-classified MUSIC request — same zero-token-gate-
+                    # then-classify shape as everything else in this chain
+                    # (MUSIC_INTENT_PATTERN local pre-filter, then one Groq
+                    # call). Searches YouTube Music via ytmusicapi and
+                    # returns a discord.Embed with a cute AI summary + top
+                    # tracks, or None if this doesn't look like a music
+                    # request. Runs AFTER handle_media_request so an image
+                    # request never gets accidentally swallowed here first.
+                    intercepted = await handle_music_request(message, guild.id, shared)
                 if intercepted:
-                    # 🌸 handle_media_request returns a discord.Embed (image
-                    # embedded cleanly, no visible link); every other
-                    # interceptor above returns a plain string reply.
+                    # 🌸 handle_media_request/handle_music_request both return
+                    # a discord.Embed; every other interceptor above returns
+                    # a plain string reply.
                     if isinstance(intercepted, discord.Embed):
                         await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                     else:

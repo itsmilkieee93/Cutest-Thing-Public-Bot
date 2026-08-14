@@ -1,21 +1,20 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import aiohttp
 import asyncio
 import logging
 import random
-import isodate
-import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
+
+import yt_dlp
+import aiosqlite
 
 # 🌸 key_config.py lives at auth/key_config.py, gitignored — see generate_key_config.py.
 if "auth" not in sys.path:
     sys.path.insert(0, "auth")
-import key_config
 
 
 # ── Logger (matches music_downloader style) ───────────────────────────────────
@@ -32,125 +31,200 @@ if not logger.handlers:
     logger.addHandler(_log_handler)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 💾 PER-USER INTERACTION STORE  (mirrors music_downloader.py exactly)
-# ══════════════════════════════════════════════════════════════════════════════
-# File layout:
-#   interactions/
-#     StayHalalBro_123456_yt_interaction.json  ← per-user history + button registry
-#     yt_message_index.json                    ← message_id → {username, user_id}
-#
-# Kept separate from music_downloader's message_index.json to avoid schema
-# collisions between the two modules.
-# ─────────────────────────────────────────────────────────────────────────────
-INTERACTIONS_DIR = "interactions"
-os.makedirs(INTERACTIONS_DIR, exist_ok=True)
+# ── Loading GIFs (matches commands_ai.py style) ───────────────────────────────
+LOADING_GIFS = [
+    "https://c.tenor.com/knwWU-EgRmMAAAAC/tenor.gif",
+    "https://c.tenor.com/J9mOaXMbKygAAAAC/tenor.gif",
+    "https://c.tenor.com/plvrL3peoBIAAAAC/tenor.gif",
+    "https://c.tenor.com/Yo4Vo-XCgqEAAAAC/tenor.gif",
+    "https://c.tenor.com/ts-81PaXp3AAAAAC/tenor.gif",
+    "https://c.tenor.com/Ly_w3cT7B04AAAAC/tenor.gif",
+]
 
 
-def _clean_name(username: str) -> str:
-    """Sanitise a Discord username for safe use as part of a filename."""
-    return re.sub(r'[^\w]', '_', str(username))[:24].strip('_') or 'user'
-
-
-def _user_file(username: str, user_id) -> str:
-    return os.path.join(
-        INTERACTIONS_DIR,
-        f"{_clean_name(username)}_{user_id}_yt_interaction.json"
+def _loading_embed(color: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔎 Fetching video info…",
+        description="Hang tight, pulling data via yt-dlp! ⏳",
+        color=color,
     )
+    embed.set_thumbnail(url=random.choice(LOADING_GIFS))
+    return embed
 
 
-def _index_file() -> str:
-    return os.path.join(INTERACTIONS_DIR, "yt_message_index.json")
+# ══════════════════════════════════════════════════════════════════════════════
+# 💾 PER-USER INTERACTION STORE  (aiosqlite, WAL mode — matches bot_history.db)
+# ══════════════════════════════════════════════════════════════════════════════
+# Single DB file instead of per-user JSON files, so storage no longer depends
+# on the bot process's working directory (interactions/*.json broke when the
+# bot was launched from a different CWD than expected). Path is resolved
+# relative to this module's own file location, not os.getcwd().
+# ─────────────────────────────────────────────────────────────────────────────
+DB_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interactions")
+DB_PATH = os.path.join(DB_DIR, "yt_interactions.db")
+os.makedirs(DB_DIR, exist_ok=True)
+
+_db_lock = asyncio.Lock()
+_db: aiosqlite.Connection | None = None
 
 
-def _atomic_write(path: str, data: dict | list) -> None:
-    """Write JSON atomically so a crash mid-write never corrupts data."""
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
-    except OSError as e:
-        logger.error(f"❌ Write failed [{path}]: {e}")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+async def _get_db() -> aiosqlite.Connection:
+    """Lazily open the single shared connection and ensure sync constraints."""
+    global _db
+    if _db is not None:
+        return _db
+    async with _db_lock:
+        if _db is not None:
+            return _db
+        conn = await aiosqlite.connect(DB_PATH)
+        
+        # 🩹 WAL instead of DELETE journal: readers no longer block behind a
+        # writer's fsync, and writes don't need the whole-file rewrite that
+        # DELETE mode does. synchronous=NORMAL is safe under WAL (durable on
+        # app crash, only risks the last commit on a full OS crash — a
+        # message-registry cache doesn't need EXTRA's double-fsync cost).
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA synchronous=NORMAL;")
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS registry (
+                message_id  TEXT PRIMARY KEY,
+                username    TEXT NOT NULL,
+                user_id     TEXT NOT NULL,
+                title       TEXT,
+                description TEXT,
+                color       INTEGER,
+                video_id    TEXT,
+                channel     TEXT,
+                timestamp   TEXT
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                username    TEXT NOT NULL,
+                user_id     TEXT NOT NULL,
+                timestamp   TEXT,
+                query       TEXT,
+                title       TEXT,
+                channel     TEXT,
+                video_id    TEXT,
+                message_id  TEXT,
+                guild_id    TEXT,
+                guild_name  TEXT
+            );
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);"
+        )
+        await conn.commit()
+        _db = conn
+        logger.info(f"✅ SQLite DB hardened at {DB_PATH} (No more .wal/.shm caching)")
+        return _db
 
 
-def _load_user_data(username: str, user_id) -> dict:
-    path = _user_file(username, user_id)
-    if not os.path.exists(path):
-        return {
-            "username": str(username),
-            "user_id":  str(user_id),
-            "history":  [],
-            "registry": {}
-        }
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {
-            "username": str(username),
-            "user_id":  str(user_id),
-            "history":  [],
-            "registry": {}
-        }
-
-
-def _load_index() -> dict:
-    idx = _index_file()
-    if not os.path.exists(idx):
-        return {}
-    try:
-        with open(idx, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_message_record(
+async def _save_message_record(
     message_id: str, username: str, user_id, record: dict
 ) -> None:
-    """Save button data to user file + register message_id in the index."""
-    data = _load_user_data(username, user_id)
-    data.setdefault("registry", {})[str(message_id)] = record
-    _atomic_write(_user_file(username, user_id), data)
+    """Upsert button registry following the strict table constraint layout."""
+    db = await _get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO registry (message_id, username, user_id, title, description, color, video_id, channel, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                username=excluded.username,
+                user_id=excluded.user_id,
+                title=excluded.title,
+                description=excluded.description,
+                color=excluded.color,
+                video_id=excluded.video_id,
+                channel=excluded.channel,
+                timestamp=excluded.timestamp
+            """,
+            (
+                str(message_id), str(username), str(user_id),
+                record.get("title"), record.get("description"), record.get("color"),
+                record.get("video_id"), record.get("channel"), record.get("timestamp"),
+            ),
+        )
+        await db.commit()
+        # 🩹 Checkpoint right after commit so this row lands physically in
+        # yt_interactions.db, not just -wal. WAL's own ~1000-page
+        # auto-checkpoint (or cog_unload's clean close) doesn't fire on a
+        # Termux kill / OOM / crash restart, so data that only lives in -wal
+        # vanishes on reboot even though the write itself succeeded.
+        # PASSIVE mode never blocks concurrent readers/writers, and this
+        # button-press path isn't hot enough for the extra syscall to matter.
+        try:
+            await db.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except Exception as e:
+            logger.warning(f"⚠️ wal_checkpoint after registry save failed: {e}")
+        logger.info(f"💾 Message record {message_id} saved.")
+    except Exception as e:
+        logger.error(f"❌ Failed to execute upsert statement: {e}")
 
-    index = _load_index()
-    index[str(message_id)] = {"username": str(username), "user_id": str(user_id)}
-    _atomic_write(_index_file(), index)
-    logger.info(f"✅ Saved yt record — msg:{message_id} user:{username}")
 
-
-def _get_message_record(message_id: str) -> dict | None:
-    """Look up button data for a message_id via the index (works after restart)."""
-    index = _load_index()
-    entry = index.get(str(message_id))
-    if not entry:
+async def _get_message_record(message_id: str) -> dict | None:
+    """Look up button data based on the exact database column order with safe casting."""
+    db = await _get_db()
+    try:
+        # ✨ THE FIX: Menggunakan CAST agar SQLite mencocokkan ID baik dalam format teks maupun angka bulat
+        async with db.execute(
+            "SELECT title, description, color, video_id, channel, timestamp "
+            "FROM registry WHERE CAST(message_id AS TEXT) = CAST(? AS TEXT)",
+            (str(message_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+        
+        if row is None:
+            logger.warning(f"⚠️ Message ID {message_id} not found in SQLite registry.")
+            return None
+            
+        title, description, color, video_id, channel, timestamp = row
+        return {
+            "title":       str(title or "Unknown Title"),
+            "description": str(description or ""),
+            "color":       int(color) if color is not None else 0xB57EDC,
+            "video_id":    str(video_id or ""),
+            "channel":     str(channel or ""),
+            "timestamp":   str(timestamp or ""),
+        }
+    except Exception as e:
+        logger.error(f"❌ SQLite fetch error for message_id {message_id}: {e}")
         return None
-    data = _load_user_data(entry["username"], entry["user_id"])
-    return data.get("registry", {}).get(str(message_id))
 
-
-def _append_history(username: str, user_id, record: dict) -> None:
-    """Append one search record to the user's history."""
-    data = _load_user_data(username, user_id)
-    data.setdefault("history", []).append(record)
-    _atomic_write(_user_file(username, user_id), data)
+async def _append_history(username: str, user_id, record: dict) -> None:
+    """Insert one search record into the user's history inside SQLite directly."""
+    db = await _get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO history (username, user_id, timestamp, query, title, channel, video_id, message_id, guild_id, guild_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(username), str(user_id), record.get("timestamp"), record.get("query"),
+                record.get("title"), record.get("channel"), record.get("video_id"),
+                record.get("message_id"), record.get("guild_id"), record.get("guild_name"),
+            ),
+        )
+        await db.commit()
+        try:
+            await db.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except Exception as e:
+            logger.warning(f"⚠️ wal_checkpoint after history append failed: {e}")
+        logger.info(f"✨ History appended successfully for user {username}.")
+    except Exception as e:
+        logger.error(f"❌ Failed to append search history to SQLite: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 🕐 Duration formatting helper
 # ══════════════════════════════════════════════════════════════════════════════
-def _fmt_duration(duration) -> str:
-    if isinstance(duration, timedelta):
-        total = int(duration.total_seconds())
-    else:
-        total = int(duration.totimedelta(start=datetime.utcnow()).total_seconds())
-
-    total = max(0, total)
+def _fmt_duration(total_seconds) -> str:
+    total = max(0, int(total_seconds or 0))
     h, remainder = divmod(total, 3600)
     m, s = divmod(remainder, 60)
 
@@ -162,19 +236,101 @@ def _fmt_duration(duration) -> str:
         return f"{s}s"
 
 
+def _fmt_timestamp(total_seconds) -> str:
+    """mm:ss or hh:mm:ss, for pointing at a spot in the video."""
+    total = max(0, int(total_seconds or 0))
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔥 Most-replayed segment helper (from yt-dlp's `heatmap` field)
+# ══════════════════════════════════════════════════════════════════════════════
+def _most_replayed(heatmap: list | None) -> dict | None:
+    """
+    yt-dlp's `heatmap` is a list of {'start_time', 'end_time', 'value'}
+    dicts (value normalised 0-1). Returns the single hottest segment, or
+    None if there's no heatmap data (e.g. new/low-view videos).
+    """
+    if not heatmap:
+        return None
+    try:
+        peak = max(heatmap, key=lambda seg: seg.get("value", 0))
+        return {
+            "start": peak.get("start_time", 0),
+            "end":   peak.get("end_time", 0),
+            "value": peak.get("value", 0),
+        }
+    except (ValueError, TypeError):
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📥 yt-dlp extraction (blocking — always run via asyncio.to_thread)
+# ══════════════════════════════════════════════════════════════════════════════
+YDL_OPTS = {
+    "quiet":            True,
+    "no_warnings":      True,
+    "skip_download":    True,
+    "extract_flat":     False,
+    "noplaylist":       True,
+    "logger":           logging.getLogger("yt_dlp_silent"),
+    # 🩹 Skip DASH/HLS manifest + format resolution — we only need metadata
+    "extractor_args": {
+        "youtube": {
+            "skip": ["dash", "hls", "translated_subs"],
+            "player_client": ["android", "ios", "tv_embedded"],
+            "player_skip": ["webpage"]
+        }
+    },
+}
+
+logging.getLogger("yt_dlp_silent").setLevel(logging.CRITICAL)
+
+
+def _extract_info_sync(url: str) -> dict:
+    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _extract_playlist_sync(url: str) -> dict:
+    opts = dict(YDL_OPTS)
+    opts["noplaylist"] = False
+    opts["extract_flat"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _best_thumbnail(info: dict) -> str | None:
+    """Prefer maxres, fall back down the quality ladder yt-dlp gives us."""
+    thumbs = info.get("thumbnails") or []
+    if thumbs:
+        # yt-dlp sorts thumbnails worst→best by preference; last is best.
+        maxres = [
+            t for t in thumbs
+            if "maxresdefault" in (t.get("url") or "")
+            and (t.get("url") or "").endswith((".jpg", ".jpeg", ".png"))
+        ]
+        if maxres:
+            return maxres[-1]["url"]
+        # otherwise just take the highest-preference (last) real-image thumb
+        image_thumbs = [t for t in thumbs if not (t.get("url") or "").endswith(".webp")]
+        if image_thumbs:
+            return image_thumbs[-1]["url"]
+        return thumbs[-1]["url"]
+    return info.get("thumbnail")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 🎬 YouTube Button View — persistent across restarts
 # ══════════════════════════════════════════════════════════════════════════════
 class YouTubeView(discord.ui.View):
-    def __init__(self, video_url: str):
+    def __init__(self):
+        # ✨ KOSONGKAN PARAMETER AGAR LAYOUT CUSTOM_ID SELALU STATIS PASCA REBOOT
         super().__init__(timeout=None)
-
-        self.add_item(discord.ui.Button(
-            label="View Video",
-            url=video_url,
-            style=discord.ButtonStyle.link,
-            emoji="📲"
-        ))
 
     @discord.ui.button(
         label="View Description",
@@ -185,27 +341,30 @@ class YouTubeView(discord.ui.View):
     async def view_description(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        responded = interaction.response.is_done()
-        if not responded:
-            try:
-                await interaction.response.defer(ephemeral=True)
-                responded = True
-            except discord.errors.NotFound:
-                return
-            except Exception:
-                responded = False
+        logger.info(
+            f"🖱️ view_description clicked | msg="
+            f"{interaction.message.id if interaction.message else '?'} "
+            f"user={interaction.user.id}"
+        )
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ view_description defer failed for msg "
+                f"{interaction.message.id if interaction.message else '?'}: {e}"
+            )
+            return
 
         async def _reply(embed: discord.Embed):
-            if responded:
-                try:
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-                    return
-                except Exception:
-                    pass
             try:
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-            except Exception:
-                pass
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            except Exception as e:
+                logger.error(
+                    f"❌ view_description followup.send failed for msg "
+                    f"{interaction.message.id if interaction.message else '?'}: {e}",
+                    exc_info=True,
+                )
 
         try:
             if interaction.message is None:
@@ -215,10 +374,8 @@ class YouTubeView(discord.ui.View):
                     color=0xFF6B6B
                 ))
 
-            # ── Look up via per-user index (same pattern as music_downloader) ──
-            record = await asyncio.to_thread(
-                _get_message_record, str(interaction.message.id)
-            )
+            # Database lookup using custom cast function
+            record = await _get_message_record(str(interaction.message.id))
 
             if not record:
                 return await _reply(discord.Embed(
@@ -230,8 +387,8 @@ class YouTubeView(discord.ui.View):
                     color=0xFF6B6B
                 ))
 
-            desc  = record.get("description", "").strip()
             title = record.get("title", "Unknown")
+            desc  = record.get("description", "").strip()
             color = record.get("color", 0xB57EDC)
 
             if not isinstance(color, int):
@@ -246,6 +403,7 @@ class YouTubeView(discord.ui.View):
 
             if len(desc) > 4000:
                 desc = desc[:4000] + "\n\n*...Description truncated ✂️*"
+
 
             embed = discord.Embed(
                 title=f"📄 {title}"[:256],
@@ -286,13 +444,24 @@ PASTEL_COLORS = [
 ]
 
 
+
+
 class YouTubeUniversalModule(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        logger.info("🧩 YouTubeUniversalModule cog initialized.")
 
-    def _get_api_key(self):
-        key = (key_config.YOUTUBE_API_KEY or "").strip()
-        return key or None
+    async def cog_load(self):
+        """Memaksa registrasi View Persisten global saat siklus memori Cog aktif."""
+        self.bot.add_view(YouTubeView())
+        logger.info("✅ Persistent YouTubeView successfully mapped inside cog_load!")
+
+    async def cog_unload(self):
+        global _db
+        if _db is not None:
+            await _db.close()
+            _db = None
+            logger.info("🔌 aiosqlite connection closed on cog unload.")
 
     async def yt_autocomplete(self, interaction: discord.Interaction, current: str):
         if not current:
@@ -310,7 +479,7 @@ class YouTubeUniversalModule(commands.Cog):
             logger.warning(f"⚠️ Autocomplete error: {e}")
             return []
 
-    @app_commands.command(name="youtube", description="Get video/playlist metadata via YouTube API v3! ⚡")
+    @app_commands.command(name="youtube", description="Get video/playlist metadata via yt-dlp! ⚡")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(query="Paste a link or search for something...")
@@ -322,9 +491,20 @@ class YouTubeUniversalModule(commands.Cog):
         req_name = str(req_user)
         req_id   = str(req_user.id)
 
-        api_key = self._get_api_key()
-        if not api_key:
-            return await interaction.followup.send("❌ Missing API Key in `key_config.YOUTUBE_API_KEY`!")
+        ui_color = random.choice(PASTEL_COLORS)
+
+        # ── Show a loading embed immediately (gif thumbnail) ────────────────
+        # 🩹 THE FIX: was `interaction.followup.send(..., wait=True)`, which
+        # posts a SEPARATE new message and leaves the deferred "Cutest Thing
+        # is thinking..." placeholder unresolved forever. ~15 min later that
+        # orphaned placeholder's token expires and Discord's client renders
+        # it as "Cutest Thing didn't respond in time" — a ghost message sent
+        # on EVERY /youtube call, independent of how long extraction took.
+        # `edit_original_response()` updates that placeholder in place
+        # instead of creating a second message, so there's nothing left to
+        # ever expire/orphan.
+        await interaction.edit_original_response(embed=_loading_embed(ui_color))
+        loading_msg = await interaction.original_response()
 
         video_id    = None
         playlist_id = None
@@ -357,146 +537,187 @@ class YouTubeUniversalModule(commands.Cog):
             video_id   = q
             target_url = f"https://www.youtube.com/watch?v={video_id}"
         else:
-            search_url = "https://www.googleapis.com/youtube/v3/search"
-            s_params   = {'part': 'snippet', 'q': q, 'type': 'video', 'maxResults': 1, 'key': api_key}
-            async with self.bot.session.get(search_url, params=s_params) as s_resp:
-                s_data   = await s_resp.json()
-                video_id = s_data.get('items', [{}])[0].get('id', {}).get('videoId')
-                if video_id:
-                    target_url = f"https://www.youtube.com/watch?v={video_id}"
-                else:
-                    return await interaction.followup.send("❌ No videos found for that search query.")
+            # Not a direct link/ID — treat as a search term, resolve via yt-dlp's
+            # own search extractor rather than a separate API call.
+            target_url = f"ytsearch1:{q}"
 
         try:
-            ui_color = random.choice(PASTEL_COLORS)
-            embed    = discord.Embed(color=ui_color)
-            snippet  = None
+            embed = discord.Embed(color=ui_color)
+            info  = None
 
-            # ── CASE 1: VIDEO / SHORT ─────────────────────────────────────────
-            if video_id:
-                view = YouTubeView(video_url=target_url)
-
-                v_url    = "https://www.googleapis.com/youtube/v3/videos"
-                v_params = {'part': 'snippet,statistics,contentDetails', 'id': video_id, 'key': api_key}
-                async with self.bot.session.get(v_url, params=v_params) as v_resp:
-                    v_data = await v_resp.json()
-                    if not v_data.get('items'):
-                        return await interaction.followup.send("❌ Video not found or is unavailable.")
-
-                    item    = v_data['items'][0]
-                    snippet = item['snippet']
-                    stats   = item['statistics']
-
-                    date_obj     = datetime.strptime(snippet['publishedAt'], "%Y-%m-%dT%H:%M:%SZ")
-                    pub_date     = date_obj.strftime("%A, %d %B %Y | %H:%M:%S (UTC+0)")
-                    raw_duration = isodate.parse_duration(item['contentDetails']['duration'])
-                    duration_str = _fmt_duration(raw_duration)
-                    is_short     = "/shorts/" in q
-
-                    embed.title  = f"{'📱 Short' if is_short else '🎥 Video'}: {snippet['title']}"
-
-                    likes_val    = f"{int(stats['likeCount']):,}"    if 'likeCount'    in stats else 'Hidden'
-                    comments_val = f"{int(stats['commentCount']):,}" if 'commentCount' in stats else 'Disabled'
-
-                    embed.add_field(name="👤 Publisher",      value=snippet['channelTitle'],               inline=True)
-                    embed.add_field(name="📅 Date Published", value=pub_date,                              inline=True)
-                    embed.add_field(name="⏱️ Duration",       value=duration_str,                          inline=True)
-                    embed.add_field(name="👀 Views",           value=f"{int(stats.get('viewCount', 0)):,}", inline=True)
-                    embed.add_field(name="👍 Likes",           value=likes_val,                             inline=True)
-                    embed.add_field(name="💬 Comments",        value=comments_val,                          inline=True)
-                    embed.add_field(name="🆔 Video ID",        value=video_id,                              inline=True)
-
-                    thumb = (
-                        snippet['thumbnails'].get('maxres', {}).get('url')
-                        or snippet['thumbnails'].get('high',   {}).get('url')
-                    )
-                    embed.set_image(url=thumb)
-
-            # ── CASE 2: PLAYLIST ──────────────────────────────────────────────
-            elif playlist_id:
+            # ── CASE 1: PLAYLIST ─────────────────────────────────────────────
+            if playlist_id:
                 view = discord.ui.View()
 
-                p_url    = "https://www.googleapis.com/youtube/v3/playlists"
-                p_params = {'part': 'snippet,contentDetails', 'id': playlist_id, 'key': api_key}
-                async with self.bot.session.get(p_url, params=p_params) as p_resp:
-                    p_data = await p_resp.json()
-                    if not p_data.get('items'):
-                        return await interaction.followup.send("❌ Playlist not found or is unavailable.")
-
-                    item    = p_data['items'][0]
-                    snippet = item['snippet']
-
-                    date_obj = datetime.strptime(snippet['publishedAt'], "%Y-%m-%dT%H:%M:%SZ")
-                    pub_date = date_obj.strftime("%A, %d %B %Y | %H:%M:%S (UTC+0)")
-
-                    embed.title = f"📂 Playlist: {snippet['title']}"
-                    embed.add_field(name="👤 Creator",      value=snippet['channelTitle'],                  inline=True)
-                    embed.add_field(name="📅 Created On",   value=pub_date,                                 inline=True)
-                    embed.add_field(name="📦 Total Videos", value=str(item['contentDetails']['itemCount']), inline=True)
-                    embed.add_field(name="🔗 Link",          value=f"[Open Playlist]({target_url}) ✨",      inline=True)
-
-                    embed.set_image(url=(
-                        snippet['thumbnails'].get('maxres', {}).get('url')
-                        or snippet['thumbnails'].get('high',   {}).get('url')
-                        or snippet['thumbnails'].get('medium', {}).get('url', '')
+                info = await asyncio.to_thread(_extract_playlist_sync, target_url)
+                if not info:
+                    return await loading_msg.edit(embed=discord.Embed(
+                        title="❌ Playlist not found",
+                        description="Playlist not found or is unavailable.",
+                        color=0xFF6B6B
                     ))
-                    view.add_item(discord.ui.Button(
-                        label="View Playlist",
-                        url=target_url,
-                        style=discord.ButtonStyle.link,
-                        emoji="📂"
-                    ))
+
+                entries    = info.get("entries") or []
+                pl_title   = info.get("title", "Unknown Playlist")
+                pl_channel = info.get("uploader") or info.get("channel") or "Unknown"
+
+                embed.title = f"📂 Playlist: {pl_title}"
+                embed.add_field(name="👤 Creator",      value=pl_channel,                      inline=True)
+                embed.add_field(name="📦 Total Videos", value=str(len(entries)),               inline=True)
+                embed.add_field(name="🔗 Link",          value=f"[Open Playlist]({target_url}) ✨", inline=True)
+
+                thumb = None
+                if entries:
+                    first_id = entries[0].get("id")
+                    if first_id:
+                        thumb = f"https://i.ytimg.com/vi/{first_id}/maxresdefault.jpg"
+                if thumb:
+                    embed.set_image(url=thumb)
+
+                view.add_item(discord.ui.Button(
+                    label="View Playlist",
+                    url=target_url,
+                    style=discord.ButtonStyle.link,
+                    emoji="📂"
+                ))
+
+            # ── CASE 2: VIDEO / SHORT / SEARCH ──────────────────────────────
             else:
-                return await interaction.followup.send("❌ Could not determine video or playlist ID.")
+                info = await asyncio.to_thread(_extract_info_sync, target_url)
+                if not info:
+                    return await loading_msg.edit(embed=discord.Embed(
+                        title="❌ Video not found",
+                        description="No videos found for that search/link.",
+                        color=0xFF6B6B
+                    ))
+
+                # ytsearch1: returns a playlist-shaped wrapper with 1 entry
+                if info.get("_type") == "playlist":
+                    entries = info.get("entries") or []
+                    if not entries:
+                        return await loading_msg.edit(embed=discord.Embed(
+                            title="❌ No results",
+                            description="No videos found for that search query.",
+                            color=0xFF6B6B
+                        ))
+                    info = entries[0]
+
+                video_id   = info.get("id")
+                target_url = info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+                view = YouTubeView()
+                view.add_item(discord.ui.Button(
+                    label="View Video",
+                    url=target_url,
+                    style=discord.ButtonStyle.link,
+                    emoji="📲"
+                ))
+
+                title    = info.get("title") or info.get("fulltitle") or "Unknown Title"
+                channel  = info.get("uploader") or info.get("channel") or "Unknown"
+                is_short = "/shorts/" in (info.get("webpage_url") or q)
+
+                view_count    = info.get("view_count")
+                like_count    = info.get("like_count")
+                comment_count = info.get("comment_count")
+                duration_s    = info.get("duration")
+
+                upload_date = info.get("upload_date")  # YYYYMMDD
+                if upload_date:
+                    try:
+                        date_obj = datetime.strptime(upload_date, "%Y%m%d")
+                        pub_date = date_obj.strftime("%A, %d %B %Y")
+                    except ValueError:
+                        pub_date = "Unknown"
+                else:
+                    pub_date = "Unknown"
+
+                embed.title = f"{'📱 Short' if is_short else '🎥 Video'}: {title}"
+
+                views_val    = f"{int(view_count):,}"    if view_count    is not None else "Hidden"
+                likes_val    = f"{int(like_count):,}"    if like_count    is not None else "Hidden"
+                comments_val = f"{int(comment_count):,}" if comment_count is not None else "Disabled"
+
+                embed.add_field(name="👤 Author",         value=channel,                        inline=True)
+                embed.add_field(name="📅 Date Published", value=pub_date,                       inline=True)
+                embed.add_field(name="⏱️ Duration",       value=_fmt_duration(duration_s),      inline=True)
+                embed.add_field(name="👀 Views",          value=views_val,                       inline=True)
+                embed.add_field(name="👍 Likes",          value=likes_val,                       inline=True)
+                embed.add_field(name="💬 Comments",       value=comments_val,                    inline=True)
+
+                # ── Most replayed part (from heatmap, if YouTube has one) ──
+                peak = _most_replayed(info.get("heatmap"))
+                if peak:
+                    ts_link = f"{target_url}&t={int(peak['start'])}s" if "watch?v=" in target_url else target_url
+                    embed.add_field(
+                        name="🔥 Most Replayed",
+                        value=f"[{_fmt_timestamp(peak['start'])}–{_fmt_timestamp(peak['end'])}]({ts_link})",
+                        inline=True
+                    )
+
+                embed.add_field(name="🆔 Video ID", value=video_id, inline=True)
+
+                thumb = _best_thumbnail(info)
+                if thumb:
+                    embed.set_image(url=thumb)
 
             embed.set_footer(
-                text="YouTube ✨️",
-                icon_url=(
-                    "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/"
-                    "YouTube_social_white_squircle_%282024%29.svg/"
-                    "1280px-YouTube_social_white_squircle_%282024%29.svg.png"
-                )
+                text="YouTube • via yt-dlp ✨️",
+                icon_url="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/YouTube_social_white_squircle_%282024%29.svg/1280px-YouTube_social_white_squircle_%282024%29.svg.png"
             )
 
-            # ── Send (wait=True so we have the message ID immediately) ─────────
-            sent_msg = await interaction.followup.send(embed=embed, view=view, wait=True)
 
-            # ── Persist per-user record (same pattern as music_downloader) ─────
-            if video_id and sent_msg and snippet:
+            # ── Swap the loading embed for the real result ─────────────────
+            await loading_msg.edit(embed=embed, view=view)
+
+            # ── Persist per-user record (same pattern as music_downloader) ─
+            if video_id and info:
+                title       = info.get("title") or "Unknown Title"
+                description = info.get("description", "") or ""
+                channel     = info.get("uploader") or info.get("channel") or ""
+
                 registry_record = {
-                    "title":       snippet['title'],
-                    "description": snippet.get('description', ''),
+                    "title":       title,
+                    "description": description,
                     "color":       ui_color,
                     "video_id":    video_id,
-                    "channel":     snippet.get('channelTitle', ''),
+                    "channel":     channel,
                     "timestamp":   datetime.now().isoformat(),
                 }
-                # 1. Button registry + index (for View Description after restart)
-                await asyncio.to_thread(
-                    _save_message_record,
-                    str(sent_msg.id), req_name, req_id, registry_record
+                # 1. Button registry (for View Description after restart)
+                await _save_message_record(
+                    str(loading_msg.id), req_name, req_id, registry_record
                 )
                 # 2. Search history
-                await asyncio.to_thread(
-                    _append_history, req_name, req_id,
+                await _append_history(
+                    req_name, req_id,
                     {
                         "timestamp":  datetime.now().isoformat(),
                         "query":      query,
-                        "title":      snippet['title'],
-                        "channel":    snippet.get('channelTitle', ''),
+                        "title":      title,
+                        "channel":    channel,
                         "video_id":   video_id,
-                        "message_id": str(sent_msg.id),
+                        "message_id": str(loading_msg.id),
                         "guild_id":   str(interaction.guild_id or "DM"),
                         "guild_name": interaction.guild.name if interaction.guild else "DM",
                     }
                 )
 
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"❌ yt-dlp DownloadError for {req_user}: {e}")
+            await loading_msg.edit(embed=discord.Embed(
+                title="❌ Couldn't fetch that",
+                description=f"```{str(e)[:200]}```",
+                color=0xFF6B6B
+            ))
         except Exception as e:
             logger.error(f"❌ yt_universal error for {req_user}: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error: `{str(e)[:200]}`")
+            await loading_msg.edit(embed=discord.Embed(
+                title="❌ Something went wrong",
+                description=f"```{str(e)[:200]}```",
+                color=0xFF6B6B
+            ))
 
 
 async def setup(bot):
     await bot.add_cog(YouTubeUniversalModule(bot))
-    bot.add_view(YouTubeView(video_url="https://youtube.com"))
-    print("✅ YouTube Module loaded successfully!")
+    print("✅ YouTube Module loaded successfully! (Fixed Cog-Load Lifecycle)")

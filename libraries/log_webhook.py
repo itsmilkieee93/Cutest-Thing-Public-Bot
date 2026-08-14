@@ -28,10 +28,16 @@ import config_loader
 
 # ── Tunables ──────────────────────────────────────────────────────────
 BATCH_WINDOW = 4.0           # seconds to accumulate lines before flushing one embed
-MAX_LINES_PER_EMBED = 15     # safety cap so crash-spam can't flood the channel
-MAX_FIELD_LEN = 500          # Discord embed description soft-wrap point per severity group
+MAX_LINES_PER_BATCH = 300    # safety cap so crash-spam can't flood the channel (was 15 — that's
+                              # what was silently dropping most of a batch and forcing hard
+                              # truncation of tracebacks)
+MAX_FIELD_LEN = 1970         # a group's text can live in one embed's description up to this
+                              # length — kept under 2000 once wrapped in ``` fences (6 chars).
+                              # Longer groups are split across multiple embeds of this size
+                              # instead of being truncated or sent as a file attachment.
 MAX_TOTAL_EMBED_CHARS = 5500 # stay under Discord's hard 6000-char total-embed limit (with headroom)
-FLUSH_QUEUE_MAX = 300        # drop oldest if this backs up (webhook down / no internet)
+MAX_EMBEDS_PER_MESSAGE = 10  # Discord's hard limit on embeds per webhook message
+FLUSH_QUEUE_MAX = 2000       # drop oldest if this backs up (webhook down / no internet)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -59,6 +65,33 @@ def classify(line: str) -> str:
         if pattern.search(line):
             return severity
     return "info"
+
+
+def chunk_lines(group_lines: list[str], max_len: int) -> list[str]:
+    """🌸 Split a list of log lines into text chunks that each stay under
+    max_len chars, breaking on line boundaries so a traceback frame is
+    never sliced mid-line. If a single line is itself longer than
+    max_len, it gets hard-wrapped as a last resort."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in group_lines:
+        line_len = len(line) + 1  # +1 for the joining newline
+        if current and current_len + line_len > max_len:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        if line_len > max_len:
+            # 🌸 One monster line on its own — hard-wrap it so it still
+            # fits rather than blowing the budget of every chunk it touches.
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i:i + max_len])
+            continue
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
 
 
 class _Tee:
@@ -192,53 +225,79 @@ class LogShipper:
 
     async def _ship_batch(self, session: aiohttp.ClientSession, lines: list[str]):
         """Group consecutive same-severity lines together so a batch with
-        one warning + a wall of info doesn't get flattened into one color."""
+        one warning + a wall of info doesn't get flattened into one color.
+
+        Long groups (full tracebacks etc.) are split across multiple
+        embeds — each kept under 2000 chars — instead of being truncated
+        or sent as a file attachment. Everything ships as embeds only."""
         groups: list[tuple[str, list[str]]] = []
-        for line in lines[:MAX_LINES_PER_EMBED]:
+        for line in lines[:MAX_LINES_PER_BATCH]:
             severity = classify(line)
             if groups and groups[-1][0] == severity:
                 groups[-1][1].append(line)
             else:
                 groups.append((severity, [line]))
 
-        dropped = len(lines) - MAX_LINES_PER_EMBED
-        embeds = []
+        dropped = len(lines) - MAX_LINES_PER_BATCH
+        all_embeds = []
         running_total = 0
-        omitted_groups = 0
-        for severity, group_lines in groups[:10]:  # Discord allows max 10 embeds/message
-            style = SEVERITY_STYLE[severity]
-            text = "\n".join(group_lines)
-            if len(text) > MAX_FIELD_LEN:
-                text = text[: MAX_FIELD_LEN - 20] + "\n... (truncated)"
-            title = f"{style['emoji']} {style['label']}"
-            desc = f"```{text}```"
-            # 🌸 Rough char cost Discord counts toward the 6000-char total
-            # embed budget (title + description, roughly).
-            cost = len(title) + len(desc)
-            if running_total + cost > MAX_TOTAL_EMBED_CHARS:
-                omitted_groups += 1
-                continue
-            running_total += cost
-            embeds.append({
-                "title": title,
-                "description": desc,
-                "color": style["color"],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
 
-        if dropped > 0 or omitted_groups > 0:
-            note = []
-            if dropped > 0:
-                note.append(f"{dropped} line(s) over the per-batch cap")
-            if omitted_groups > 0:
-                note.append(f"{omitted_groups} group(s) omitted (embed size budget)")
-            embeds.append({
+        for severity, group_lines in groups:
+            style = SEVERITY_STYLE[severity]
+            chunks = chunk_lines(group_lines, MAX_FIELD_LEN)
+            total_parts = len(chunks)
+            for part_i, chunk_text in enumerate(chunks, start=1):
+                title = f"{style['emoji']} {style['label']}"
+                if total_parts > 1:
+                    title += f" ({part_i}/{total_parts})"
+                desc = f"```{chunk_text}```"
+                cost = len(title) + len(desc)
+                all_embeds.append({
+                    "title": title,
+                    "description": desc,
+                    "color": style["color"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "_cost": cost,
+                })
+
+        note = []
+        if dropped > 0:
+            note.append(f"{dropped} line(s) over the per-batch cap")
+
+        # 🌸 Send in message-sized batches: up to MAX_EMBEDS_PER_MESSAGE
+        # embeds and MAX_TOTAL_EMBED_CHARS total per webhook POST. Nothing
+        # gets omitted — a batch that's too big for one message just
+        # becomes multiple messages.
+        message_embeds: list[dict] = []
+        message_cost = 0
+        for embed in all_embeds:
+            cost = embed.pop("_cost")
+            fits_count = len(message_embeds) < MAX_EMBEDS_PER_MESSAGE
+            fits_budget = message_cost + cost <= MAX_TOTAL_EMBED_CHARS
+            if message_embeds and not (fits_count and fits_budget):
+                await self._post(session, message_embeds)
+                message_embeds = []
+                message_cost = 0
+            message_embeds.append(embed)
+            message_cost += cost
+
+        if note:
+            note_embed = {
                 "title": "⚠️ Warning",
                 "description": f"```{' | '.join(note)} — spamming too fast```",
                 "color": SEVERITY_STYLE["warning"]["color"],
-            })
+            }
+            note_cost = len(note_embed["title"]) + len(note_embed["description"])
+            if message_embeds and (
+                len(message_embeds) >= MAX_EMBEDS_PER_MESSAGE
+                or message_cost + note_cost > MAX_TOTAL_EMBED_CHARS
+            ):
+                await self._post(session, message_embeds)
+                message_embeds = []
+            message_embeds.append(note_embed)
 
-        await self._post(session, embeds)
+        if message_embeds:
+            await self._post(session, message_embeds)
 
     async def _post(self, session: aiohttp.ClientSession, embeds: list[dict]):
         backoff = [0, 1, 2, 5, 10]

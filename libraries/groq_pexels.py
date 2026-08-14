@@ -168,7 +168,10 @@ CLASSIFY_SYSTEM_PROMPT = (
     "rather than fetch a stock one), set is_media_request to false and "
     "kind/query to null.\n"
     "- Never include commentary, markdown, or text outside the JSON "
-    "object."
+    "object. \n"
+    "CRITICAL RULE: If the user is asking for a SONG, MUSIC, TRACK, or AUDIO "
+    "(e.g., 'give me a song by...'), you MUST set is_media_request to false and kind/query to null. "
+    "Songs are NOT visual media requests."
 )
 
 
