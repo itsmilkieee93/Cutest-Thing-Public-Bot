@@ -1,0 +1,10 @@
+# 🌸 greetings.txt — Greeting triggers
+# Format: trigger|reply
+# Lines starting with # are ignored.
+
+hello|Hello there! 🌸 Hope you're having a great day!
+hi|Hii! 💖 How are you doing?
+good morning|Good morning! ☀️ Wishing you the best day ever!
+good night|Good night! 🌙 Sweet dreams! ✨
+good evening|Good evening! 🌸 Hope your day went well!
+hey|Hey hey! 👋 What's up?
