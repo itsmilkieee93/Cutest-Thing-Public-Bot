@@ -60,7 +60,8 @@ def _loading_embed(color: int) -> discord.Embed:
 # bot was launched from a different CWD than expected). Path is resolved
 # relative to this module's own file location, not os.getcwd().
 # ─────────────────────────────────────────────────────────────────────────────
-DB_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interactions")
+DB_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "interactions")
+DB_DIR  = os.path.normpath(DB_DIR)
 DB_PATH = os.path.join(DB_DIR, "yt_interactions.db")
 os.makedirs(DB_DIR, exist_ok=True)
 

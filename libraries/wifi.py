@@ -96,8 +96,8 @@ class SpeedTestModule(commands.Cog):
                 st = speedtest.Speedtest(secure=True)
                 st.get_servers()
                 st.get_best_server()
-                st.download(threads=4)   # ← multi-thread for accuracy
-                st.upload(threads=4, pre_allocate=False)  # ← fix low upload bug
+                st.download(threads=8)   # ← multi-thread for accuracy
+                st.upload(threads=8, pre_allocate=False)  # ← fix low upload bug
                 return st.results.dict()
 
             results = await asyncio.to_thread(run_test)

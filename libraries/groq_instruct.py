@@ -1361,7 +1361,7 @@ def _strip_reasoning(text: str) -> str:
 # single-word classification, so it's tuned for minimum input+output
 # tokens rather than quality: short system prompt, no few-shot examples,
 # max_tokens=6, temperature=0.
-CLASSIFIER_MODEL = "llama-3.1-8b-instant"
+CLASSIFIER_MODEL = "openai/gpt-oss-20b"
 
 # 🌸 Label -> handler map. Each label corresponds 1:1 to one of the
 # handle_*_query functions above/below. "none" means "not a server-info

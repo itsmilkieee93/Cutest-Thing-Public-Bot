@@ -121,6 +121,16 @@ PIXABAY_API_BASE = "https://pixabay.com/api"
 # route to Pixabay (different image_type), "photo"/"video" route to Pexels.
 VALID_KINDS = {"photo", "video", "vector", "cartoon"}
 
+# 🌸 Local fallback net for the anime/manga -> "cartoon" rule (see
+# CLASSIFY_SYSTEM_PROMPT). Pexels is a real-photography stock library —
+# an "anime image" search against it surfaces things like cosplay
+# photoshoots or convention photos, which LOOK related by tag/keyword
+# but are the opposite of what "anime image" means (drawn/illustrated
+# art). This catches it locally even on the rare classifier miss.
+ANIME_STYLE_PATTERN = re.compile(
+    r"\b(anime|manga|chibi|waifu|husbando)\b", re.IGNORECASE
+)
+
 
 # ── Shared Groq client ─────────────────────────────────────────────────────
 
@@ -139,7 +149,7 @@ def _get_groq_client() -> Groq | None:
 
 # 🌸 Fast/small model — this call needs to be quick since it gates every
 # mention, but still sharp enough for reliable JSON + intent judgment.
-CLASSIFY_MODEL = "llama-3.1-8b-instant"
+CLASSIFY_MODEL = "openai/gpt-oss-20b"
 
 CLASSIFY_SYSTEM_PROMPT = (
     "You are a strict intent classifier for a Discord bot's media-fetch "
@@ -159,8 +169,16 @@ CLASSIFY_SYSTEM_PROMPT = (
     "'got any vids of X', 'draw— I mean find me a vector of X'.\n"
     "- kind is 'vector' for vector/vector-art/vector-graphic requests; "
     "'cartoon' for cartoon/clipart/illustration/drawing/sketch/animated-"
-    "style requests; 'video'/'clip' wording -> 'video'; otherwise "
-    "'photo' is the default for real-photo requests.\n"
+    "style/ANIME/manga/chibi/waifu requests; 'video'/'clip' wording -> "
+    "'video'; otherwise 'photo' is the default for real-photo requests.\n"
+    "- CRITICAL: anime, manga, chibi, and waifu are ALWAYS 'cartoon', "
+    "NEVER 'photo' — even when the message just says 'anime image' or "
+    "'anime picture' with no other style words. These are drawn/"
+    "illustrated art styles, not real photography, and must route to "
+    "the illustration search, not the stock-photo search. A real "
+    "photo of a person cosplaying an anime character is NOT what the "
+    "user means by 'anime image' — they mean actual anime-style "
+    "artwork.\n"
     "- query is the bare subject only — no style words, no filler like "
     "'please'/'pls', no leading articles ('a'/'an'/'the'), lowercase.\n"
     "- If the message is NOT a media request (e.g. it's a question, "
@@ -194,13 +212,30 @@ async def _classify_media_request(content: str) -> dict | None:
                 {"role": "user", "content": content},
             ],
             temperature=0.1,
-            max_tokens=80,
+            # 🌸 openai/gpt-oss-20b is a REASONING model — it spends tokens
+            # on hidden chain-of-thought before emitting content, so
+            # reasoning_effort="low" + generous max_tokens is required or
+            # it can burn the whole budget before ever reaching valid JSON.
+            # This is exactly what "Failed to generate JSON... max
+            # completion tokens reached before generating a valid document"
+            # meant — max_tokens=80 with default (medium) reasoning_effort
+            # left no room for the actual JSON object. Same root cause as
+            # the Aug 2026 music-classifier outage in groq_music_suggestion.py.
+            reasoning_effort="low",
+            max_tokens=300,
             response_format={"type": "json_object"},
         )
 
     try:
         response = await asyncio.to_thread(_call)
         raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            # 🌸 Same empty-content symptom the music classifier hit —
+            # flag it distinctly from a genuine JSON parse error so a
+            # reasoning-token regression like this is obvious in logs
+            # instead of looking like a one-off malformed response.
+            logger.warning("Media request classification returned EMPTY content — check reasoning_effort/max_tokens")
+            return None
         result = json.loads(raw)
     except Exception as e:
         logger.warning(f"Media request classification failed: {e}")
@@ -229,6 +264,17 @@ async def _classify_media_request(content: str) -> dict | None:
     if not query or len(query.split()) > 6:
         return {"is_media_request": False, "kind": None, "query": None}
 
+    # 🌸 Belt-and-suspenders on top of the prompt's own anime/manga rule
+    # above — a probabilistic classifier can still miss it occasionally
+    # (see the "anime image" -> real cosplay photo mixup), and getting
+    # this specific case wrong is the single most visible failure mode
+    # (a real photo when the user very clearly wanted drawn art). Cheap
+    # local regex check on the ORIGINAL message content, not just the
+    # extracted query, so it still catches "anime" even if the model
+    # trimmed it out of the query string itself.
+    if kind == "photo" and ANIME_STYLE_PATTERN.search(content):
+        kind = "cartoon"
+
     return {"is_media_request": True, "kind": kind, "query": query}
 
 
@@ -240,7 +286,7 @@ def _resolve_pixabay_image_type(kind: str) -> str:
 #    GroqService personality/memory pipeline — cheap throwaway flavor) ────
 
 CAPTION_CHANCE = 0.45
-CAPTION_MODEL = "llama-3.1-8b-instant"
+CAPTION_MODEL = "openai/gpt-oss-20b"
 
 CAPTION_SYSTEM_PROMPT = (
     "You are Cutest Thing, a kawaii-themed Discord bot with a pink/purple "
@@ -278,7 +324,12 @@ async def _maybe_caption_text(query: str, kind: str, force: bool = False) -> str
                 {"role": "user", "content": f"You found a {kind} of: {query}"},
             ],
             temperature=0.9,
-            max_tokens=30,
+            # 🌸 Same reasoning-model headroom fix as _classify_media_request
+            # above — 30 tokens with default reasoning_effort risked an
+            # empty caption (silently skipped, which is low-stakes here,
+            # but no reason to leave the same bug lurking twice).
+            reasoning_effort="low",
+            max_tokens=120,
         )
 
     try:

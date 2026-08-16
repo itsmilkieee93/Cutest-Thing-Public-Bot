@@ -396,12 +396,29 @@ class GroqService:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
-                max_tokens=10,
+                # 🌸 gpt-oss-safeguard-20b is documented (see groq_instruct.py)
+                # as a "safety REASONING model" — it spends tokens on hidden
+                # chain-of-thought before writing SAFE/UNSAFE, so max_tokens=10
+                # with no reasoning_effort almost certainly burned the whole
+                # budget on invisible reasoning and returned empty content
+                # every time. That's the WORST version of this bug found so
+                # far: check_safety fails OPEN (returns True) on empty/failed
+                # content, meaning this safety gate has likely been silently
+                # rubber-stamping everything as safe instead of actually
+                # classifying it. Same root cause as the classifier bugs
+                # already fixed in groq_pexels.py, groq_exa_search.py, and
+                # classify_server_query/classify_search_intent above —
+                # reasoning_effort="low" + real max_tokens headroom fixes it.
+                reasoning_effort="low",
+                max_tokens=150,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             verdict = (response.choices[0].message.content or "").strip().upper()
+            if not verdict:
+                print(f"🛡️⚠️ Safeguard returned EMPTY content for {username} — check reasoning_effort/max_tokens (failing open)")
+                return True
             is_safe = not verdict.startswith("UNSAFE")
             if not is_safe:
                 print(f"🛡️ Safeguard blocked a message from {username}: {prompt[:80]!r}")
@@ -453,12 +470,17 @@ class GroqService:
                     {"role": "user", "content": reply},
                 ],
                 temperature=0,
-                max_tokens=10,
+                # 🌸 Same reasoning-model fix as check_safety above.
+                reasoning_effort="low",
+                max_tokens=150,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             verdict = (response.choices[0].message.content or "").strip().upper()
+            if not verdict:
+                print(f"🛡️⚠️ Output safeguard returned EMPTY content for {username} — check reasoning_effort/max_tokens (failing open)")
+                return True
             is_safe = not verdict.startswith("UNSAFE")
             if not is_safe:
                 print(f"🛡️ Output safeguard blocked a reply meant for {username}: {reply[:80]!r}")
@@ -492,12 +514,27 @@ class GroqService:
                     {"role": "user", "content": message_content},
                 ],
                 temperature=0,
-                max_tokens=6,
+                # 🌸 CLASSIFIER_MODEL (openai/gpt-oss-20b) is a REASONING
+                # model — it spends tokens on hidden chain-of-thought
+                # before emitting any visible content, so max_tokens=6
+                # with no reasoning_effort left it burning the entire
+                # budget on invisible reasoning before ever reaching the
+                # actual label, coming back as empty content (which this
+                # function's own except/fallback then silently absorbed
+                # as "none" every time — same root cause already found
+                # and fixed in groq_pexels.py and groq_exa_search.py).
+                # reasoning_effort="low" + enough max_tokens for a short
+                # reasoning pass + the label fixes it.
+                reasoning_effort="low",
+                max_tokens=150,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             label = (response.choices[0].message.content or "").strip().lower()
+            if not label:
+                print(f"⚠️ Server-query classifier returned EMPTY content for {username} — check reasoning_effort/max_tokens")
+                return "none"
             # 🌸 Defensive parse: strip stray punctuation/quotes the model
             # sometimes wraps a single-word answer in, then take just the
             # first token in case it still adds a trailing word.
@@ -539,12 +576,22 @@ class GroqService:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
-                max_tokens=4,
+                # 🌸 Same reasoning-model fix as classify_server_query
+                # above — max_tokens=4 left zero room for gpt-oss-20b's
+                # hidden reasoning pass to finish before the budget ran
+                # out, so this was almost certainly always returning
+                # empty content and silently falling back to False/regex
+                # every single call.
+                reasoning_effort="low",
+                max_tokens=150,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             verdict = (response.choices[0].message.content or "").strip().upper()
+            if not verdict:
+                print(f"⚠️ Search-intent classifier returned EMPTY content for {username} — check reasoning_effort/max_tokens")
+                return False
             return verdict.startswith("YES")
         except Exception as e:
             print(f"⚠️ Search-intent classifier error (falling back to regex) for {username}: {e}")

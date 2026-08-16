@@ -35,6 +35,7 @@ from gemini_service import GeminiService
 # Import separated modules
 from groq_ai import GroqService
 from groq_service import GroqMentionService
+from groq_music_suggestion import register_persistent_music_view
 from roulette import RouletteService
 from discord_commands import register_all_cogs
 from resources import shared
@@ -416,6 +417,13 @@ class EnchantedBot(commands.Bot):
         """🌸 Setup hook — runs once on startup before connecting."""
         connector    = aiohttp.TCPConnector(limit=10, force_close=True, enable_cleanup_closed=True)
         self.session = aiohttp.ClientSession(connector=connector)
+
+        # 🌸 Persistent view registration MUST happen here (before the
+        # gateway connects), not in on_ready — this is what makes the
+        # music paginator's ◀️/▶️ buttons keep working on OLD messages
+        # after a bot restart. See MusicPaginatorView / custom_id
+        # scheme in groq_music_suggestion.py.
+        register_persistent_music_view(self)
 
         # 🌸 Full guild data sync (metadata/roles/channels/members) now
         # happens in on_ready instead — self.guilds is still empty here,

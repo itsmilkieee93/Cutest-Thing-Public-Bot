@@ -41,7 +41,7 @@ JINA_READER_BASE = "https://r.jina.ai/"
 # 🌸 Same rationale as CLASSIFIER_MODEL in groq_instruct.py — this is a
 # single summarization call, not a chat reply, so pick the
 # smallest/fastest model rather than a bigger one.
-JINA_SUMMARY_MODEL = "llama-3.1-8b-instant"
+JINA_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 JINA_SUMMARY_SYSTEM_PROMPT = (
     "Summarize the following news article text into a short, factual "
@@ -85,7 +85,7 @@ CURRENTS_CATEGORIES = [
 
 # 🌸 Same smallest/fastest model as JINA_SUMMARY_MODEL — this call
 # returns a tiny JSON object, no reasoning needed.
-CATEGORY_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
+CATEGORY_CLASSIFIER_MODEL = "openai/gpt-oss-20b"
 
 CATEGORY_CLASSIFIER_POLICY = (
     "Classify the USER QUERY into the single best-fit category from "
@@ -202,12 +202,32 @@ class ExaSearchService:
                     {"role": "user", "content": query},
                 ],
                 temperature=0,
-                max_tokens=40,
+                # 🌸 openai/gpt-oss-20b is a REASONING model — it spends
+                # tokens on hidden chain-of-thought before emitting any
+                # content, so a tight max_tokens with no reasoning_effort
+                # set can exhaust the whole budget before reaching valid
+                # JSON (symptom: empty .content, not a JSON parse error).
+                # reasoning_effort="low" + generous max_tokens fixes it —
+                # same root cause as the Aug 2026 music-classifier outage
+                # in groq_music_suggestion.py and the media-classifier fix
+                # in groq_pexels.py.
+                reasoning_effort="low",
+                max_tokens=300,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             raw = (response.choices[0].message.content or "").strip()
+            if not raw:
+                # 🌸 Same empty-content symptom as the reasoning-token
+                # regressions elsewhere — flag it distinctly from a
+                # genuine JSON parse error so it's obvious in logs
+                # rather than looking like a one-off malformed reply.
+                exa_logger.warning(
+                    f"[classify_categories] EMPTY content for query={query!r} "
+                    "— check reasoning_effort/max_tokens"
+                )
+                return defaults
             # 🌸 Defensive strip: some models wrap JSON in ```json fences
             # even when told not to — same belt-and-suspenders approach
             # as _strip_reasoning in groq_instruct.py.
@@ -395,13 +415,23 @@ class ExaSearchService:
                     {"role": "user", "content": f"Topic: {query}\n\n{article_text}"},
                 ],
                 temperature=0.3,
-                max_tokens=200,
+                # 🌸 Same reasoning-model fix as classify_categories above —
+                # openai/gpt-oss-20b needs reasoning_effort="low" or its
+                # hidden chain-of-thought can eat the whole max_tokens
+                # budget before writing the actual summary, coming back
+                # as empty content instead of an error.
+                reasoning_effort="low",
+                max_tokens=500,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             summary = (response.choices[0].message.content or "").strip()
             if not summary:
+                exa_logger.warning(
+                    f"[_summarize_with_groq] EMPTY content for query={query!r} "
+                    "— check reasoning_effort/max_tokens"
+                )
                 return article_text[:max_chars]
             if len(summary) > max_chars:
                 summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
