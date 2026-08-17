@@ -104,6 +104,29 @@ MUSIC_INTENT_CLASSIFIER_POLICY = (
     '"yes" or "no".'
 )
 
+# 🌸 Same fixed-cheap-model shape as MUSIC_INTENT_CLASSIFIER_MODEL — one
+# extra Groq call, only ever spent once handle_music_request has ALREADY
+# committed to "this is a music request" (see call order below), so this
+# never costs anything on messages that aren't music requests at all.
+MUSIC_PAGE_COUNT_MODEL = "openai/gpt-oss-20b"
+
+MUSIC_PAGE_COUNT_SYSTEM_PROMPT = (
+    "A Discord user is asking for music. Decide how many song results "
+    "they most likely want, from 1 to 30.\n"
+    "Rules of thumb:\n"
+    "- A single specific song/artist named, or a vague 'give me a "
+    "song' with no plural/quantity hint -> 1.\n"
+    "- Plural wording with no number ('some songs', 'a few lofi "
+    "beats', 'recommend me some tracks') -> 5-8.\n"
+    "- An explicit number in the message -> use that number, capped "
+    "at 30.\n"
+    "- Broad/open asks ('give me a ton of songs', 'load me up with "
+    "music', 'all their songs') -> 20-30.\n"
+    "Respond with ONLY a single-line JSON object, nothing else, no "
+    "markdown fences, in exactly this shape:\n"
+    '{"count": <integer 1-30>}'
+)
+
 # 🌸 Dedicated file logger, same pattern as exa_logger in
 # groq_exa_search.py — one line per search so usage is traceable in
 # logs/bot.log without cluttering stdout. The `if not logger.handlers`
@@ -299,6 +322,52 @@ class MusicSuggestionService:
             print(f"⚠️ Music intent classifier error (defaulting to no): {e}")
             music_logger.info(f"[classify_music_intent] prompt={prompt!r} FAILED: {e}")
             return False
+
+    async def classify_page_count(self, prompt: str) -> int:
+        """🌸 One cheap Groq call → how many result pages (1-30) this
+        request most likely wants, same fail-safe shape as
+        classify_music_intent above. Fails to 8 (the previous fixed
+        default) on any problem — no client, API error, junk reply —
+        so a classifier hiccup just means "same behavior as before
+        this feature existed" instead of an unpredictable page count."""
+        DEFAULT_COUNT = 8
+        if not self.groq_client or not prompt:
+            return DEFAULT_COUNT
+
+        def _call():
+            return self.groq_client.chat.completions.create(
+                model=MUSIC_PAGE_COUNT_MODEL,
+                messages=[
+                    {"role": "system", "content": MUSIC_PAGE_COUNT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                # 🌸 Same reasoning-model headroom fix as every other
+                # gpt-oss-20b call in this file — see
+                # MUSIC_INTENT_CLASSIFIER_MODEL's comment for the exact
+                # empty-content failure this avoids.
+                reasoning_effort="low",
+                max_tokens=150,
+            )
+
+        try:
+            response = await asyncio.to_thread(_call)
+            raw = (response.choices[0].message.content or "").strip()
+            if not raw:
+                print("⚠️ Page-count classifier returned EMPTY content — check reasoning_effort/max_tokens")
+                return DEFAULT_COUNT
+            # 🌸 Defensive strip: some models wrap JSON in ```json fences
+            # even when told not to.
+            raw = raw.strip("`").removeprefix("json").strip()
+            parsed = json.loads(raw)
+            count = int(parsed.get("count", DEFAULT_COUNT))
+            count = max(1, min(30, count))  # 🌸 hard clamp, 30 max as requested
+            music_logger.info(f"[classify_page_count] prompt={prompt!r} -> {count}")
+            return count
+        except Exception as e:
+            print(f"⚠️ Page-count classifier error (defaulting to {DEFAULT_COUNT}): {e}")
+            music_logger.info(f"[classify_page_count] prompt={prompt!r} FAILED: {e}")
+            return DEFAULT_COUNT
 
     async def rewrite_search_query(self, prompt: str) -> str | None:
         """🌸 Called ONLY after a literal ytm.search(prompt) already
@@ -722,7 +791,10 @@ def _build_music_embed(result: dict):
         embed.set_footer(text=f"YouTube Music • \"{result['query']}\"")
         return embed, None, result["summary"]
 
-    tracks = result["results"][:5]  # 🌸 same cap as before, now pages instead of fields
+    tracks = result["results"][:30]  # 🌸 hard safety cap — matches classify_page_count's clamp;
+                                       # already ≤30 from suggest(limit=page_count), this just
+                                       # guards against a raw ytmusicapi response somehow
+                                       # coming back longer than what was actually requested.
     embed = _build_track_embed(tracks[0], 0, len(tracks), result["query"], result["summary"])
     return embed, tracks, result["summary"]
 
@@ -789,6 +861,12 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
     if not wants_music:
         return None
 
+    # 🌸 AI decides how many result pages this ask wants (1-30) —
+    # only spent once we already know this IS a music request, so it
+    # never adds cost to non-music messages. Defaults to 8 (the old
+    # fixed cap) on any classifier problem — see classify_page_count.
+    page_count = await music_service.classify_page_count(text)
+
     # 🌸 Try the raw message as a literal ytmusicapi search first — the
     # common case (a real title/artist named) is handled here with no
     # extra cost. Only reach for Groq below if that comes up genuinely
@@ -797,11 +875,11 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
     # verified against ytm.search() again before it's ever shown to
     # the user, so a bad guess just means "couldn't find it" rather
     # than a hallucinated result.
-    result = await music_service.suggest(text)
+    result = await music_service.suggest(text, limit=page_count)
     if not result["results"]:
         rewritten_query = await music_service.rewrite_search_query(text)
         if rewritten_query:
-            result = await music_service.suggest(rewritten_query)
+            result = await music_service.suggest(rewritten_query, limit=page_count)
 
     if not result["results"]:
         # 🌸 Once the classifier commits to "this IS a music request",

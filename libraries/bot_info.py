@@ -110,17 +110,20 @@ class UtilityCommands(commands.Cog):
         embed.add_field(
             name="🤖 ᴀ ɪ  &  ɪ ɴ ᴛ ᴇ ʟ ʟ ɪ ɢ ᴇ ɴ ᴄ ᴇ",
             value=(
-                f"{gemini_cmd}  {gemini_reply_cmd}\n"
+                f"{gemini_cmd}\n"
+                f"{gemini_reply_cmd}\n"
                 "Chat with Gemini AI — supports memory across messages.\n"
-                f"> 📌 {gemini_cmd} `prompt:What is life?` | {gemini_reply_cmd} `message_id:... prompt:...`\n\n"
+                f"> 📌 `prompt:What is life?`\n\n"
 
-                f"{openrouter_cmd}  {openrouter_reply_cmd}\n"
+                f"{openrouter_cmd}\n"
+                f"{openrouter_reply_cmd}\n"
                 "Chat using OpenRouter's AI models.\n"
-                f"> 📌 {openrouter_cmd} `prompt:Hello!` | {openrouter_reply_cmd} `message_id:... prompt:...`\n\n"
+                f"> 📌 `prompt:Hello!`\n\n"
 
-                f"{cloudflare_ai_cmd}  {cloudflare_ai_reply_cmd}\n"
+                f"{cloudflare_ai_cmd}\n"
+                f"{cloudflare_ai_reply_cmd}\n"
                 "Chat using Cloudflare AI models. ☁️\n"
-                f"> 📌 {cloudflare_ai_cmd} `prompt:Hello!` | {cloudflare_ai_reply_cmd} `message_id:... prompt:...`"
+                f"> 📌 `prompt:Hello!`"
             ),
             inline=False
         )
@@ -137,23 +140,23 @@ class UtilityCommands(commands.Cog):
             value=(
                 f"{msg_cmd}\n"
                 "Send or reply to a message in any channel.\n"
-                f"> 📌 {msg_cmd} `channel:#general text:Hello everyone!`\n\n"
+                f"> 📌 `channel:#general text:Hello everyone!`\n\n"
 
                 f"{edit_msg_cmd}\n"
                 "Edit a message the bot previously sent.\n"
-                f"> 📌 {edit_msg_cmd} `message_id:... new_text:Updated content`\n\n"
+                f"> 📌 `message_id:... new_text:Updated content`\n\n"
 
                 f"{dm_user_cmd}\n"
                 "Send a private message to anyone via their User ID.\n"
-                f"> 📌 {dm_user_cmd} `user_id:123456789 text:Hey!`\n\n"
+                f"> 📌 `user_id:123456789 text:Hey!`\n\n"
 
                 f"{forward_msg_cmd}\n"
                 "Relay a message across servers or channels.\n"
-                f"> 📌 {forward_msg_cmd} `message_id:... to:#channel`\n\n"
+                f"> 📌 `message_id:... to:#channel`\n\n"
 
                 f"{embed_msg_cmd}\n"
                 "Send a beautiful customizable embed message.\n"
-                f"> 📌 {embed_msg_cmd} `description:Hello! color:pink image_url:...`"
+                f"> 📌 `description:Hello! color:pink image_url:...`"
             ),
             inline=False
         )
@@ -168,17 +171,18 @@ class UtilityCommands(commands.Cog):
         embed.add_field(
             name="🎭 ɪ ɴ ᴛ ᴇ ʀ ᴀ ᴄ ᴛ ɪ ᴏ ɴ  &  ᴍ ᴏ ᴅ ᴇ ʀ ᴀ ᴛ ɪ ᴏ ɴ",
             value=(
-                f"{react_cmd}  {unreact_cmd}\n"
+                f"{react_cmd}\n"
+                f"{unreact_cmd}\n"
                 "Add or remove a reaction emoji on any message by ID.\n"
-                f"> 📌 {react_cmd} `message_id:... emoji:🌸` | {unreact_cmd} `message_id:... emoji:🌸`\n\n"
+                f"> 📌 `message_id:... emoji:🌸`\n\n"
 
                 f"{clear_msg_cmd}\n"
                 "Clean up recent bot messages from the channel.\n"
-                f"> 📌 {clear_msg_cmd} `amount:10`\n\n"
+                f"> 📌 `amount:10`\n\n"
 
-                f"{safs_cmd}  {unf_cmd}\n"
-                "Toggle safe or unfiltered content mode.\n"
-                f"> 📌 {safs_cmd} | {unf_cmd}"
+                f"{safs_cmd}\n"
+                f"{unf_cmd}\n"
+                "Toggle safe or unfiltered content mode."
             ),
             inline=False
         )
@@ -194,21 +198,19 @@ class UtilityCommands(commands.Cog):
             name="🔮 ꜱ ʏ ꜱ ᴛ ᴇ ᴍ  &  ᴛ ᴏ ᴏ ʟ ꜱ",
             value=(
                 f"{info_cmd}\n"
-                "View connection status and latency stats. 📡\n"
-                f"> 📌 {info_cmd}\n\n"
+                "View connection status and latency stats. 📡\n\n"
 
                 f"{speed_test_cmd}\n"
-                "Run a live speed test on my owner's WiFi. 🛜\n"
-                f"> 📌 {speed_test_cmd}\n\n"
+                "Run a live speed test on my owner's WiFi. 🛜\n\n"
 
-                f"{encrypt_cmd}  {decrypt_cmd}\n"
+                f"{encrypt_cmd}\n"
+                f"{decrypt_cmd}\n"
                 "Convert text ↔ Base64 encoded strings.\n"
-                f"> 📌 {encrypt_cmd} `text:Hello World` → `SGVsbG8gV29ybGQ=`\n"
-                f"> 📌 {decrypt_cmd} `text:SGVsbG8gV29ybGQ=` → `Hello World`\n\n"
+                f"> 📌 `text:Hello World` → `SGVsbG8gV29ybGQ=`\n\n"
 
                 f"{upload_cmd}\n"
                 "Upload a file through the bot.\n"
-                f"> 📌 {upload_cmd} `file:...`"
+                f"> 📌 `file:...`"
             ),
             inline=False
         )
@@ -222,12 +224,11 @@ class UtilityCommands(commands.Cog):
             value=(
                 f"{math_cmd}\n"
                 "Solve any math expression or arithmetic operation.\n"
-                f"> 📌 {math_cmd} `expression:sqrt(144) + factorial(5)`\n"
-                f"> 📌 {math_cmd} `number_a:25 operator:➗ number_b:5`\n\n"
+                f"> 📌 `expression:sqrt(144) + factorial(5)`\n"
+                f"> 📌 `number_a:25 operator:➗ number_b:5`\n\n"
 
                 f"{math_ref_cmd}\n"
-                "View all available math functions and constants.\n"
-                f"> 📌 {math_ref_cmd}"
+                "View all available math functions and constants."
             ),
             inline=False
         )
@@ -248,28 +249,31 @@ class UtilityCommands(commands.Cog):
         embed.add_field(
             name="📚 ᴋ ɴ ᴏ ᴡ ʟ ᴇ ᴅ ɢ ᴇ  &  ᴊ ᴏ ʏ",
             value=(
-                "Random fact, quote, life advice, or dad joke.\n"
-                f"> 📌 {fact_cmd} | {quote_cmd} | {advice_cmd} | {dadjoke_cmd}\n\n"
+                f"{fact_cmd}\n"
+                f"{quote_cmd}\n"
+                f"{advice_cmd}\n"
+                f"{dadjoke_cmd}\n"
+                "Random fact, quote, life advice, or dad joke.\n\n"
 
                 f"{question_cmd}\n"
-                "Get a random thought-provoking question. 🤔\n"
-                f"> 📌 {question_cmd}\n\n"
+                "Get a random thought-provoking question. 🤔\n\n"
 
-                f"{wikipedia_cmd}  {wiki_news_cmd}\n"
+                f"{wikipedia_cmd}\n"
+                f"{wiki_news_cmd}\n"
                 "Search Wikipedia or fetch latest Wikipedia news.\n"
-                f"> 📌 {wikipedia_cmd} `query:Black holes` | {wiki_news_cmd} `topic:Technology`\n\n"
+                f"> 📌 `query:Black holes` | `topic:Technology`\n\n"
 
                 f"{news_cmd}\n"
-                "Fetch recent global news headlines.\n"
-                f"> 📌 {news_cmd}\n\n"
+                "Fetch recent global news headlines.\n\n"
 
                 f"{weather_cmd}\n"
                 "Get detailed weather info for any city. *(1000 req/day)*\n"
-                f"> 📌 {weather_cmd} `city:Tokyo`\n\n"
+                f"> 📌 `city:Tokyo`\n\n"
 
-                f"{praise_cmd}  {joke_unf_cmd}\n"
+                f"{praise_cmd}\n"
+                f"{joke_unf_cmd}\n"
                 "Send appreciation to a user 🥰 or get unfiltered humor ⚠️\n"
-                f"> 📌 {praise_cmd} `user:@someone` | {joke_unf_cmd}"
+                f"> 📌 `user:@someone`"
             ),
             inline=False
         )
@@ -286,23 +290,22 @@ class UtilityCommands(commands.Cog):
             value=(
                 f"{music_cmd}\n"
                 "Search and listen to music via YouTube or YouTube Music. 🎶\n"
-                f"> 📌 {music_cmd} `search:Blinding Lights`\n\n"
+                f"> 📌 `search:Blinding Lights`\n\n"
 
                 f"{download_music_cmd}\n"
                 "Download a song and save it to your device. 📥\n"
-                f"> 📌 {download_music_cmd} `search:Starboy format:MP3 quality:192kbps`\n\n"
+                f"> 📌 `search:Starboy format:MP3 quality:192kbps`\n\n"
 
                 f"{youtube_cmd}\n"
                 "Get full stats and metadata from any YouTube video or playlist. 📊\n"
-                f"> 📌 {youtube_cmd} `url:https://youtube.com/watch?v=...`\n\n"
+                f"> 📌 `url:https://youtube.com/watch?v=...`\n\n"
 
                 f"{livestream_chat_cmd}\n"
                 "Interact with a YouTube livestream chat in real time. 📺\n"
-                f"> 📌 {livestream_chat_cmd} `url:https://youtube.com/watch?v=...`\n\n"
+                f"> 📌 `url:https://youtube.com/watch?v=...`\n\n"
 
                 f"{my_channel_cmd}\n"
-                "View stats and info about your YouTube channel. 🌟\n"
-                f"> 📌 {my_channel_cmd}"
+                "View stats and info about your YouTube channel. 🌟"
             ),
             inline=False
         )
@@ -316,11 +319,11 @@ class UtilityCommands(commands.Cog):
             value=(
                 f"{photo_cmd}\n"
                 "Search and display beautiful photos. 🖼️\n"
-                f"> 📌 {photo_cmd} `query:Sunset mountains`\n\n"
+                f"> 📌 `query:Sunset mountains`\n\n"
 
                 f"{pexels_cmd}\n"
                 "Search high-quality stock photos from Pexels. 🌄\n"
-                f"> 📌 {pexels_cmd} `query:Ocean waves`"
+                f"> 📌 `query:Ocean waves`"
             ),
             inline=False
         )
@@ -352,6 +355,23 @@ class UtilityCommands(commands.Cog):
         py_version = platform.python_version()
         dpy_version = discord.__version__
 
+        # 🌸 Fetch the bot's banner — prefer the per-server override set via
+        # /server-persona-set, fall back to the bot's global profile banner.
+        # Neither guild.me (cached Member) nor bot.user (cached ClientUser)
+        # carry banner data, so both need a fresh fetch to actually see it.
+        banner_url = None
+        try:
+            if interaction.guild is not None:
+                fresh_member = await interaction.guild.fetch_member(self.bot.user.id)
+                if fresh_member.banner:
+                    banner_url = fresh_member.banner.with_size(1024).url
+            if banner_url is None:
+                fresh_user = await self.bot.fetch_user(self.bot.user.id)
+                if fresh_user.banner:
+                    banner_url = fresh_user.banner.with_size(1024).url
+        except Exception as e:
+            print(f"⚠️ Failed to fetch bot banner: {e}")
+
         # 2. Build the Lavender Embed
         embed = discord.Embed(
             title=self._display_name(interaction),
@@ -381,6 +401,10 @@ class UtilityCommands(commands.Cog):
         
         # Add Thumbnail if available
         embed.set_thumbnail(url=self._display_avatar_url(interaction))
+
+        # 🌸 High-res banner across the bottom of the embed (only if one is set)
+        if banner_url:
+            embed.set_image(url=banner_url)
             
         # 3. Use followup to send the message 💌
         await interaction.followup.send(embed=embed)

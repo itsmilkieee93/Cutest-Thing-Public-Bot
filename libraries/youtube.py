@@ -30,6 +30,15 @@ _log_handler.setFormatter(logging.Formatter(
 if not logger.handlers:
     logger.addHandler(_log_handler)
 
+# 🌸 Also relay this logger's messages to stdout (and therefore to the
+# Discord log channel via log_webhook.py's stdout/stderr tee), on top of
+# the file handler above. Safe to call on every import/reload.
+try:
+    from log_webhook import add_stdout_relay
+    add_stdout_relay(logger, prefix="YouTubeModule")
+except ImportError:
+    pass  # log_webhook not present in this deployment — file logging still works
+
 
 # ── Loading GIFs (matches commands_ai.py style) ───────────────────────────────
 LOADING_GIFS = [
