@@ -648,7 +648,16 @@ def _build_owner_status(user_id: int) -> str:
         "names, trivia, anything off-topic — ignore this fact completely "
         "and just respond normally to what they actually said. Never "
         "repeat this fact back-to-back across messages just because you "
-        "mentioned it recently.)"
+        "mentioned it recently.)\n"
+        "(SELF-REFERENCE CHECK — if a quoted/replied-to message above "
+        "contains an @mention of a Discord username, ALWAYS compare that "
+        "mention against the username of the person you're talking to "
+        "RIGHT NOW, given at the top of this prompt. If the names match, "
+        "that mention IS this person — say so plainly, e.g. 'yeah that's "
+        "you!'. Don't assume a name in quoted text is someone else just "
+        "because it reads in third person — check for a match against "
+        "the current speaker FIRST, before guessing it's a different "
+        "person.)"
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1188,9 +1197,7 @@ def _format_server_context(info: dict) -> str:
 MODEL_POOL = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
     "groq/compound",
     "groq/compound-mini",
 ]
@@ -1587,4 +1594,10 @@ SAFEGUARD_BLOCK_REPLIES = [
     "lol nope, not doing that 🎀 next question?",
     "that's too much for me rn 🥲 pick a different topic",
     "yeah no, hard pass on that one 🌸",
+    "absolutely not bestie 💀 try again",
+    "we're not doing this today 🎀",
+    "hmm no 🌸 next",
+    "not it, chief 😭 ask me literally anything else",
+    "big fat no from me 🎀",
+    "denied ✨ pick a new topic",
 ]

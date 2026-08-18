@@ -364,11 +364,11 @@ class UtilityCommands(commands.Cog):
             if interaction.guild is not None:
                 fresh_member = await interaction.guild.fetch_member(self.bot.user.id)
                 if fresh_member.banner:
-                    banner_url = fresh_member.banner.with_size(1024).url
+                    banner_url = fresh_member.banner.with_size(2048).url
             if banner_url is None:
                 fresh_user = await self.bot.fetch_user(self.bot.user.id)
                 if fresh_user.banner:
-                    banner_url = fresh_user.banner.with_size(1024).url
+                    banner_url = fresh_user.banner.with_size(2048).url
         except Exception as e:
             print(f"⚠️ Failed to fetch bot banner: {e}")
 

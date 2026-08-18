@@ -35,7 +35,7 @@ from groq_instruct import (
 # 🌸 Dynamic personality — instructions are generated live from the bot's
 # CURRENT per-guild nickname (set via /server-persona-set), instead of a
 # static auth/personality.txt file. See personality.py for details.
-from personality import get_personality_for_nickname
+from personality import get_personality_for_nickname, load_personality
 
 # 🌸 Exa web search — PRIMARY search path now, ahead of groq/compound-mini
 # (see GroqService.__init__ and the _wants_web_search branch in
@@ -462,24 +462,43 @@ class GroqService:
         if not self.client:
             return True
 
+        # 🌸 Defensive truncation — this is the one safeguard call that
+        # screens the CHAT MODEL'S full reply (not a short user prompt), so
+        # an unusually long reply can eat into the reasoning/output budget
+        # and starve the verdict token even with max_tokens headroom below.
+        # Slurs/harmful content that would trigger UNSAFE virtually always
+        # show up early; capping the input here doesn't weaken the check.
+        reply_for_check = reply[:2000]
+
         def _call():
             return self.client.chat.completions.create(
                 model=SAFEGUARD_MODEL,
                 messages=[
                     {"role": "system", "content": OUTPUT_SAFEGUARD_POLICY},
-                    {"role": "user", "content": reply},
+                    {"role": "user", "content": reply_for_check},
                 ],
                 temperature=0,
                 # 🌸 Same reasoning-model fix as check_safety above.
                 reasoning_effort="low",
-                max_tokens=150,
+                max_tokens=300,
             )
 
         try:
             response = await asyncio.to_thread(_call)
             verdict = (response.choices[0].message.content or "").strip().upper()
+
+            # 🌸 One retry before failing open — this gate gets a single
+            # transient empty-content response more often than it should,
+            # and failing open on the FIRST miss defeats the point of an
+            # output safety check. A second attempt costs one extra call
+            # only in the rare empty case, not on the normal path.
             if not verdict:
-                print(f"🛡️⚠️ Output safeguard returned EMPTY content for {username} — check reasoning_effort/max_tokens (failing open)")
+                print(f"🛡️⚠️ Output safeguard returned EMPTY content for {username} on first attempt — retrying once")
+                response = await asyncio.to_thread(_call)
+                verdict = (response.choices[0].message.content or "").strip().upper()
+
+            if not verdict:
+                print(f"🛡️⚠️ Output safeguard returned EMPTY content for {username} on retry too — check reasoning_effort/max_tokens (failing open)")
                 return True
             is_safe = not verdict.startswith("UNSAFE")
             if not is_safe:
@@ -488,6 +507,87 @@ class GroqService:
         except Exception as e:
             print(f"⚠️ Output safeguard check error (failing open): {e}")
             return True
+
+    async def _generate_safeguard_decline(self, username: str, display_name: str = None, guild=None) -> str:
+        """
+        🌸 LIVE decline, not a template. Previously both the input-side
+        (check_safety) and output-side (check_output_safety) blocks fell
+        back to `random.choice(SAFEGUARD_BLOCK_REPLIES)` — the same 4
+        canned lines on repeat forever, which reads as an obvious
+        copy-pasted bot response instead of the bot actually "talking".
+        This makes one small, cheap Groq call so the decline is generated
+        fresh every time, in the bot's real personality, addressed to the
+        actual person — same idea as every other reply, just short and
+        firm. Kept deliberately separate from get_ai_response (no memory
+        load/save, no search, no history) so a blocked message costs as
+        little as possible while still sounding alive.
+
+        🌸 Now pulls the bot's CURRENT per-guild personality/nickname from
+        personality.py (same source get_ai_response's main system prompt
+        uses) instead of a separate hardcoded "cute gen-z bot" blurb, so a
+        decline matches whatever nickname/vibe /server-persona-set gave
+        that guild instead of sounding like a generic stand-in bot.
+
+        🌸 System prompt is JUST personality_instructions now — no extra
+        decline-specific rules layered on top. personality.py already
+        says "no corporate refusals, no lecture, just say no casually",
+        so repeating/rephrasing that here only fought with it and made
+        replies drift toward generic filler ("nope, not gonna happen")
+        or over-explained mini-lectures. The user turn is a minimal
+        bracketed scene-setter, not an instruction block, so the model's
+        own personality does all the talking.
+
+        FAILS CLOSED to the static SAFEGUARD_BLOCK_REPLIES list if this
+        call itself errors or comes back empty — a decline template is a
+        perfectly safe fallback (never blocks safety), it just shouldn't
+        be the DEFAULT path anymore.
+        """
+        if not self.client:
+            return random.choice(SAFEGUARD_BLOCK_REPLIES)
+
+        # 🌸 Resolve live personality instructions the same way the main
+        # chat path does: per-guild nickname lookup if we have a guild,
+        # else the global default template (e.g. DMs, or lookup failure).
+        try:
+            if guild is not None and self.bot is not None:
+                personality_instructions = await load_personality(self.bot, guild.id)
+            else:
+                personality_instructions = get_personality_for_nickname(None)
+        except Exception as e:
+            print(f"⚠️ Safeguard decline personality load failed (using default): {e}")
+            personality_instructions = get_personality_for_nickname(None)
+
+        def _call():
+            return self.client.chat.completions.create(
+                model=self.default_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": personality_instructions,
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[{display_name or username} (@{username}) sent something "
+                            "you're declining to engage with. Reply in character.]"
+                        ),
+                    },
+                ],
+                temperature=1.05,
+                reasoning_effort="low",
+                max_tokens=60,
+            )
+
+        try:
+            response = await asyncio.to_thread(_call)
+            decline = _strip_reasoning(response.choices[0].message.content or "").strip()
+            if not decline:
+                print(f"🛡️⚠️ Safeguard decline generation returned EMPTY for {username} — using static fallback")
+                return random.choice(SAFEGUARD_BLOCK_REPLIES)
+            return decline
+        except Exception as e:
+            print(f"⚠️ Safeguard decline generation failed (using static fallback): {e}")
+            return random.choice(SAFEGUARD_BLOCK_REPLIES)
 
     async def classify_server_query(self, message_content: str, username: str) -> str:
         """
@@ -646,7 +746,7 @@ class GroqService:
             return None
 
         if not await self.check_safety(prompt, username):
-            return random.choice(SAFEGUARD_BLOCK_REPLIES)
+            return await self._generate_safeguard_decline(username, display_name, guild)
 
         # 🌸 Random model pick per turn (unless caller pinned model_id) —
         # see MODEL_POOL up top for what's in rotation. EXCEPTION: if the
@@ -1076,7 +1176,7 @@ class GroqService:
                 # flagged, swap in a refusal BEFORE it's saved to memory,
                 # written to the transcript log, or sent to Discord.
                 if not await self.check_output_safety(reply, username):
-                    reply = random.choice(SAFEGUARD_BLOCK_REPLIES)
+                    reply = await self._generate_safeguard_decline(username, display_name, guild)
                     self._log_ai_transcript(
                         username, user_id, model_to_use, guild, channel,
                         prompt, "[BLOCKED BY OUTPUT SAFEGUARD — reply withheld]",
