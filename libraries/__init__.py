@@ -1,6 +1,6 @@
 # libraries/__init__.py
 
-__version__ = "9.1.5"
+__version__ = "9.3.0"
 __bot_name__ = "Cutest Thing 🌸✨️"
 __discord__ = "10"
 __description__ = "Floating on a strawberry cloud 🍓☁️"

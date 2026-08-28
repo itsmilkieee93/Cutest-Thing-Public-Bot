@@ -35,6 +35,9 @@ from gemini_service import GeminiService
 # Import separated modules
 from groq_ai import GroqService
 from groq_service import GroqMentionService
+
+# 🌸 DM-trigger gate now lives in extras/groq_dm.py — see is_dm_trigger.
+from extras.groq_dm import is_dm_trigger
 from groq_music_suggestion import register_persistent_music_view
 from roulette import RouletteService
 from discord_commands import register_all_cogs
@@ -335,6 +338,10 @@ class EnchantedBot(commands.Bot):
 
         is_dm       = isinstance(message.channel, discord.DMChannel)
         is_mentioned = self.user.mentioned_in(message)
+        # 🌸 extras/groq_dm.is_dm_trigger — separate module so the DM
+        # eligibility rule (currently just "is this a DMChannel") has
+        # room to grow without touching on_message itself.
+        is_dm_reply = is_dm_trigger(message, self.user)
 
         if is_dm or is_mentioned:
             await self.log_to_inbox(message)
@@ -379,7 +386,7 @@ class EnchantedBot(commands.Bot):
         # 🎲 Mention / reply-to-bot reaction — random message roulette
         # (single shared typing pulse for the whole flow). Delegated to
         # groq_service.GroqMentionService — see self.groq_mentions.
-        if is_mentioned or await self.groq_mentions.is_reply_to_bot(message):
+        if is_dm_reply or is_mentioned or await self.groq_mentions.is_reply_to_bot(message):
             await self.groq_mentions.handle_mention_reaction(message)
 
         await self.process_commands(message)

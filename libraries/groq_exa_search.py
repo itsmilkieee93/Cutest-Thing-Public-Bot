@@ -264,6 +264,7 @@ class ExaSearchService:
         if not self.client:
             return None
         try:
+            exa_logger.debug(f"→ Exa.answer() | query={query!r}")
             response = await asyncio.to_thread(self.client.answer, query)
             answer = getattr(response, "answer", None)
             if not answer:
@@ -309,6 +310,7 @@ class ExaSearchService:
             )
             if category:
                 kwargs["category"] = category
+            exa_logger.debug(f"→ Exa.search_and_contents() | query={query!r} kwargs={kwargs}")
             response = await asyncio.to_thread(
                 self.client.search_and_contents,
                 query,
@@ -360,6 +362,8 @@ class ExaSearchService:
         )
         if category:
             url += f"&category={urllib.parse.quote(category)}"
+        _log_url = url.replace(news_api_key, "***")
+        exa_logger.debug(f"→ GET {_log_url}")
         try:
             async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
@@ -382,6 +386,7 @@ class ExaSearchService:
         headers = {"X-Return-Format": "text"}
         if self.jina_api_key:
             headers["Authorization"] = f"Bearer {self.jina_api_key}"
+        exa_logger.debug(f"→ GET {JINA_READER_BASE}{url} | headers={{'X-Return-Format': 'text'}}")
         try:
             async with session.get(f"{JINA_READER_BASE}{url}", headers=headers, timeout=15) as resp:
                 if resp.status != 200:

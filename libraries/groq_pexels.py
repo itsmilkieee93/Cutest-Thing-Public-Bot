@@ -558,6 +558,7 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
                 "per_page":    1,
                 "page":        random.randint(1, 50),
             }
+            logger.debug(f"→ GET {PEXELS_API_BASE}/v1/search | params={params}")
             async with session.get(
                 f"{PEXELS_API_BASE}/v1/search",
                 headers=headers,
@@ -633,6 +634,7 @@ async def _fetch_pexels_video(message, guild_id: int, query: str) -> str | None:
                 "per_page": 1,
                 "page":     random.randint(1, 20),
             }
+            logger.debug(f"→ GET {PEXELS_API_BASE}/videos/search | params={params}")
             async with session.get(
                 f"{PEXELS_API_BASE}/videos/search",
                 headers=headers,
@@ -718,6 +720,8 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             # ~80 hits), not just the global 500-hit cap. A flat
             # randint(1, 50) assumed every query had the full 500 and
             # blew past that per-query ceiling for narrower searches.
+            _log_params = {**base_params, "page": 1, "key": "***"}
+            logger.debug(f"→ GET {PIXABAY_API_BASE}/ | params={_log_params}")
             async with session.get(
                 f"{PIXABAY_API_BASE}/",
                 params={**base_params, "page": 1},
@@ -739,6 +743,9 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             if max_page > 1:
                 page = random.randint(1, max_page)
                 if page != 1:
+                    logger.debug(
+                        f"→ GET {PIXABAY_API_BASE}/ | params={{**base_params, 'page': {page}, 'key': '***'}}"
+                    )
                     async with session.get(
                         f"{PIXABAY_API_BASE}/",
                         params={**base_params, "page": page},

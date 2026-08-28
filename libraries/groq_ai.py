@@ -701,13 +701,15 @@ class GroqService:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
         stalls the bot's event loop. Loads this user's saved chat history
-        from groq/memory/{guild_id}/memory.db (via shared.load_groq_memory)
-        and includes it for multi-turn context, then appends this exchange
-        and saves it back — trimmed to the last 200 turns so the DB row/
-        prompt don't grow unbounded. Memory is now PER-GUILD: one SQLite
-        file per guild (DMs use guild_id=0), so what someone says in
-        Server A no longer bleeds into Server B's context. Within each
-        guild's file, memory is SHARED across every model in MODEL_POOL
+        from groq/memory/{guild_id}/memory.db, or groq/memory/dm/{channel_id}/
+        memory.db for DMs (via shared.load_groq_memory) and includes it
+        for multi-turn context, then appends this exchange and saves it
+        back — trimmed to the last 200 turns so the DB row/prompt don't
+        grow unbounded. Memory is now PER-GUILD (and PER-DM-CHANNEL): one
+        SQLite file per guild, and a separate one per DM channel, so what
+        someone says in Server A no longer bleeds into Server B's context,
+        or into their DMs. Within each bucket's file, memory is SHARED
+        across every model in MODEL_POOL
         (one row per user_id within that guild, not per user_id+model),
         so the random per-turn model pick below no longer resets context
         when it happens to land on a different model than last time. Also
@@ -849,10 +851,21 @@ class GroqService:
         # standalone outside EnchantedBot).
         if is_compound_call:
             server_context = ""
+        elif guild is None:
+            # 🌸 DMs have no guild at all — get_server_context_text (and
+            # self.guild_info_cache inside it) is guild-shaped (guild.id/
+            # guild.name/guild.member_count), so it must never be called
+            # with guild=None. This branch has to come BEFORE the
+            # self.bot.groq_mentions check below, since that check was
+            # true even in DMs (groq_mentions exists regardless of
+            # channel type) and was routing DMs into
+            # get_server_context_text(None) anyway, crashing on
+            # guild.id — see the fallback that was meant to catch this.
+            server_context = DM_CONTEXT_INSTRUCTIONS
         elif self.bot and getattr(self.bot, "groq_mentions", None):
             server_context = self.bot.groq_mentions.get_server_context_text(guild)
         else:
-            server_context = DM_CONTEXT_INSTRUCTIONS if guild is None else ""
+            server_context = ""
 
         # 🌸 Pull compact guild info straight from the per-guild SQLite
         # cache (metadata.db/roles.db/channels.db) instead of dumping the
@@ -923,7 +936,15 @@ class GroqService:
         # still being shared across every model in MODEL_POOL within that
         # guild (doesn't matter which model answered last turn).
         guild_id         = guild.id if guild else 0
-        history          = await shared.load_groq_memory(user_id, guild_id)
+        # 🌸 DMs (guild=None) now get their own per-channel memory bucket
+        # — groq/memory/dm/{channel_id}/memory.db — instead of sharing
+        # one flat groq/memory/0/ bucket. channel here is message.channel
+        # passed through from handle_mention_reaction; for a DM that's
+        # the DMChannel object, and .id is stable per user. Guild
+        # messages don't need this — channel_id is ignored whenever
+        # guild_id is truthy (see shared._groq_bucket_key).
+        dm_channel_id    = channel.id if (channel and not guild) else None
+        history          = await shared.load_groq_memory(user_id, guild_id, dm_channel_id)
 
         # 🌸 SLICING: only ship a random-sized recent window (from THIS
         # user_id's shared history) to Groq to keep input tokens small and
@@ -1198,7 +1219,7 @@ class GroqService:
                 # the same anchor point.
                 history.append({"role": "user", "content": prompt, "message_id": message_id})
                 history.append({"role": "assistant", "content": reply, "message_id": message_id})
-                await shared.save_groq_memory(model_to_use, username, user_id, history[-200:], guild_id)
+                await shared.save_groq_memory(model_to_use, username, user_id, history[-200:], guild_id, dm_channel_id)
 
                 # 🌸 Success log — fired for EVERY completed Groq reply, not
                 # just errors. Best-effort: never let a logging hiccup take

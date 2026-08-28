@@ -150,8 +150,9 @@ def save_gemini_memory(model_id, username, user_id, history):
 # 🌸 Per-guild Groq memory — one SQLite file per guild instead of one
 # shared bot_history.db for everyone:
 #   groq/memory/{guild_id}/memory.db
-# DMs (no guild) use guild_id=0 as their own folder/bucket, e.g.
-#   groq/memory/0/memory.db
+# DMs (no guild) get their OWN per-channel bucket instead of sharing a
+# single guild_id=0 file, e.g.
+#   groq/memory/dm/{channel_id}/memory.db
 # user_id is always the sender's real Discord snowflake ID
 # (message.author.id / interaction.user.id), never a display name or
 # username, so lookups stay stable even if someone changes their
@@ -162,36 +163,58 @@ def save_gemini_memory(model_id, username, user_id, history):
 # once set, so this only needs to actually run again after a fresh
 # db-file creation — but re-asserting it cheaply on every fresh connection
 # is fine too; this set just avoids doing it redundantly on every single
-# load/save call. Keyed per guild_id since each guild now has its own file.
+# load/save call. Keyed per bucket_key (see _groq_bucket_key) since each
+# guild/DM channel now has its own file.
 _wal_enabled_guilds = set()
 
 
-def _groq_memory_dir(guild_id: int) -> str:
-    """🌸 Directory holding this guild's memory.db — guild_id=0 for DMs."""
-    return os.path.join(BASE_GROQ_DIR, str(guild_id or 0))
+def _groq_bucket_key(guild_id: int, channel_id: int | None) -> str:
+    """🌸 Resolves which memory.db bucket a message belongs to.
 
-
-def _groq_memory_db_path(guild_id: int) -> str:
-    """🌸 Path to groq/memory/{guild_id}/memory.db."""
-    return os.path.join(_groq_memory_dir(guild_id), "memory.db")
-
-
-async def _get_groq_db(guild_id: int = 0) -> aiosqlite.Connection:
-    """🌸 Opens a fresh aiosqlite connection to this guild's
-    groq/memory/{guild_id}/memory.db, creating the table/index and
-    enabling WAL mode (write-ahead logging) the first time this process
-    touches that file. WAL lets reads and writes happen concurrently
-    instead of locking the whole file on every write — much friendlier
-    for a Discord bot that may be handling several mentions/replies in
-    parallel across servers.
+    - Guild message (guild_id truthy): bucket is just str(guild_id),
+      same as before — groq/memory/{guild_id}/memory.db.
+    - DM (guild_id falsy): bucket is "dm/{channel_id}" —
+      groq/memory/dm/{channel_id}/memory.db. channel_id is the DM
+      channel's snowflake, which is stable per-user, so this is
+      effectively one bucket per DM conversation.
+    - DM with no channel_id passed (legacy callers that only ever
+      passed guild_id=0): falls back to "dm/0" so nothing crashes,
+      but new call sites should always pass the real channel_id.
     """
-    guild_id = guild_id or 0
-    guild_dir = _groq_memory_dir(guild_id)
-    os.makedirs(guild_dir, exist_ok=True)
+    if guild_id:
+        return str(guild_id)
+    return os.path.join("dm", str(channel_id or 0))
 
-    conn = await aiosqlite.connect(_groq_memory_db_path(guild_id))
 
-    if guild_id not in _wal_enabled_guilds:
+def _groq_memory_dir(guild_id: int, channel_id: int | None = None) -> str:
+    """🌸 Directory holding this bucket's memory.db —
+    groq/memory/{guild_id}/ for guilds, groq/memory/dm/{channel_id}/
+    for DMs."""
+    return os.path.join(BASE_GROQ_DIR, _groq_bucket_key(guild_id, channel_id))
+
+
+def _groq_memory_db_path(guild_id: int, channel_id: int | None = None) -> str:
+    """🌸 Path to this bucket's memory.db."""
+    return os.path.join(_groq_memory_dir(guild_id, channel_id), "memory.db")
+
+
+async def _get_groq_db(guild_id: int = 0, channel_id: int | None = None) -> aiosqlite.Connection:
+    """🌸 Opens a fresh aiosqlite connection to this bucket's memory.db
+    (groq/memory/{guild_id}/memory.db for guilds, or
+    groq/memory/dm/{channel_id}/memory.db for DMs), creating the
+    table/index and enabling WAL mode (write-ahead logging) the first
+    time this process touches that file. WAL lets reads and writes
+    happen concurrently instead of locking the whole file on every
+    write — much friendlier for a Discord bot that may be handling
+    several mentions/replies in parallel across servers.
+    """
+    bucket_key = _groq_bucket_key(guild_id, channel_id)
+    bucket_dir = os.path.join(BASE_GROQ_DIR, bucket_key)
+    os.makedirs(bucket_dir, exist_ok=True)
+
+    conn = await aiosqlite.connect(os.path.join(bucket_dir, "memory.db"))
+
+    if bucket_key not in _wal_enabled_guilds:
         # journal_mode=WAL persists in the db file itself after the first
         # successful call, but it's harmless (and fast) to re-assert it.
         await conn.execute("PRAGMA journal_mode=WAL")
@@ -199,7 +222,7 @@ async def _get_groq_db(guild_id: int = 0) -> aiosqlite.Connection:
         # with WAL — still crash-safe, just skips some fsyncs that FULL
         # would do, which is the whole point of using WAL for concurrency.
         await conn.execute("PRAGMA synchronous=NORMAL")
-        _wal_enabled_guilds.add(guild_id)
+        _wal_enabled_guilds.add(bucket_key)
 
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
@@ -228,31 +251,34 @@ async def _get_groq_db(guild_id: int = 0) -> aiosqlite.Connection:
         # This only fails if this guild's DB somehow has old per-model
         # duplicate rows for the same user_id left over from before
         # memory was shared cross-model. Safe to ignore on a fresh file.
-        print(f"⚠️ Couldn't create memory index for guild {guild_id} ({e}).")
+        print(f"⚠️ Couldn't create memory index for bucket {bucket_key} ({e}).")
     await conn.commit()
     return conn
 
 
-async def _init_groq_db(guild_id: int = 0):
-    """🌸 Initialize a guild's groq/memory/{guild_id}/memory.db with the
-    chat_history table (and WAL mode) if it doesn't exist yet. Safe to
-    call from cog_load — await shared._init_groq_db(guild_id) initializes
-    that guild's memory DB on startup (or pass nothing / 0 for the DM
-    memory DB).
+async def _init_groq_db(guild_id: int = 0, channel_id: int | None = None):
+    """🌸 Initialize a bucket's memory.db with the chat_history table
+    (and WAL mode) if it doesn't exist yet. Safe to call from cog_load
+    — await shared._init_groq_db(guild_id) initializes that guild's
+    memory DB on startup, or shared._init_groq_db(0, channel_id) for a
+    specific DM channel's bucket.
     """
-    conn = await _get_groq_db(guild_id)
+    conn = await _get_groq_db(guild_id, channel_id)
     await conn.close()
 
 
-async def save_groq_memory(model_dir: str, username: str, user_id: int, history: list, guild_id: int = 0):
-    """🌸 Save history into this guild's own memory.db — one row per
-    user_id, scoped entirely by which guild's DB file this connects to.
-    Pass guild_id=0 (the default) for DMs, so DM history lives in its
-    own groq/memory/0/memory.db separate from every server. model_dir
-    is recorded (for debugging), but history is still cross-model
-    shared within that guild."""
+async def save_groq_memory(model_dir: str, username: str, user_id: int, history: list,
+                            guild_id: int = 0, channel_id: int | None = None):
+    """🌸 Save history into this bucket's own memory.db — one row per
+    user_id, scoped entirely by which bucket's DB file this connects
+    to. For guild messages, pass guild_id — history lives in
+    groq/memory/{guild_id}/memory.db. For DMs, pass guild_id=0 (or
+    leave it) AND channel_id — history lives in its own
+    groq/memory/dm/{channel_id}/memory.db, separate from every other
+    DM and every server. model_dir is recorded (for debugging), but
+    history is still cross-model shared within that bucket."""
     guild_id = guild_id or 0
-    conn = await _get_groq_db(guild_id)
+    conn = await _get_groq_db(guild_id, channel_id)
     try:
         await conn.execute("""
             INSERT INTO chat_history (user_id, username, model_name, history_json)
@@ -265,18 +291,20 @@ async def save_groq_memory(model_dir: str, username: str, user_id: int, history:
         """, (user_id, username, model_dir, json.dumps(history)))
         await conn.commit()
     except Exception as e:
-        print(f"❌ Groq memory save error for {username} ({user_id}) in guild {guild_id}: {e}")
+        bucket_key = _groq_bucket_key(guild_id, channel_id)
+        print(f"❌ Groq memory save error for {username} ({user_id}) in bucket {bucket_key}: {e}")
     finally:
         await conn.close()
 
 
-async def load_groq_memory(user_id: int, guild_id: int = 0) -> list:
-    """🌸 Load this user's Groq memory from a single guild's own
-    memory.db (or groq/memory/0/memory.db for DMs). What they said in
-    one server no longer shows up in another — each guild's history
-    lives in a completely separate SQLite file."""
+async def load_groq_memory(user_id: int, guild_id: int = 0, channel_id: int | None = None) -> list:
+    """🌸 Load this user's Groq memory from a single bucket's own
+    memory.db (groq/memory/{guild_id}/memory.db for a guild, or
+    groq/memory/dm/{channel_id}/memory.db for a DM). What they said in
+    one server — or one DM — no longer shows up anywhere else; each
+    bucket's history lives in a completely separate SQLite file."""
     guild_id = guild_id or 0
-    conn = await _get_groq_db(guild_id)
+    conn = await _get_groq_db(guild_id, channel_id)
     try:
         cur = await conn.execute(
             "SELECT history_json FROM chat_history WHERE user_id = ?",
@@ -287,7 +315,8 @@ async def load_groq_memory(user_id: int, guild_id: int = 0) -> list:
             return json.loads(row[0])
         return []
     except Exception as e:
-        print(f"❌ Groq memory load error for user {user_id} in guild {guild_id}: {e}")
+        bucket_key = _groq_bucket_key(guild_id, channel_id)
+        print(f"❌ Groq memory load error for user {user_id} in bucket {bucket_key}: {e}")
         return []
     finally:
         await conn.close()

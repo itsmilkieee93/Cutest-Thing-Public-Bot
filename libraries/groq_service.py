@@ -608,6 +608,28 @@ class GroqMentionService:
             #    through to the EXACT SAME regex chain as before, in the
             #    same most-specific-first order. Nothing above is removed;
             #    this only skips it on a successful AI classification.
+            # 🌸 guild.id is only safe to access when guild is truthy —
+            # DMs have guild=None. handle_media_request/handle_music_request
+            # below run for EVERY message (guild or DM) and only use this
+            # for logging, so 0 is a safe DM placeholder (never a real
+            # guild id). Defined once here so the whole block below doesn't
+            # need repeated `guild.id if guild else 0` inline.
+            guild_id = guild.id if guild else 0
+
+            # 🌸 intercepted MUST be initialized here, before the `if guild:`
+            # block below — it used to live inside that block (as
+            # `intercepted = None`), which meant in a DM (guild=None) it was
+            # NEVER assigned at all. The later `if intercepted is None:`
+            # checks that gate handle_media_request/handle_music_request are
+            # OUTSIDE the `if guild:` block (they must run for DMs too), so
+            # they'd hit a bare NameError on every single DM — silently
+            # caught by discord.py's default on_message error handler,
+            # which is why DMs never crashed visibly but also never reached
+            # the media/music interceptors at all (the model would then
+            # just hallucinate "I can't send images" in general chat,
+            # having never actually been given the chance to try).
+            intercepted = None
+
             if guild:
                 server_hint = _looks_server_related(dispatch_text)
 
@@ -640,8 +662,6 @@ class GroqMentionService:
                 # look server-related at all, there's nothing to flip a
                 # coin over and we skip straight to "none" like before.
                 strategy = random.choice(["ai", "regex"]) if server_hint else "regex"
-
-                intercepted = None
 
                 async def _try_ai():
                     label = await self.bot.groq.classify_server_query(dispatch_text, message.author.name)
@@ -723,72 +743,86 @@ class GroqMentionService:
                         # before giving up entirely, same as the "ai" branch
                         # falling back to regex above.
                         intercepted = await _try_ai()
-                if intercepted is None:
-                    # 🌸 AI-classified media request — one Groq call decides
-                    # if this is "send me a pic/video/vector/cartoon of X",
-                    # then dispatches to Pexels (photo/video) or Pixabay
-                    # (vector/cartoon) and returns a discord.Embed with the
-                    # image set via set_image() — no raw link text visible,
-                    # unlike the old bare-URL auto-embed approach.
-                    intercepted = await handle_media_request(message, guild.id, shared)
-                if intercepted is None:
-                    # 🌸 AI-classified MUSIC request — same zero-token-gate-
-                    # then-classify shape as everything else in this chain
-                    # (MUSIC_INTENT_PATTERN local pre-filter, then one Groq
-                    # call). Searches YouTube Music via ytmusicapi and
-                    # returns a discord.Embed with a cute AI summary + top
-                    # tracks, or None if this doesn't look like a music
-                    # request. Runs AFTER handle_media_request so an image
-                    # request never gets accidentally swallowed here first.
-                    intercepted = await handle_music_request(message, guild.id, shared)
-                if intercepted:
-                    # 🌸 handle_media_request returns a plain discord.Embed.
-                    # handle_music_request returns a (discord.Embed,
-                    # tracks | None, query, summary | None) 4-tuple —
-                    # tracks/summary are None for the "couldn't find
-                    # anything" apology embed (nothing to paginate). When
-                    # tracks IS populated, buttons are PERSISTENT (survive
-                    # bot restarts — see MusicPaginatorView +
-                    # register_persistent_music_view in
-                    # groq_music_suggestion.py). custom_id is a FIXED
-                    # literal string ("music:prev"/"music:next"), not
-                    # message-id-encoded, so the view can be built and
-                    # attached in the SAME reply() call — no more
-                    # send-without-view-then-edit-in-a-view dance, and one
-                    # fewer Discord API round-trip per music result. `summary`
-                    # is threaded into save_music_interaction so ◀️/▶️ page
-                    # turns can keep showing the same AI blurb instead of it
-                    # only ever appearing on the first-sent page. Every
-                    # OTHER interceptor above returns a plain string reply.
-                    if isinstance(intercepted, tuple):
-                        music_embed, music_tracks, music_query, music_summary = intercepted
-                        if music_tracks:
-                            music_view = MusicPaginatorView(owner_id=message.author.id)
-                            _, music_url, video_url = _track_urls(music_tracks[0])
-                            music_view.add_item(discord.ui.Button(label="YT Music", url=music_url, emoji="🎧"))
-                            music_view.add_item(discord.ui.Button(label="YouTube", url=video_url, emoji="📲"))
-                            sent = await message.reply(
-                                embed=music_embed,
-                                view=music_view,
-                                mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS,
-                            )
-                            await save_music_interaction(
-                                message_id=sent.id,
-                                user_id=message.author.id,
-                                guild_id=guild.id,
-                                query=music_query,
-                                filter_type="songs",
-                                tracks=music_tracks,
-                                track_index=0,
-                                summary=music_summary,
-                            )
-                        else:
-                            await message.reply(embed=music_embed, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
-                    elif isinstance(intercepted, discord.Embed):
-                        await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+
+            # 🌸 DEDENTED OUT OF `if guild:` — this used to be nested inside
+            # the guild-only block above, which meant handle_media_request/
+            # handle_music_request (and the reply-sending logic below) never
+            # ran at all in a DM: `if guild:` was False, so Python skipped
+            # straight past all of this to the plain-chat path below, no
+            # crash, no error, nothing — the model just answered from
+            # general chat with no chance to actually search for media,
+            # which is exactly why it kept insisting "I'm text-only" even
+            # after the earlier `intercepted = None` / server_context fixes.
+            # Those fixes stopped the crash, but this indentation bug was
+            # still silently skipping the interceptors themselves in DMs.
+            # `intercepted` is already guaranteed to exist here (initialized
+            # above, before `if guild:`) whether or not that block ran.
+            if intercepted is None:
+                # 🌸 AI-classified media request — one Groq call decides
+                # if this is "send me a pic/video/vector/cartoon of X",
+                # then dispatches to Pexels (photo/video) or Pixabay
+                # (vector/cartoon) and returns a discord.Embed with the
+                # image set via set_image() — no raw link text visible,
+                # unlike the old bare-URL auto-embed approach.
+                intercepted = await handle_media_request(message, guild_id, shared)
+            if intercepted is None:
+                # 🌸 AI-classified MUSIC request — same zero-token-gate-
+                # then-classify shape as everything else in this chain
+                # (MUSIC_INTENT_PATTERN local pre-filter, then one Groq
+                # call). Searches YouTube Music via ytmusicapi and
+                # returns a discord.Embed with a cute AI summary + top
+                # tracks, or None if this doesn't look like a music
+                # request. Runs AFTER handle_media_request so an image
+                # request never gets accidentally swallowed here first.
+                intercepted = await handle_music_request(message, guild_id, shared)
+            if intercepted:
+                # 🌸 handle_media_request returns a plain discord.Embed.
+                # handle_music_request returns a (discord.Embed,
+                # tracks | None, query, summary | None) 4-tuple —
+                # tracks/summary are None for the "couldn't find
+                # anything" apology embed (nothing to paginate). When
+                # tracks IS populated, buttons are PERSISTENT (survive
+                # bot restarts — see MusicPaginatorView +
+                # register_persistent_music_view in
+                # groq_music_suggestion.py). custom_id is a FIXED
+                # literal string ("music:prev"/"music:next"), not
+                # message-id-encoded, so the view can be built and
+                # attached in the SAME reply() call — no more
+                # send-without-view-then-edit-in-a-view dance, and one
+                # fewer Discord API round-trip per music result. `summary`
+                # is threaded into save_music_interaction so ◀️/▶️ page
+                # turns can keep showing the same AI blurb instead of it
+                # only ever appearing on the first-sent page. Every
+                # OTHER interceptor above returns a plain string reply.
+                if isinstance(intercepted, tuple):
+                    music_embed, music_tracks, music_query, music_summary = intercepted
+                    if music_tracks:
+                        music_view = MusicPaginatorView(owner_id=message.author.id)
+                        _, music_url, video_url = _track_urls(music_tracks[0])
+                        music_view.add_item(discord.ui.Button(label="YT Music", url=music_url, emoji="🎧"))
+                        music_view.add_item(discord.ui.Button(label="YouTube", url=video_url, emoji="📲"))
+                        sent = await message.reply(
+                            embed=music_embed,
+                            view=music_view,
+                            mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS,
+                        )
+                        await save_music_interaction(
+                            message_id=sent.id,
+                            user_id=message.author.id,
+                            guild_id=guild_id,
+                            query=music_query,
+                            filter_type="songs",
+                            tracks=music_tracks,
+                            track_index=0,
+                            summary=music_summary,
+                        )
                     else:
-                        await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
-                    return
+                        await message.reply(embed=music_embed, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                elif isinstance(intercepted, discord.Embed):
+                    await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                else:
+                    await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                return
 
             # 🌸 Prompt no longer carries the full guild_context dump — the
             # compact, DB-backed guild summary is now injected inside
