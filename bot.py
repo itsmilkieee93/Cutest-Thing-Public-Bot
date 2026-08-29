@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/python3.14
+
 import sys
 import os
 import time
