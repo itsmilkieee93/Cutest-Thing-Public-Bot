@@ -116,6 +116,19 @@ if not exa_logger.handlers:
     exa_logger.addHandler(_exa_log_handler)
     exa_logger.propagate = False
 
+# 🌸 Also relay to stdout (and therefore to Discord via log_webhook's
+# sys.stdout Tee, same as groq_pexels.py's logger) — exa_logger has
+# propagate=False above specifically so it doesn't double up through
+# the root logger, so this relay is the ONLY way its lines reach the
+# live status channel. Safe to call even if start_log_webhook() hasn't
+# run yet / never runs (webhook not configured) — it just writes to
+# plain stdout in that case, same as before.
+try:
+    from log_webhook import add_stdout_relay
+    add_stdout_relay(exa_logger, prefix="ExaSearch")
+except ImportError:
+    pass
+
 
 class ExaSearchService:
     """
@@ -363,9 +376,11 @@ class ExaSearchService:
         if category:
             url += f"&category={urllib.parse.quote(category)}"
         _log_url = url.replace(news_api_key, "***")
-        exa_logger.debug(f"→ GET {_log_url}")
+        _site = "api.currentsapi.services"
+        exa_logger.info(f"→ GET {_site} | query={query!r}")
         try:
             async with session.get(url, timeout=10) as resp:
+                exa_logger.info(f"← GET {_site} | status={resp.status} | query={query!r}")
                 if resp.status != 200:
                     return None
                 data = await resp.json()
@@ -375,6 +390,7 @@ class ExaSearchService:
                 return articles[0].get("url")
         except Exception as e:
             print(f"⚠️ Currents search failed for {query!r}: {e}")
+            exa_logger.warning(f"← GET {_site} | FAILED | query={query!r} | {e}")
             return None
 
     async def _fetch_via_jina(self, session: aiohttp.ClientSession, url: str, max_chars: int = 3000) -> str | None:
@@ -386,9 +402,11 @@ class ExaSearchService:
         headers = {"X-Return-Format": "text"}
         if self.jina_api_key:
             headers["Authorization"] = f"Bearer {self.jina_api_key}"
-        exa_logger.debug(f"→ GET {JINA_READER_BASE}{url} | headers={{'X-Return-Format': 'text'}}")
+        _site = "r.jina.ai"
+        exa_logger.info(f"→ GET {_site} | url={url!r}")
         try:
             async with session.get(f"{JINA_READER_BASE}{url}", headers=headers, timeout=15) as resp:
+                exa_logger.info(f"← GET {_site} | status={resp.status} | url={url!r}")
                 if resp.status != 200:
                     return None
                 text = (await resp.text()).strip()
@@ -398,6 +416,7 @@ class ExaSearchService:
                     text = text[:max_chars].rsplit(" ", 1)[0] + "…"
                 return text
         except Exception as e:
+            exa_logger.warning(f"← GET {_site} | FAILED | url={url!r} | {e}")
             print(f"⚠️ r.jina.ai fetch failed for {url}: {e}")
             return None
 

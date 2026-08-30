@@ -222,7 +222,7 @@ async def _classify_media_request(content: str) -> dict | None:
             # left no room for the actual JSON object. Same root cause as
             # the Aug 2026 music-classifier outage in groq_music_suggestion.py.
             reasoning_effort="low",
-            max_tokens=300,
+            max_tokens=1000,
             response_format={"type": "json_object"},
         )
 
@@ -474,11 +474,13 @@ async def _get_pexels_avatar_url(photographer_id: int | None, profile_url: str |
     avatar_url = None
     try:
         async with aiohttp.ClientSession() as session:
+            logger.info(f"→ GET pexels.com (profile scrape) | photographer_id={photographer_id}")
             async with session.get(
                 profile_url,
                 timeout=aiohttp.ClientTimeout(total=1),
                 headers={"User-Agent": "Mozilla/5.0 (compatible; CutestThingBot/1.0)"},
             ) as resp:
+                logger.info(f"← GET pexels.com (profile scrape) | status={resp.status} | photographer_id={photographer_id}")
                 if resp.status == 200:
                     html = await resp.text()
                     match = _AVATAR_IMG_RE.search(html)
@@ -558,13 +560,14 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
                 "per_page":    1,
                 "page":        random.randint(1, 50),
             }
-            logger.debug(f"→ GET {PEXELS_API_BASE}/v1/search | params={params}")
+            logger.info(f"→ GET api.pexels.com/v1/search | query={query!r}")
             async with session.get(
                 f"{PEXELS_API_BASE}/v1/search",
                 headers=headers,
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
+                logger.info(f"← GET api.pexels.com/v1/search | status={resp.status} | query={query!r}")
                 if resp.status != 200:
                     logger.warning(f"Pexels returned {resp.status} for query '{query}'")
                     return None
@@ -634,13 +637,14 @@ async def _fetch_pexels_video(message, guild_id: int, query: str) -> str | None:
                 "per_page": 1,
                 "page":     random.randint(1, 20),
             }
-            logger.debug(f"→ GET {PEXELS_API_BASE}/videos/search | params={params}")
+            logger.info(f"→ GET api.pexels.com/videos/search | query={query!r}")
             async with session.get(
                 f"{PEXELS_API_BASE}/videos/search",
                 headers=headers,
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                logger.info(f"← GET api.pexels.com/videos/search | status={resp.status} | query={query!r}")
                 if resp.status != 200:
                     logger.warning(f"Pexels videos returned {resp.status} for query '{query}'")
                     return None
@@ -720,13 +724,13 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             # ~80 hits), not just the global 500-hit cap. A flat
             # randint(1, 50) assumed every query had the full 500 and
             # blew past that per-query ceiling for narrower searches.
-            _log_params = {**base_params, "page": 1, "key": "***"}
-            logger.debug(f"→ GET {PIXABAY_API_BASE}/ | params={_log_params}")
+            logger.info(f"→ GET pixabay.com/api | query={query!r} | page=1")
             async with session.get(
                 f"{PIXABAY_API_BASE}/",
                 params={**base_params, "page": 1},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                logger.info(f"← GET pixabay.com/api | status={resp.status} | query={query!r} | page=1")
                 if resp.status != 200:
                     logger.warning(f"Pixabay returned {resp.status} for query '{query}'")
                     return None
@@ -743,14 +747,13 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
             if max_page > 1:
                 page = random.randint(1, max_page)
                 if page != 1:
-                    logger.debug(
-                        f"→ GET {PIXABAY_API_BASE}/ | params={{**base_params, 'page': {page}, 'key': '***'}}"
-                    )
+                    logger.info(f"→ GET pixabay.com/api | query={query!r} | page={page}")
                     async with session.get(
                         f"{PIXABAY_API_BASE}/",
                         params={**base_params, "page": page},
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
+                        logger.info(f"← GET pixabay.com/api | status={resp.status} | query={query!r} | page={page}")
                         if resp.status == 200:
                             data = await resp.json()
                         else:

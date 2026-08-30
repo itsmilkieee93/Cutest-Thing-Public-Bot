@@ -46,6 +46,7 @@ from groq_music_suggestion import (
     handle_music_request, save_music_interaction,
     MusicPaginatorView, _track_urls,
 )
+from extras.groq_dm_instruct import DM_REQUEST_PATTERN, route_dm_split
 from resources import shared
 
 # 🌸 Referential word gate for reply-context folding — see the comment
@@ -854,6 +855,15 @@ class GroqMentionService:
             # ✅ Determine which emoji to suggest (if allowed to react)
             react_allowed = user_asking_for_react or random.random() < AUTO_REACT_CHANCE
 
+            # 🌸 Same "regex gates/strengthens, AI decides content" shape
+            # as react_allowed above — DM_REQUEST_PATTERN reliably catches
+            # explicit "dm me"/"kirim ke dm" asks even when Groq itself
+            # might not judge the content as "sensitive enough" to warrant
+            # a [DM_START] tag on its own. Only meaningful in a guild
+            # (get_ai_response's build_dm_directives already no-ops this
+            # for DMs), but computing it unconditionally here is harmless.
+            dm_requested = bool(DM_REQUEST_PATTERN.search(message.content))
+
             # 🌸 reply_to_message_id / reply_to_message_text were already
             # resolved earlier (before the server-query dispatch block
             # above) so that dispatch could see reply context too — no
@@ -868,6 +878,7 @@ class GroqMentionService:
                 channel=message.channel,
                 recent_react_emoji=self.recent_react_emoji.get(str(message.channel.id), []),
                 react_allowed=react_allowed,  # ✅ ADDED: Pass react_allowed
+                dm_requested=dm_requested,
                 shared=shared,
                 message_id=message.id,
                 reply_to_message_id=reply_to_message_id,
@@ -880,6 +891,18 @@ class GroqMentionService:
 
                 # ✅ Strip [REACT:emoji] tags from response text so they don't show to users
                 clean_response = REACT_TAG_PATTERN.sub("", response).strip()
+
+                # 🌸 DM split-routing MUST run BEFORE the public send below —
+                # it further strips [DM_START]...[DM_END] out of
+                # clean_response (mutating what actually reaches the server
+                # channel), fires the private DM off to the side, and
+                # appends an AI-phrased, Discord-verified success/privacy-
+                # blocked notice. See extras/groq_dm_instruct.route_dm_split
+                # for the full contract; generate_dm_notice is what phrases
+                # that notice in the bot's own voice.
+                clean_response = await route_dm_split(
+                    message, clean_response, self.bot.groq.generate_dm_notice,
+                )
 
                 try:
                     if clean_response:  # Only send if there's content after stripping
