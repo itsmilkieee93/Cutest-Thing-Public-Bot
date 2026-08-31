@@ -643,6 +643,16 @@ class GroqService:
         "small, cheap, in-character, no memory load" call as
         _generate_safeguard_decline, just reporting a different fact.
 
+        Uses CLASSIFIER_MODEL (openai/gpt-oss-20b), NOT self.default_model
+        — this is a short, templated, low-stakes fill-in-the-blank line,
+        not a full conversational reply, so the smaller/cheaper/faster
+        model is the right fit (same reasoning as classify_server_query's
+        use of CLASSIFIER_MODEL elsewhere in this file). Being a REASONING
+        model, it spends part of its token budget on hidden chain-of-
+        thought before any visible content — see notice_max_tokens below
+        for why the caps are set higher than the visible sentence alone
+        would need.
+
         FAILS to a short static line per outcome if the client is
         missing or the call errors/comes back empty — reporting SOME
         accurate status always beats reporting nothing, and reporting
@@ -683,6 +693,14 @@ class GroqService:
                 "second sentence, no extra thought tacked on after it. Just "
                 "the one confirmation line and stop.]"
             )
+            # 🌸 "sent" only ever needs a short single confirmation
+            # ("sent it to your DMs! 🌸💌"). CLASSIFIER_MODEL is a
+            # REASONING model (see classify_server_query's _call above) —
+            # it spends tokens on hidden chain-of-thought before any
+            # visible content, so the budget has to cover BOTH a short
+            # reasoning pass AND the sentence itself, not just the
+            # sentence. 120 leaves real headroom for that.
+            notice_max_tokens = 120
         else:
             scene = (
                 f"[You just TRIED to DM {display_name} (@{username}) "
@@ -696,24 +714,41 @@ class GroqService:
                 "both the problem and the fix — no greeting, no second "
                 "sentence, no extra thought tacked on after it.]"
             )
+            # 🌸 "forbidden" needs a full mention + explanation + fix
+            # instruction in one sentence (~45-55 tokens on its own — see
+            # the max_tokens=40 cutoff bug this already fixed once) PLUS
+            # the same reasoning-token overhead as above — 180 covers
+            # both comfortably.
+            notice_max_tokens = 180
 
         def _call():
             return self.client.chat.completions.create(
-                model=self.default_model,
+                model=CLASSIFIER_MODEL,
                 messages=[
                     {"role": "system", "content": personality_instructions},
                     {"role": "user", "content": scene},
                 ],
                 temperature=0.9,
                 reasoning_effort="low",
-                max_tokens=40,
+                max_tokens=notice_max_tokens,
             )
 
         try:
             response = await asyncio.to_thread(_call)
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
             notice = _strip_reasoning(response.choices[0].message.content or "").strip()
             if not notice:
                 print(f"⚠️ DM notice generation returned EMPTY for {username} (outcome={outcome}) — using static fallback")
+                return static_fallback
+
+            # 🌸 HARD-TRUNCATION GUARD — if the completion got cut off by
+            # hitting notice_max_tokens mid-sentence (finish_reason ==
+            # "length"), the API stopped wherever the budget ran out, not
+            # at a sentence boundary (the exact bug seen in production:
+            # "...your privacy settings dis" cut off mid-word). Ship the
+            # guaranteed-complete static line instead of a mangled one.
+            if finish_reason == "length":
+                print(f"⚠️ DM notice generation hit max_tokens (outcome={outcome}) — using static fallback to avoid mid-sentence cutoff")
                 return static_fallback
 
             # 🌸 DEFENSIVE BACKSTOP — the scene prompt says "EXACTLY ONE

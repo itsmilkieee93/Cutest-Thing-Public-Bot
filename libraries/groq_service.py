@@ -47,6 +47,7 @@ from groq_music_suggestion import (
     MusicPaginatorView, _track_urls,
 )
 from extras.groq_dm_instruct import DM_REQUEST_PATTERN, route_dm_split
+from extras.groq_attachments import get_image_attachments, describe_attachments
 from resources import shared
 
 # 🌸 Referential word gate for reply-context folding — see the comment
@@ -842,12 +843,34 @@ class GroqMentionService:
             # the forwarder typed alongside it.
             forwarded_text = self._extract_forwarded_text(message)
 
+            # 🌸 IMAGE ATTACHMENTS — if the user posted image(s) alongside
+            # their message, describe them via a SEPARATE Groq vision call
+            # (extras/groq_attachments.py) and fold the description into
+            # the text prompt as its own labeled block, same pattern as
+            # forwarded_text above. This is intentionally NOT woven into
+            # get_ai_response's own messages/content-blocks — the vision
+            # call happens here, once, and the rest of the pipeline
+            # (personality, history, [REACT:...], [DM_START]...) just
+            # sees ordinary text either way, so nothing else needs to
+            # know vision happened at all. Only attempted if there's at
+            # least one actual image attachment — get_image_attachments
+            # filters out non-image files, so a message with only a
+            # regular file/video attachment skips this entirely with no
+            # wasted Groq call.
+            image_description = None
+            if get_image_attachments(message):
+                image_description = await describe_attachments(
+                    self.bot.groq.client, message, user_text=message.clean_content,
+                )
+
             prompt = (
                 f"User: {message.author.name}\n"
                 f"Message: {message.clean_content}\n"
             )
             if forwarded_text:
                 prompt += f"[Forwarded message]: {forwarded_text}\n"
+            if image_description:
+                prompt += f"[Attached image]: {image_description}\n"
 
             # ✅ Check if user is asking for a reaction
             user_asking_for_react = bool(REACT_REQUEST_PATTERN.search(message.content))
