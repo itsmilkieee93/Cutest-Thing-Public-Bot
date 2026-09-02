@@ -47,7 +47,10 @@ from groq_music_suggestion import (
     MusicPaginatorView, _track_urls,
 )
 from extras.groq_dm_instruct import DM_REQUEST_PATTERN, route_dm_split
-from extras.groq_attachments import get_image_attachments, describe_attachments
+from extras.groq_attachments import (
+    get_image_attachments, describe_attachments,
+    get_text_attachments, read_and_format_text_attachments,
+)
 from resources import shared
 
 # 🌸 Referential word gate for reply-context folding — see the comment
@@ -863,6 +866,21 @@ class GroqMentionService:
                     self.bot.groq.client, message, user_text=message.clean_content,
                 )
 
+            # 🌸 TEXT ATTACHMENTS — .txt or ANY UTF-8-decodable file
+            # (extras/groq_attachments.py). Unlike the image path above,
+            # this makes NO separate Groq call — a UTF-8 decode is free,
+            # so the file's FULL content (up to a generous per-file char
+            # cap) gets folded straight into the prompt as its own
+            # labeled block. Keeps token cost tied to what the file
+            # actually contains instead of spending a whole extra
+            # completion call paraphrasing it the way vision does for
+            # images. Only attempted if there's at least one non-image
+            # attachment small enough to bother downloading — see
+            # get_text_attachments for the pre-read size guard.
+            text_attachment_block = None
+            if get_text_attachments(message):
+                text_attachment_block = await read_and_format_text_attachments(message)
+
             prompt = (
                 f"User: {message.author.name}\n"
                 f"Message: {message.clean_content}\n"
@@ -871,6 +889,8 @@ class GroqMentionService:
                 prompt += f"[Forwarded message]: {forwarded_text}\n"
             if image_description:
                 prompt += f"[Attached image]: {image_description}\n"
+            if text_attachment_block:
+                prompt += f"{text_attachment_block}\n"
 
             # ✅ Check if user is asking for a reaction
             user_asking_for_react = bool(REACT_REQUEST_PATTERN.search(message.content))
