@@ -135,7 +135,7 @@ Depends on which feature you used:
 | **Cloudflare Workers AI** | `/cloudflare-ai` commands |
 | **Exa** and news/page-fetch fallbacks | Grounded Groq answers |
 | **Pexels / Pixabay / Unsplash** | Image / video search |
-| **YouTube / yt-dlp / YouTube Music** | `/youtube`, `/music`, `/download-music`, `/livestream-chat`, `/my-channel` |
+| **YouTube / yt-dlp / YouTube Music** | `/youtube`, `/music`, `/livestream-chat`, `/my-channel` |
 | **Wikipedia, weather, news APIs** | Matching slash commands |
 | **Joke / quote / trivia / compliment APIs** | `/dadjoke`, `/quote`, `/fact`, `/advice`, `/question`, `/praise`, and related |
 | **Discord** | Normal bot API traffic plus the Operator’s log embeds and webhook |

@@ -69,7 +69,6 @@ Personality text comes from `libraries/personality.py` and uses the Bot’s **cu
 | Command | What the code does |
 | --- | --- |
 | `/music` | YouTube Music search |
-| `/download-music` | Audio via yt-dlp (guilds only in current code) |
 | `/youtube` | Video / playlist metadata via yt-dlp |
 | `/livestream-chat` | Recent YouTube live chat line |
 | `/my-channel` | Operator’s YouTube channel stats |
