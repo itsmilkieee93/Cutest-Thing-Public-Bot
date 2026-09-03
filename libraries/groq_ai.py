@@ -449,7 +449,7 @@ class GroqService:
                 # classify_server_query/classify_search_intent above —
                 # reasoning_effort="low" + real max_tokens headroom fixes it.
                 reasoning_effort="low",
-                max_tokens=150,
+                max_tokens=1024,
             )
 
         try:
@@ -519,7 +519,7 @@ class GroqService:
                 temperature=0,
                 # 🌸 Same reasoning-model fix as check_safety above.
                 reasoning_effort="low",
-                max_tokens=300,
+                max_tokens=1024,
             )
 
         try:
@@ -614,7 +614,7 @@ class GroqService:
                 ],
                 temperature=1.05,
                 reasoning_effort="low",
-                max_tokens=60,
+                max_tokens=512,
             )
 
         try:
@@ -719,7 +719,7 @@ class GroqService:
             # the max_tokens=40 cutoff bug this already fixed once) PLUS
             # the same reasoning-token overhead as above — 180 covers
             # both comfortably.
-            notice_max_tokens = 180
+            notice_max_tokens = 256
 
         def _call():
             return self.client.chat.completions.create(

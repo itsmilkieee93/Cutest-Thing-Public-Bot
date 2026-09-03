@@ -31,6 +31,23 @@ back a plain text description string and folds it into the normal text
 forwarded-message text there — so the rest of the pipeline (personality,
 [REACT:...], [DM_START]...) needs no awareness that vision happened at
 all.
+
+🌸 TEXT ATTACHMENTS (.txt / any UTF-8 file) — a SEPARATE, much cheaper
+path from the image one above. No extra Groq call at all: a UTF-8
+decode costs nothing, so attachment.read() bytes get decoded and the
+FULL file content is folded straight into the prompt as its own
+labeled block, the exact same way image_description/forwarded_text
+already are in groq_service.py. "Bloating the token input" here would
+only mean spending a whole extra completion call turning the file into
+a paraphrased description first (like vision does) — skipping that
+step entirely is what keeps this cheap, not truncating the file. The
+only guard is MAX_TEXT_ATTACHMENT_CHARS, a generous per-file ceiling
+so one freak huge log dump can't single-handedly blow the whole
+prompt's context budget — real-world .txt/.py/.md/.json/etc. files
+people actually share in Discord pass through completely untouched.
+Non-text (binary) attachments are detected the honest way: the UTF-8
+decode itself raises UnicodeDecodeError and that attachment is
+silently skipped, no content_type/extension guessing needed.
 """
 
 import asyncio
@@ -66,6 +83,34 @@ MAX_SINGLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB per image
 # the more generous qwen3.6-27b caps at 5. Enforced again defensively
 # inside build_image_content_blocks even if a caller passes more.
 ABSOLUTE_MAX_IMAGES = 5
+
+# 🌸 TEXT ATTACHMENTS — see module docstring. This is a pre-read size
+# guard (checked against attachment.size, before ever downloading
+# anything) so we don't waste a Discord CDN round-trip on something
+# that's obviously not a small text file to begin with — e.g. a 40MB
+# video someone attached alongside their message. Deliberately much
+# more generous than MAX_SINGLE_IMAGE_BYTES since there's no Groq
+# request-size cap in play here at all (no vision call happens for
+# text), this is purely "don't bother downloading+decoding something
+# this large".
+MAX_TEXT_ATTACHMENT_DOWNLOAD_BYTES = 1 * 1024 * 1024  # 1MB
+
+# 🌸 Post-decode ceiling on what actually gets folded into the prompt,
+# per file. ~40k characters is roughly 10-12k tokens (rough 3-4
+# chars/token ballpark for English/code) — generous enough that real
+# .txt/.py/.md/.json/.log files people paste into Discord pass through
+# completely whole, while still keeping one outlier file from eating
+# the entire prompt budget by itself. Only the excess past this point
+# gets truncated (with a note) — never a summary, always the file's
+# own real text.
+MAX_TEXT_ATTACHMENT_CHARS = 40_000
+
+# 🌸 How many separate text-file attachments we'll bother reading per
+# message — mirrors the spirit of ABSOLUTE_MAX_IMAGES. Most messages
+# have at most one attached file; this just stops one message with
+# five random file attachments from ballooning the prompt with five
+# separate full-file blocks.
+ABSOLUTE_MAX_TEXT_ATTACHMENTS = 3
 
 
 def get_image_attachments(message: discord.Message) -> list[discord.Attachment]:
@@ -236,3 +281,123 @@ async def describe_attachments(
     except Exception as e:
         print(f"⚠️ Vision call failed (model={model}, images={len(blocks)}): {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 🌸 TEXT ATTACHMENTS (.txt / any UTF-8 file) — see module docstring
+# for why this is a cheaper, separate path from the image vision code
+# above: no Groq call at all, just a direct UTF-8 decode of whatever
+# attachment.read() returns.
+# ─────────────────────────────────────────────────────────────────────
+
+def get_text_attachments(message: discord.Message) -> list[discord.Attachment]:
+    """🌸 Filters a message's attachments down to ones worth attempting a
+    UTF-8 text read on. Deliberately does NOT gate on content_type or
+    file extension — Discord's content_type for code/config files
+    (.py, .json, .yml, .env, extensionless files, etc.) is frequently
+    missing or generic ("application/octet-stream"), so trusting it
+    the way get_image_attachments trusts "image/..." would silently
+    drop plenty of legitimately-readable text files. Instead this just
+    excludes images (already handled by the vision path above, and
+    reusing that same result here would be pointless) and anything
+    over MAX_TEXT_ATTACHMENT_DOWNLOAD_BYTES — actual "is this really
+    text" filtering happens honestly in read_text_attachments, via the
+    UTF-8 decode itself succeeding or failing.
+    """
+    out = [
+        a for a in message.attachments
+        if not (a.content_type and a.content_type.startswith("image/"))
+        and not (a.size and a.size > MAX_TEXT_ATTACHMENT_DOWNLOAD_BYTES)
+    ]
+    return out[:ABSOLUTE_MAX_TEXT_ATTACHMENTS]
+
+
+async def read_text_attachments(attachments: list[discord.Attachment]) -> list[tuple[str, str]]:
+    """🌸 Downloads each attachment via attachment.read() and attempts a
+    strict UTF-8 decode. A binary file (image already filtered out
+    upstream, but also zips, executables, audio, etc.) simply fails
+    that decode with UnicodeDecodeError and gets silently skipped —
+    same fail-soft philosophy as the vision path: a file the bot can't
+    read as text is not a reason to error out the whole message.
+
+    Per-file content is capped at MAX_TEXT_ATTACHMENT_CHARS (truncated
+    with a trailing note, not summarized) so the caller always gets
+    back the file's OWN real text, in full, up to that ceiling — never
+    an AI paraphrase of it.
+
+    Returns a list of (filename, text) pairs for whatever successfully
+    decoded, in the same order as `attachments`. Empty list if nothing
+    was readable as UTF-8 text.
+    """
+    results = []
+
+    for attachment in attachments:
+        try:
+            raw = await attachment.read()
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to read attachment {attachment.filename}: {e}")
+            continue
+        except discord.Forbidden as e:
+            print(f"⚠️ Forbidden reading attachment {attachment.filename}: {e}")
+            continue
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # 🌸 Not UTF-8 text — a binary file discord.py's content_type
+            # didn't flag as such (or didn't set at all). Silently skip,
+            # same as an oversized/unreadable image attachment.
+            continue
+
+        if not text.strip():
+            continue
+
+        if len(text) > MAX_TEXT_ATTACHMENT_CHARS:
+            remaining = len(text) - MAX_TEXT_ATTACHMENT_CHARS
+            text = (
+                text[:MAX_TEXT_ATTACHMENT_CHARS]
+                + f"\n...[truncated — {remaining:,} more characters in the original file]"
+            )
+
+        results.append((attachment.filename, text))
+
+    return results
+
+
+def format_text_attachment_blocks(text_attachments: list[tuple[str, str]]) -> str:
+    """🌸 Formats (filename, text) pairs into labeled prompt blocks — one
+    per file, e.g.:
+
+        [Attached file: notes.txt]
+        <full file content>
+
+    Same "own labeled block" shape as [Forwarded message]/[Attached
+    image] already use in groq_service.py's prompt assembly, so Groq
+    sees a consistent structure regardless of which kind of extra
+    context got folded in. Multiple files are joined with a blank line
+    between them. Returns "" if given an empty list.
+    """
+    return "\n\n".join(
+        f"[Attached file: {filename}]\n{text}"
+        for filename, text in text_attachments
+    )
+
+
+async def read_and_format_text_attachments(message: discord.Message) -> str | None:
+    """🌸 Main entry point for text attachments — the read_text_attachments
+    equivalent of describe_attachments above, minus the Groq call.
+    groq_service.py calls this with the incoming discord.Message and
+    gets back a single ready-to-append prompt block (or None if there
+    was nothing readable), the same shape as image_description already
+    has, so it slots into the existing prompt-assembly `if` chain with
+    zero special-casing.
+    """
+    attachments = get_text_attachments(message)
+    if not attachments:
+        return None
+
+    text_attachments = await read_text_attachments(attachments)
+    if not text_attachments:
+        return None
+
+    return format_text_attachment_blocks(text_attachments)

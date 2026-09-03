@@ -2,21 +2,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from typing import Union
-import os
+import config_loader
+import msg_whitelist_db
 
 
 class ForwardCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.whitelist_path = "auth/whitelist"
-
-    def get_allowed_servers(self):
-        if not os.path.exists(self.whitelist_path): return []
-        try:
-            if os.path.getsize(self.whitelist_path) == 0: return []
-            with open(self.whitelist_path, "r") as f:
-                return [int(line.strip()) for line in f if line.strip().isdigit()]
-        except: return []
 
     async def server_autocomplete(self, interaction: discord.Interaction, current: str):
         choices = []
@@ -117,9 +109,10 @@ class ForwardCog(commands.Cog):
         except: 
             return 
 
-        allowed_servers = self.get_allowed_servers()
+        is_owner = config_loader.is_owner(interaction.user.id)
+        allowed_servers = config_loader.get_allowed_server_ids()
         # 🛡️ Only check restrictions if the command is run INSIDE a server
-        if interaction.guild_id and allowed_servers and interaction.guild_id not in allowed_servers:
+        if not is_owner and interaction.guild_id and interaction.guild_id not in allowed_servers and not await msg_whitelist_db.is_whitelisted(interaction.guild_id):
             # Cute Access Denied Embed
             error_embed = discord.Embed(
                 title="🚫 Access Restricted",

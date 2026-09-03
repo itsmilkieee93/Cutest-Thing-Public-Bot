@@ -781,40 +781,21 @@ class GroqMentionService:
                 # request never gets accidentally swallowed here first.
                 intercepted = await handle_music_request(message, guild_id, shared)
             if intercepted:
-                # 🌸 handle_media_request returns a plain discord.Embed.
-                # handle_music_request returns a (discord.Embed,
-                # tracks | None, query, summary | None) 4-tuple —
-                # tracks/summary are None for the "couldn't find
-                # anything" apology embed (nothing to paginate). When
-                # tracks IS populated, buttons are PERSISTENT (survive
-                # bot restarts — see MusicPaginatorView +
-                # register_persistent_music_view in
-                # groq_music_suggestion.py). custom_id is a FIXED
-                # literal string ("music:prev"/"music:next"), not
-                # message-id-encoded, so the view can be built and
-                # attached in the SAME reply() call — no more
-                # send-without-view-then-edit-in-a-view dance, and one
-                # fewer Discord API round-trip per music result. `summary`
-                # is threaded into save_music_interaction so ◀️/▶️ page
-                # turns can keep showing the same AI blurb instead of it
-                # only ever appearing on the first-sent page. Every
-                # OTHER interceptor above returns a plain string reply.
                 if isinstance(intercepted, tuple):
-                    music_embed, music_tracks, music_query, music_summary = intercepted
+                    music_view, music_tracks, music_query, music_summary = intercepted
                     if music_tracks:
-                        music_view = MusicPaginatorView(owner_id=message.author.id)
-                        _, music_url, video_url = _track_urls(music_tracks[0])
-                        music_view.add_item(discord.ui.Button(label="YT Music", url=music_url, emoji="🎧"))
-                        music_view.add_item(discord.ui.Button(label="YouTube", url=video_url, emoji="📲"))
+                        # 🌸 Components V2: the complete music card lives inside
+                        # the LayoutView. Do NOT pass embed= or content= here.
                         sent = await message.reply(
-                            embed=music_embed,
                             view=music_view,
-                            mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS,
+                            mention_author=True,
+                            allowed_mentions=SAFE_REPLY_MENTIONS,
                         )
                         await save_music_interaction(
                             message_id=sent.id,
                             user_id=message.author.id,
                             guild_id=guild_id,
+                            channel_id=message.channel.id,
                             query=music_query,
                             filter_type="songs",
                             tracks=music_tracks,
@@ -822,7 +803,11 @@ class GroqMentionService:
                             summary=music_summary,
                         )
                     else:
-                        await message.reply(embed=music_embed, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
+                        await message.reply(
+                            view=music_view,
+                            mention_author=True,
+                            allowed_mentions=SAFE_REPLY_MENTIONS,
+                        )
                 elif isinstance(intercepted, discord.Embed):
                     await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                 else:

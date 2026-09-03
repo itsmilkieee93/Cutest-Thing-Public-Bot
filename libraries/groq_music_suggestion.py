@@ -175,9 +175,7 @@ class MusicSuggestionService:
     @staticmethod
     def _format_result(res: dict) -> dict:
         """🌸 Flattens one raw ytmusicapi result dict into a compact,
-        stable shape — raw results vary a lot by result type (song vs
-        album vs artist vs video), so this normalizes the fields callers
-        actually care about and drops the rest."""
+        stable shape, extracting maxresdefault thumbnail when possible."""
         artists = ", ".join(a.get("name", "") for a in res.get("artists", []) or []) or None
 
         album = res.get("album")
@@ -185,9 +183,15 @@ class MusicSuggestionService:
             album = album.get("name")
 
         duration = res.get("duration")  # e.g. "3:45", None for albums/artists
+        video_id = res.get("videoId")
 
+        # 🌸 Fallback to the largest available native thumbnail
         thumbnails = res.get("thumbnails") or []
         thumbnail_url = thumbnails[-1]["url"] if thumbnails else None
+
+        # 🌸 If it's a song/video with a valid videoId, build the maxresdefault CDN link
+        if video_id:
+            thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
 
         return {
             "title": res.get("title") or res.get("artist") or "Unknown",
@@ -195,9 +199,9 @@ class MusicSuggestionService:
             "album": album,
             "duration": duration,
             "type": res.get("resultType"),
-            "video_id": res.get("videoId"),
+            "video_id": video_id,
             "browse_id": res.get("browseId"),  # albums/artists use this instead of videoId
-            "url": f"https://www.youtube.com/watch?v={res['videoId']}" if res.get("videoId") else None,
+            "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
             "thumbnail": thumbnail_url,
         }
 
@@ -433,18 +437,22 @@ CREATE TABLE IF NOT EXISTS music_interactions (
 """
 
 
-async def _db_init():
-    """🌸 Creates the table on first use — cheap no-op after that,
-    same lazy-init shape as load_guild_db in shared.py.
+def get_music_db_path(guild_id: int | None, channel_id: int | None) -> str:
+    """🌸 Splits SQLite database files into guild and DM paths."""
+    if guild_id:
+        folder = os.path.join("interactions", "music", "guild", str(guild_id))
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"music_button_{guild_id}.db")
+    else:
+        cid = channel_id or 0
+        folder = os.path.join("interactions", "music", "dm", str(cid))
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"music_button_{cid}.db")
 
-    Also runs a one-time ALTER TABLE migration for the `summary`
-    column — CREATE TABLE IF NOT EXISTS only applies to a table that
-    doesn't exist yet, so anyone with an existing interactions.db from
-    before this column was added needs it added on top, or every
-    save/load below (which now reads/writes `summary`) breaks with
-    "no such column" on their already-running bot.
-    """
-    async with aiosqlite.connect(INTERACTIONS_DB_PATH) as db:
+
+async def _db_init(db_path: str):
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(_INTERACTIONS_SCHEMA)
         cursor = await db.execute("PRAGMA table_info(music_interactions);")
         existing_cols = {row[1] for row in await cursor.fetchall()}
@@ -454,22 +462,12 @@ async def _db_init():
 
 
 async def save_music_interaction(message_id: int, user_id: int, guild_id: int | None,
-                                  query: str, filter_type: str, tracks: list,
-                                  track_index: int = 0, summary: str | None = None):
-    """🌸 Upserts one row keyed by the sent message's ID, so a button
-    press later just needs the message_id to reload full track state —
-    no in-memory dict needed, survives bot restarts (Termux/mobile
-    process gets killed a lot, same reasoning as the SQLite guild cache
-    migration).
-
-    `summary` is the AI-written blurb shown on the FIRST track's embed
-    (see handle_music_request) — persisted here too so ◀️/▶️ presses
-    can keep showing it on every page instead of only on the message
-    as it was originally sent.
-    """
-    await _db_init()
+                                  channel_id: int | None, query: str, filter_type: str,
+                                  tracks: list, track_index: int = 0, summary: str | None = None):
+    db_path = get_music_db_path(guild_id, channel_id)
+    await _db_init(db_path)
     now = time.time()
-    async with aiosqlite.connect(INTERACTIONS_DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
             INSERT INTO music_interactions
@@ -486,12 +484,11 @@ async def save_music_interaction(message_id: int, user_id: int, guild_id: int | 
         await db.commit()
 
 
-async def update_music_interaction_index(message_id: int, track_index: int):
-    """🌸 Called on every ◀️/▶️ press so track_index survives a bot
-    restart mid-pagination — matches the button handler's in-memory
-    self.index, just persisted alongside it."""
-    await _db_init()
-    async with aiosqlite.connect(INTERACTIONS_DB_PATH) as db:
+async def update_music_interaction_index(guild_id: int | None, channel_id: int | None,
+                                         message_id: int, track_index: int):
+    db_path = get_music_db_path(guild_id, channel_id)
+    await _db_init(db_path)
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "UPDATE music_interactions SET track_index = ?, updated_at = ? WHERE message_id = ?",
             (track_index, time.time(), message_id),
@@ -499,12 +496,11 @@ async def update_music_interaction_index(message_id: int, track_index: int):
         await db.commit()
 
 
-async def load_music_interaction(message_id: int) -> dict | None:
-    """🌸 Fetches a saved interaction row by message_id, e.g. to
-    rehydrate a MusicPaginatorView after a restart. Returns None if
-    unknown, same not-found convention as load_guild_cache."""
-    await _db_init()
-    async with aiosqlite.connect(INTERACTIONS_DB_PATH) as db:
+async def load_music_interaction(guild_id: int | None, channel_id: int | None,
+                                  message_id: int) -> dict | None:
+    db_path = get_music_db_path(guild_id, channel_id)
+    await _db_init(db_path)
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM music_interactions WHERE message_id = ?", (message_id,)
@@ -527,204 +523,238 @@ def _track_urls(track: dict) -> tuple[str, str, str]:
     video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else short_url
     return short_url, music_url, video_url
 
-
-def _build_track_embed(track: dict, index: int, total: int, query: str, summary: str | None = None) -> discord.Embed:
-    """🌸 Album-art-forward embed for ONE track, styled after
-    YTMPaginator.create_content in music.py (title/album/artist/
-    duration + big thumbnail + footer with position), minus the extra
-    live view/like-count API calls — those need a separate YouTube API
-    key + socialcounts.org round trip that this lighter interceptor
-    embed doesn't need to make on every mention hit."""
+def _build_track_view(track: dict, index: int, total: int, query: str, summary: str | None = None):
+    """🌸 Membuat kartu musik V2 dengan separator ganda estetis (atas & bawah ringkasan)."""
     title = track.get("title") or "Unknown Title"
     artist = track.get("artist") or "Unknown Artist"
     album = track.get("album") or "Single"
     duration = track.get("duration") or "N/A"
+    track_type = (track.get("type") or "song").capitalize()
     short_url, _, _ = _track_urls(track)
+    thumbnail = track.get("thumbnail") or MUSIC_THUMBNAIL_URL
 
-    lines = []
+    view = discord.ui.LayoutView(timeout=None)
+
+    # 1. Informasi Baris Atas (Detail Lagu)
+    top_text = (
+        f"## 🎶 [{title}]({short_url})\n"
+        f"**👤 Artist:** {artist}  |  **💿 Album:** {album}\n"
+        f"**⏱️ Duration:** `{duration}`  |  **🎧 Type:** {track_type}"
+    )
+
+    # 2. Informasi Baris Metadata Hasil (Paling Bawah)
+    meta_text = f"*Result {index + 1} of {total} for `{' '.join(query.split())}`*"
+
+    # Inisialisasi Container Utama Kosong
+    container = discord.ui.Container()
+
+    # Masukkan Bagian Atas & Separator Pertama
+    container.add_item(discord.ui.TextDisplay(top_text))
+    container.add_item(discord.ui.Separator())
+
+    # 🌸 Masukkan Ringkasan AI & Separator Kedua (Hanya jika ringkasan tersedia)
     if summary:
-        lines.append(summary + "\n")
-    lines.append(f"**🏞 Album:** {album}")
-    lines.append(f"**👤 Artist:** {artist}")
-    lines.append(f"**⏱️ Duration:** {duration}")
-    lines.append(f"\n**🔗 Link:** [Open in Browser]({short_url}) ✨")
+        container.add_item(discord.ui.TextDisplay(f"> 💬 {summary}"))
+        container.add_item(discord.ui.Separator())  # Pembatas antara Summary dan Metadata
 
-    embed = discord.Embed(
-        title=f"🎶 {title}",
-        description="\n".join(lines),
-        color=MUSIC_EMBED_COLOR,
-    )
+    # Masukkan Bagian Metadata & Thumbnail Gambar
+    container.add_item(discord.ui.TextDisplay(meta_text))
+    container.add_item(discord.ui.MediaGallery(
+        discord.MediaGalleryItem(media=thumbnail, description="Artwork")
+    ))
 
-    thumb = track.get("thumbnail")
-    embed.set_thumbnail(url=thumb or MUSIC_THUMBNAIL_URL)
+    view.add_item(container)
+    return view
 
-    embed.set_footer(
-        text=f"YouTube Music • \"{query}\" • Result {index + 1} of {total} ✨",
-        icon_url=YTM_ICON_URL,
-    )
-    return embed
+class MusicPaginatorView(discord.ui.LayoutView):
+    """🌸 Paginator Components V2 dengan separator ganda pemisah ringkasan AI."""
 
-
-class MusicPaginatorView(discord.ui.View):
-    """🌸 Persistent version of music.py's YTMPaginator — survives bot
-    restarts (important on Termux where the process gets killed a
-    lot). Two things make a view "persistent" in discord.py:
-
-      1. timeout=None — a timed-out view stops accepting interactions
-         even if the bot is still registered for it.
-      2. Every component needs a FIXED, STABLE custom_id — the exact
-         same string on every message this view ever produces.
-         discord.py's persistent-view dispatch matches on the literal
-         custom_id string of whatever was passed to bot.add_view(); it
-         does NOT do any per-message or wildcard matching. Baking the
-         message_id into the custom_id (the old "music_prev:<id>"
-         scheme) meant every real message had a UNIQUE custom_id that
-         never matched the single generic "music_prev:pending"
-         registration from on_ready — so buttons only ever worked
-         while the exact same in-memory instance/process was still
-         alive, then went dead and Discord showed "The application
-         didn't respond in time" on every click after a restart/reload.
-
-    Instead: custom_id is the same literal string always
-    ("music:prev" / "music:next"), and which MESSAGE is being paged is
-    read straight off interaction.message.id inside the callback —
-    Discord always provides that for free, no need to encode it
-    ourselves. Track list, query, and current index still aren't kept
-    on the instance; every press reloads them fresh from
-    interactions.db via load_music_interaction(interaction.message.id).
-    """
-
-    def __init__(self, owner_id: int | None = None):
-        super().__init__(timeout=None)  # 🎀 persistent — no expiry
+    def __init__(self, owner_id: int | None = None, current_index: int = 0,
+                 total_tracks: int = 1, track: dict | None = None,
+                 query: str = "", summary: str | None = None):
+        super().__init__(timeout=None)
         self.owner_id = owner_id
+        self.current_index = current_index
+        self.total_tracks = total_tracks
+
+        if track is None:
+            track = {
+                "title": "Music Search",
+                "artist": "Ask me for a song 🎶",
+                "album": "",
+                "duration": "",
+                "type": "song",
+                "thumbnail": MUSIC_THUMBNAIL_URL,
+            }
+
+        title = track.get("title") or "Unknown Title"
+        artist = track.get("artist") or "Unknown Artist"
+        album = track.get("album") or "Single"
+        duration = track.get("duration") or "N/A"
+        track_type = (track.get("type") or "song").capitalize()
+        short_url, _, _ = _track_urls(track)
+        thumbnail = track.get("thumbnail") or MUSIC_THUMBNAIL_URL
+
+        top_text = (
+            f"## 🎶 [{title}]({short_url})\n"
+            f"**👤 Artist:** {artist}  |  **💿 Album:** {album}\n"
+            f"**⏱️ Duration:** `{duration}`  |  **🎧 Type:** {track_type}"
+        )
+        
+        meta_text = f"*Result {current_index + 1} of {total_tracks} for `{' '.join(query.split())}`*"
+
+        # Inisialisasi Container Utama Kosong
+        self.container = discord.ui.Container()
+
+        # Masukkan Bagian Atas & Separator Pertama
+        self.container.add_item(discord.ui.TextDisplay(top_text))
+        self.container.add_item(discord.ui.Separator())
+
+        # 🌸 Masukkan Ringkasan AI & Separator Kedua (Hanya jika ringkasan tersedia)
+        if summary:
+            self.container.add_item(discord.ui.TextDisplay(f"> 💬 {summary}"))
+            self.container.add_item(discord.ui.Separator())  # Pembatas antara Summary dan Metadata
+
+        # Masukkan Bagian Metadata & Thumbnail Gambar
+        self.container.add_item(discord.ui.TextDisplay(meta_text))
+        self.container.add_item(discord.ui.MediaGallery(
+            discord.MediaGalleryItem(media=thumbnail, description="Artwork")
+        ))
+        
+        self.add_item(self.container)
+
+        # Row 0: Tombol navigasi
+        self.prev_btn = discord.ui.Button(
+            label="Prev", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id="music:prev",
+        )
+        self.counter_btn = discord.ui.Button(
+            label=f"{current_index + 1} / {total_tracks}", emoji="🎵",
+            style=discord.ButtonStyle.primary, custom_id="music:counter",
+            disabled=True,
+        )
+        self.next_btn = discord.ui.Button(
+            label="Next", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id="music:next",
+        )
+        self.prev_btn.callback = self._prev_click
+        self.next_btn.callback = self._next_click
+
+        self.nav_row = discord.ui.ActionRow(
+            self.prev_btn, self.counter_btn, self.next_btn
+        )
+        self.add_item(self.nav_row)
+
+        # Row 1: Link eksternal
+        _, music_url, video_url = _track_urls(track)
+        self.links_row = discord.ui.ActionRow(
+            discord.ui.Button(label="YT Music", url=music_url, emoji="🎧"),
+            discord.ui.Button(label="YouTube", url=video_url, emoji="📺"),
+        )
+        self.add_item(self.links_row)
+
 
     async def _step(self, interaction: discord.Interaction, delta: int):
-        # 🌸 message_id comes straight from Discord's interaction
-        # payload — no parsing needed, works identically whether this
-        # is the instance that sent the message or a freshly
-        # registered generic instance after a restart.
         message_id = interaction.message.id
-        row = await load_music_interaction(message_id)
+        guild_id = interaction.guild_id
+        channel_id = interaction.channel_id
+
+        row = await load_music_interaction(guild_id, channel_id, message_id)
         if not row:
             return await interaction.response.send_message(
-                "This search has expired, sorry! 🥺 try asking me again?", ephemeral=True
+                "This search session has expired or wasn't found! 🥺 Try asking me again?",
+                ephemeral=True,
             )
 
-        # 🌸 Ownership check now reads user_id from the db row instead
-        # of a stored self.user — same "not your search" UX, just
-        # sourced from persisted state.
         if interaction.user.id != row["user_id"]:
             return await interaction.response.send_message(
-                "This isn't your search! 😭🙏 But you can ask me for music too! 🙂✨️", ephemeral=True
+                "This isn't your search! 😭🙏 But you can ask me for music too! 🙂✨",
+                ephemeral=True,
             )
 
         tracks = row["tracks_json"]
+        if not tracks:
+            return await interaction.response.send_message(
+                "There aren't any tracks in this search session. 🥺",
+                ephemeral=True,
+            )
+
         new_index = (row["track_index"] + delta) % len(tracks)
-        await update_music_interaction_index(message_id, new_index)
+        await update_music_interaction_index(guild_id, channel_id, message_id, new_index)
 
-        embed = _build_track_embed(tracks[new_index], new_index, len(tracks), row["query"], row.get("summary"))
-        _, music_url, video_url = _track_urls(tracks[new_index])
+        current_track = tracks[new_index]
+        view = create_music_view(
+            row["user_id"], new_index, len(tracks), current_track,
+            row["query"], row.get("summary"),
+        )
+        await interaction.response.edit_message(view=view)
 
-        view = MusicPaginatorView(owner_id=row["user_id"])
-        view.add_item(discord.ui.Button(label="YT Music", url=music_url, emoji="🎧"))
-        view.add_item(discord.ui.Button(label="YouTube", url=video_url, emoji="📲"))
-
-        await interaction.response.edit_message(embed=embed, view=view)
-
-    @discord.ui.button(label="◀️", style=discord.ButtonStyle.gray, custom_id="music:prev")
-    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _prev_click(self, interaction: discord.Interaction):
         await self._step(interaction, -1)
 
-    @discord.ui.button(label="▶️", style=discord.ButtonStyle.gray, custom_id="music:next")
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _next_click(self, interaction: discord.Interaction):
         await self._step(interaction, 1)
 
 
-def register_persistent_music_view(bot):
-    """🌸 Registers the persistent view so buttons on OLD messages
-    (sent before a restart) keep working — Discord still shows them,
-    but without this the client isn't listening for "music:prev" /
-    "music:next" anymore and clicking does nothing. Since those are
-    now fixed literal custom_ids (not per-message), one registration
-    genuinely covers every message this view has ever produced or
-    ever will. Guard against double-registration the same way
-    _initial_guild_sync_done guards sync_all_guilds() in
-    GroqMentionService — this can run more than once per process.
+def create_music_view(owner_id: int, current_index: int, total_tracks: int,
+                      track: dict, query: str = "", summary: str | None = None) -> MusicPaginatorView:
+    """🌸 Builds a complete Components V2 music response."""
+    return MusicPaginatorView(
+        owner_id=owner_id,
+        current_index=current_index,
+        total_tracks=total_tracks,
+        track=track,
+        query=query,
+        summary=summary,
+    )
 
-    Called automatically from MusicPaginatorCog.cog_load() below, so
-    nothing needs to be hand-wired into bot_service.py's on_ready —
-    same self-contained pattern wikipedia.py uses (its comment even
-    says "registered once in cog_load", not on_ready). This is kept
-    as a standalone function too in case a caller wants to invoke it
-    directly, e.g. from a different cog's cog_load.
-    """
+
+def register_persistent_music_view(bot):
+    """🌸 Registers the Components V2 paginator for messages across restarts."""
     if getattr(bot, "_music_view_registered", False):
         return
     bot.add_view(MusicPaginatorView())
     bot._music_view_registered = True
-    print("🌸 Persistent music paginator view registered!")
+    print("🌸 Persistent Components V2 music paginator view registered!")
 
 
 class MusicPaginatorCog(commands.Cog):
-    """🌸 Tiny, self-contained cog whose ONLY job is registering
-    MusicPaginatorView as persistent — same shape as wikipedia.py's
-    cog, so this module doesn't depend on anyone remembering to add a
-    line to bot_service.py's on_ready. cog_load() fires reliably on
-    initial load AND every hot-reload, unlike on_ready which can be
-    skipped entirely if this module is never imported from the file
-    that owns on_ready, or can fire multiple times per process after a
-    gateway reconnect — cog_load has neither problem.
-
-    Load this like any other cog, e.g. in your extension list:
-        "groq_music_suggestion"
-    or manually:
-        await bot.load_extension("groq_music_suggestion")
-    """
+    """🌸 Registers the persistent Components V2 music paginator."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     async def cog_load(self):
         register_persistent_music_view(self.bot)
-        print("🌸 MusicPaginatorCog loaded — persistent view active!")
+        print("🌸 MusicPaginatorCog loaded — Components V2 persistent view active!")
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(MusicPaginatorCog(bot))
 
 
-
-def _build_music_embed(result: dict):
-    """🌸 Turns a suggest() result dict into (embed, tracks, summary) —
-    album art embed for track #0, the trimmed track list the caller
-    needs to build a MusicPaginatorView, and the AI summary string (so
-    it can be persisted via save_music_interaction and re-shown on
-    every page, not just the first). Button-building happens at the
-    call site (see handle_music_request's docstring) because a
-    persistent view's custom_id has to encode the REAL message_id,
-    which only exists after message.reply() returns — can't be baked
-    in here.
-
-    NOTE: the empty-results branch below is currently unreachable in
-    practice — handle_music_request already checks
-    `if not result["results"]` and returns its own apology embed
-    BEFORE ever calling this function. Kept as a defensive fallback
-    (and now a correctly-shaped 3-tuple) in case this is ever called
-    directly from somewhere that skips that pre-check.
-    """
+def _build_music_view(result: dict):
+    """🌸 Turns a suggest() result into (view, tracks, summary)."""
     if not result["results"]:
-        embed = discord.Embed(
-            title="🎶 Music Search",
-            description=result["summary"],
-            color=MUSIC_EMBED_COLOR,
-        )
-        embed.set_thumbnail(url=MUSIC_THUMBNAIL_URL)
-        embed.set_footer(text=f"YouTube Music • \"{result['query']}\"")
-        return embed, None, result["summary"]
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(discord.ui.Container(
+            discord.ui.TextDisplay("## 🎶 Music Search"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(result["summary"]),
+            discord.ui.TextDisplay(f"YouTube Music • `{result['query']}`"),
+        ))
+        return view, None, result["summary"]
 
-    tracks = result["results"][:5]  # 🌸 same cap as before, now pages instead of fields
-    embed = _build_track_embed(tracks[0], 0, len(tracks), result["query"], result["summary"])
-    return embed, tracks, result["summary"]
+    tracks = result["results"][:5]
+    view = create_music_view(
+        owner_id=0,
+        current_index=0,
+        total_tracks=len(tracks),
+        track=tracks[0],
+        query=result["query"],
+        summary=result["summary"],
+    )
+    return view, tracks, result["summary"]
 
 
 async def handle_music_request(message: "discord.Message", guild_id: int, shared):
@@ -808,15 +838,18 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
         # we must not let it silently fall through to the generic chat
         # model — that's how you get hallucinated song titles/links.
         # An honest "couldn't find it" beats a made-up track every time.
-        embed = discord.Embed(
-            title="🎶 Music Search",
-            description=f"Couldn't find anything for \"{text}\" 🥺 try naming the song/artist directly?",
-            color=MUSIC_EMBED_COLOR,
-        )
-        return embed, None, text, None
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(discord.ui.Container(
+            discord.ui.TextDisplay("## 🎶 Music Search"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(
+                f'Couldn\'t find anything for "{text}" 🥺 try naming the song/artist directly?'
+            ),
+        ))
+        return view, None, text, None
 
-    embed, tracks, summary = _build_music_embed(result)
-    return embed, tracks, result["query"], summary
+    view, tracks, summary = _build_music_view(result)
+    return view, tracks, result["query"], summary
 
 
 # 🌸 Quick manual smoke test — run directly (`python groq_music_suggestion.py

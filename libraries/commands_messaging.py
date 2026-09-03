@@ -2,6 +2,34 @@ import discord
 from discord import app_commands
 from typing import Union
 from resources.shared import bridge_log, reply_to_autocomplete
+import config_loader
+import msg_whitelist_db
+
+
+# =====================================================================
+# 📝 MODAL: Register Server (used by /register-server, mods only)
+# =====================================================================
+class RegisterServerModal(discord.ui.Modal, title="🌸 Register Server"):
+    snowflake_id = discord.ui.TextInput(
+        label="Server ID (snowflake)",
+        placeholder="e.g. 1385237763816816710",
+        min_length=17,
+        max_length=20,
+        required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.snowflake_id.value.strip()
+        if not raw.isdigit():
+            return await interaction.response.send_message("🚫 That's not a valid snowflake ID! Digits only.", ephemeral=True)
+
+        guild_id = int(raw)
+        added = await msg_whitelist_db.add_server(guild_id)
+        if added:
+            await interaction.response.send_message(f"✅ Server `{guild_id}` added to the whitelist!", ephemeral=True)
+            await bridge_log(interaction, "register-server", f"By: {interaction.user}", f"Whitelisted guild {guild_id}")
+        else:
+            await interaction.response.send_message(f"ℹ️ Server `{guild_id}` is already whitelisted!", ephemeral=True)
 
 
 def setup_commands(bot):
@@ -26,13 +54,13 @@ def setup_commands(bot):
         reply_to:   str  = None,
         ping_reply: bool = False
     ):
-        ALLOWED_SERVERS = [1385237763816816710, 1239881782308900874]
-        OWNER_ID        = 1165555555268567040
-        is_owner = interaction.user.id == OWNER_ID
+        ALLOWED_SERVERS = config_loader.get_allowed_server_ids()
+        is_owner = config_loader.is_owner(interaction.user.id)
         is_guild = interaction.guild_id is not None
 
-        if not is_owner and is_guild and interaction.guild_id not in ALLOWED_SERVERS:
-            return await interaction.response.send_message("🚫 Access Restricted!", ephemeral=True)
+        if not is_owner and is_guild:
+            if interaction.guild_id not in ALLOWED_SERVERS and not await msg_whitelist_db.is_whitelisted(interaction.guild_id):
+                return await interaction.response.send_message("🚫 Access Restricted!", ephemeral=True)
 
         target_dest = channel or interaction.channel
         try:
@@ -226,3 +254,13 @@ def setup_commands(bot):
             await interaction.followup.send("❌ **Failed:** DMs closed.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ **Error:** {str(e)[:50]}", ephemeral=True)
+
+    # =====================================================================
+    # 📝 COMMAND: /register-server  [MOD ONLY]
+    # =====================================================================
+    @bot.tree.command(name="register-server", description="[MOD ONLY] Register a server ID for the /msg whitelist 📝")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.checks.has_permissions(moderate_members=True)
+    async def register_server(interaction: discord.Interaction):
+        await interaction.response.send_modal(RegisterServerModal())
