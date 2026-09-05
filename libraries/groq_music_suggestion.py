@@ -29,13 +29,17 @@ MUSIC_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 MUSIC_SUMMARY_SYSTEM_PROMPT = (
     "You are a music search assistant for a kawaii-themed Discord bot. "
-    "You will be given a JSON list of YouTube Music search results "
-    "(title, artist, album, duration, type). Write a short, friendly "
-    "1-2 sentence summary of what was found, in the bot's cute voice "
-    "(you can use a light emoji or two, not more than 2). Do NOT list "
-    "every track — just describe the vibe/spread of results (e.g. genre, "
-    "top artist, mix of songs vs albums). No markdown, no headers, no "
-    "preamble like 'Here is a summary'.\n\n"
+    "You will be given a JSON list of 2 or more YouTube Music search "
+    "results (title, artist, album, duration, type). Write a short, "
+    "friendly 1-2 sentence summary describing the overall vibe/spread "
+    "of results (e.g. genre, top artist, mix of songs vs albums), in "
+    "the bot's cute voice (you can use a light emoji or two, not more "
+    "than 2). No markdown, no headers, no preamble like 'Here is a "
+    "summary'.\n\n"
+    "CRITICAL: only mention artists/titles that literally appear in "
+    "the given list — never invent, assume, or add any artist that "
+    "isn't there. Do NOT list every track individually — just a short "
+    "natural-language description of what's actually present.\n\n"
     "Respond with ONLY a single-line JSON object, nothing else, no "
     "markdown fences, in exactly this shape:\n"
     '{"summary": "<your 1-2 sentence summary>"}'
@@ -103,6 +107,40 @@ MUSIC_INTENT_CLASSIFIER_POLICY = (
     "Respond with ONLY one word, lowercase, nothing else: "
     '"yes" or "no".'
 )
+
+# 🌸 Hard ceiling on how many tracks the embed/paginator will ever show,
+# regardless of what the user asks for or what the AI decides — keeps a
+# request like "give me 500 songs" from blowing up the ytmusicapi call,
+# the Groq summary prompt size, or the paginator UI.
+MAX_SUGGESTED_TRACKS = 20
+
+# 🌸 Same tiny structured-decision shape as MUSIC_INTENT_CLASSIFIER_POLICY —
+# one cheap Groq call, not a chat reply. Reads the user's message for an
+# explicit number ("gimme 10 songs", "top 3 lofi tracks") and falls back
+# to its own judgment (based on wording like "a song" vs "a playlist" vs
+# "some songs") when no number is stated. Clamped again in code afterward
+# so a malformed/out-of-range reply can never exceed MAX_SUGGESTED_TRACKS.
+TRACK_COUNT_SYSTEM_PROMPT = (
+    "A Discord user is asking for song/music suggestions. Decide how "
+    "many tracks should be returned.\n"
+    "- If the message states an explicit number (e.g. 'give me 10 "
+    "songs', 'top 3 tracks'), use that number exactly.\n"
+    "- If no number is stated, use your own judgment based on the "
+    "wording: a single specific song ask ('play X', 'find me the song "
+    "X') -> 1. A vague single-song ask ('give me a cool song') -> 1-3. "
+    "A general request for 'some songs'/'a few tracks' -> 5. A request "
+    "for 'a playlist', 'a bunch of songs', or 'lots of' -> 10-20.\n"
+    f"Always respond with a whole number from 1 to {MAX_SUGGESTED_TRACKS} "
+    "inclusive, never higher, never lower.\n"
+    "Respond with ONLY a single-line JSON object, nothing else, no "
+    "markdown fences, in exactly this shape:\n"
+    '{"count": <integer>}'
+)
+
+# 🌸 Same "official replacement, needs reasoning_effort=low" rationale as
+# MUSIC_INTENT_CLASSIFIER_MODEL above — this is a structured pick-a-number
+# task, so the small/fast model is the right shape here too.
+TRACK_COUNT_MODEL = "openai/gpt-oss-20b"
 
 # 🌸 Dedicated file logger, same pattern as exa_logger in
 # groq_exa_search.py — one line per search so usage is traceable in
@@ -205,10 +243,49 @@ class MusicSuggestionService:
             "thumbnail": thumbnail_url,
         }
 
+    @staticmethod
+    def _format_single_result_summary(result: dict) -> str:
+        """🌸 Plain string-formatted summary for exactly 1 result — no
+        AI call at all, so there is zero chance of the model inventing
+        a "mix"/"spread" of other artists that were never found (the
+        production bug this replaces: a single Adele result summarized
+        as "Adele and Rihanna... plus Ed Sheeran and Taylor Swift").
+        Built directly from the result's own fields via string
+        formatting/regex-safe interpolation — nothing here can drift
+        from what was actually returned."""
+        title = result.get("title") or "this track"
+        artist = result.get("artist")
+        result_type = (result.get("type") or "song").lower()
+
+        if artist:
+            return f'Found "{title}" by {artist}! 🎶'
+        return f'Found "{title}"! 🎶' if result_type == "song" else f'Found the {result_type} "{title}"! 🎶'
+
     async def _summarize_with_groq(self, query: str, results: list) -> str:
-        """🌸 One cheap Groq call → short cute summary string. Falls
-        back to a plain templated sentence (no AI) on ANY problem — no
-        client, API error, timeout, malformed JSON — same
+        """🌸 Summary string for a set of search results.
+
+        Exactly 1 result -> handled entirely by
+        _format_single_result_summary (no AI call, see that method's
+        docstring for why). Only 2+ results reach Groq below, since
+        that's the only case where a genuine "spread" of artists/genres
+        actually exists to describe — the model is never even given
+        the chance to hallucinate one from a single item anymore.
+
+        🌸 No post-hoc verification of the 2+ summary against `results`
+        — a regex check against artist/title/album was tried and
+        removed: real Groq output uses inconsistent whitespace (narrow
+        no-break spaces like "Ed\u202fSheeran" instead of a normal
+        space) and other formatting quirks that made a real, correct
+        mention of an actual result look "unknown" and get rejected —
+        a false positive throwing away a good summary is worse than an
+        occasional true positive slipping through. MUSIC_SUMMARY_SYSTEM_PROMPT's
+        instruction to only use artists/titles that appear in the list
+        is trusted at face value here, same trust level every other
+        classifier in this file (classify_music_intent,
+        rewrite_search_query) already operates at.
+
+        Falls back to a plain templated sentence (no AI) on ANY
+        problem — no client, API error, timeout, malformed JSON — same
         degrades-quietly convention as classify_categories() in
         groq_exa_search.py, so a Groq hiccup never breaks the search
         results themselves."""
@@ -216,7 +293,13 @@ class MusicSuggestionService:
             f"Found {len(results)} result(s) for \"{query}\"! 🎶"
             if results else f"Couldn't find anything for \"{query}\". 🥺"
         )
-        if not self.groq_client or not results:
+        if not results:
+            return fallback
+
+        if len(results) == 1:
+            return self._format_single_result_summary(results[0])
+
+        if not self.groq_client:
             return fallback
 
         # 🌸 Trim to just the fields the model needs — keeps the prompt
@@ -304,6 +387,46 @@ class MusicSuggestionService:
             music_logger.info(f"[classify_music_intent] prompt={prompt!r} FAILED: {e}")
             return False
 
+    async def decide_track_count(self, prompt: str, default: int = 5) -> int:
+        """🌸 One cheap Groq call → how many tracks to return (1-20).
+        Only called after classify_music_intent already said "yes", so
+        this doesn't need its own zero-token gate. Fails safe to
+        `default` on any problem — no client, API error, timeout, junk/
+        out-of-range reply — same degrades-quietly convention as every
+        other classifier in this file. Result is ALWAYS clamped to
+        [1, MAX_SUGGESTED_TRACKS] regardless of what the model says."""
+        if not self.groq_client or not prompt:
+            return default
+
+        def _call():
+            return self.groq_client.chat.completions.create(
+                model=TRACK_COUNT_MODEL,
+                messages=[
+                    {"role": "system", "content": TRACK_COUNT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                reasoning_effort="low",
+                max_tokens=100,
+            )
+
+        try:
+            response = await asyncio.to_thread(_call)
+            raw = (response.choices[0].message.content or "").strip()
+            raw = raw.strip("`").removeprefix("json").strip()
+            parsed = json.loads(raw)
+            count = int(parsed.get("count", default))
+        except Exception as e:
+            print(f"⚠️ Track count classifier error (using default={default}): {e}")
+            music_logger.info(f"[decide_track_count] prompt={prompt!r} FAILED: {e}")
+            return default
+
+        # 🌸 Belt-and-suspenders clamp — never trust a model's number
+        # blindly, even one it was explicitly told a ceiling for.
+        count = max(1, min(count, MAX_SUGGESTED_TRACKS))
+        music_logger.info(f"[decide_track_count] prompt={prompt!r} -> {count}")
+        return count
+
     async def rewrite_search_query(self, prompt: str) -> str | None:
         """🌸 Called ONLY after a literal ytm.search(prompt) already
         came back empty — asks Groq for a concrete, real song/artist
@@ -353,12 +476,18 @@ class MusicSuggestionService:
         to "songs" since that's what the existing autocomplete in
         music_downloader.py already uses.
 
+        `limit` is clamped to [1, MAX_SUGGESTED_TRACKS] no matter what
+        the caller passes — same final-safety-net convention as
+        decide_track_count's own clamp, so a bad call site can never
+        request more than the ceiling.
+
         On any failure (no ytm client, empty query, API error) returns
         the same shape with an empty results list and an apologetic
         summary, so callers never need a special-case branch — they can
         always just read result["results"] and result["summary"].
         """
         query = (query or "").strip()
+        limit = max(1, min(int(limit or 1), MAX_SUGGESTED_TRACKS))
         if not query or not self.ytm:
             return {
                 "query": query,
@@ -375,6 +504,13 @@ class MusicSuggestionService:
             music_logger.info(f"[suggest] query={query!r} filter={filter_type} FAILED: {e}")
             raw_results = []
 
+        # 🌸 ytmusicapi's own `limit` param is unreliable for some
+        # filters (observed: filter="songs" returning ~20 results even
+        # when limit=2 was passed) — it's a page-size hint to the
+        # underlying API, not a hard cap. Slice ourselves right after
+        # the call so `results` always matches what was actually
+        # asked for, regardless of what ytmusicapi's API returns.
+        raw_results = raw_results[:limit] if raw_results else raw_results
         results = [self._format_result(r) for r in raw_results if r]
         summary = await self._summarize_with_groq(query, results)
 
@@ -733,8 +869,15 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(MusicPaginatorCog(bot))
 
 
-def _build_music_view(result: dict):
-    """🌸 Turns a suggest() result into (view, tracks, summary)."""
+def _build_music_view(result: dict, max_tracks: int = 5):
+    """🌸 Turns a suggest() result into (view, tracks, summary).
+    `max_tracks` slices the already-fetched result["results"] for the
+    paginator/embed — normally this is a no-op since suggest() is now
+    called with the same count as `limit`, but the slice stays as a
+    defensive final cap (clamped again below) in case a caller ever
+    passes a larger `result` than it asked the paginator to show."""
+    max_tracks = max(1, min(int(max_tracks or 1), MAX_SUGGESTED_TRACKS))
+
     if not result["results"]:
         view = discord.ui.LayoutView(timeout=None)
         view.add_item(discord.ui.Container(
@@ -745,7 +888,7 @@ def _build_music_view(result: dict):
         ))
         return view, None, result["summary"]
 
-    tracks = result["results"][:5]
+    tracks = result["results"][:max_tracks]
     view = create_music_view(
         owner_id=0,
         current_index=0,
@@ -819,6 +962,12 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
     if not wants_music:
         return None
 
+    # 🌸 How many tracks to show — explicit user number ("give me 10
+    # songs") wins, otherwise the AI picks a sensible amount based on
+    # phrasing (single song vs "a few" vs "a playlist"). Always clamped
+    # to [1, MAX_SUGGESTED_TRACKS] inside decide_track_count itself.
+    track_count = await music_service.decide_track_count(text)
+
     # 🌸 Try the raw message as a literal ytmusicapi search first — the
     # common case (a real title/artist named) is handled here with no
     # extra cost. Only reach for Groq below if that comes up genuinely
@@ -827,11 +976,11 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
     # verified against ytm.search() again before it's ever shown to
     # the user, so a bad guess just means "couldn't find it" rather
     # than a hallucinated result.
-    result = await music_service.suggest(text)
+    result = await music_service.suggest(text, limit=track_count)
     if not result["results"]:
         rewritten_query = await music_service.rewrite_search_query(text)
         if rewritten_query:
-            result = await music_service.suggest(rewritten_query)
+            result = await music_service.suggest(rewritten_query, limit=track_count)
 
     if not result["results"]:
         # 🌸 Once the classifier commits to "this IS a music request",
@@ -848,7 +997,7 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
         ))
         return view, None, text, None
 
-    view, tracks, summary = _build_music_view(result)
+    view, tracks, summary = _build_music_view(result, max_tracks=track_count)
     return view, tracks, result["query"], summary
 
 
