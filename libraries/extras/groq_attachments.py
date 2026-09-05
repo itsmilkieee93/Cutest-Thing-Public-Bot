@@ -263,7 +263,7 @@ async def describe_attachments(
             model=model,
             messages=[{"role": "user", "content": content}],
             temperature=1,
-            max_completion_tokens=1024,
+            max_completion_tokens=768,
             top_p=1,
             stream=False,
         )

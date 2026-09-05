@@ -902,6 +902,8 @@ class GroqMentionService:
                 username=message.author.name,
                 user_id=message.author.id,
                 display_name=message.author.display_name,
+                global_name=message.author.global_name,
+                guild_nickname=message.author.nick if message.guild else None,
                 guild=message.guild,
                 channel=message.channel,
                 recent_react_emoji=self.recent_react_emoji.get(str(message.channel.id), []),

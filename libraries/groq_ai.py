@@ -31,7 +31,7 @@ from groq_instruct import (
     CLASSIFIER_MODEL, SERVER_QUERY_LABELS, SERVER_QUERY_CLASSIFIER_POLICY,
     _wants_web_search, _search_domains_for_prompt, SEARCH_INTENT_CLASSIFIER_POLICY,
 )
-from extras.groq_dm_instruct import build_dm_directives
+from extras.groq_dm_instruct import build_dm_directives, format_snowflake_info
 
 # 🌸 Dynamic personality — instructions are generated live from the bot's
 # CURRENT per-guild nickname (set via /server-persona-set), instead of a
@@ -881,7 +881,7 @@ class GroqService:
             print(f"⚠️ Search-intent classifier error (falling back to regex) for {username}: {e}")
             return False
 
-    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
+    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, global_name: str = None, guild_nickname: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
         stalls the bot's event loop. Loads this user's saved chat history
@@ -927,6 +927,19 @@ class GroqService:
         that search comes up empty but reply_to_message_text is non-empty,
         that raw text gets injected directly into the prompt instead —
         see the FALLBACK CONTEXT block right after the anchor search.
+
+        🌸 IDENTITY FIELDS: `global_name` (message.author.global_name —
+        the account-wide display name from User Settings, may be None)
+        and `guild_nickname` (message.author.nick — THIS server's
+        nickname override, always None in a DM) are passed separately
+        from `display_name` because display_name is discord.py's already
+        -collapsed nick→global_name→username fallback chain and can't be
+        un-collapsed after the fact. All three plus the snowflake-decoded
+        creation date go into IDENTITY_INSTRUCTIONS (see groq_instruct.py)
+        so the AI can answer identity questions ("what's my snowflake
+        id", "when was my account made", "what's my username vs my
+        nickname here") straight from context, no tool/decoder site
+        needed.
         """
         if not self.client:
             return None
@@ -995,9 +1008,23 @@ class GroqService:
             # any reason — keeps the bot answering instead of crashing.
             print(f"⚠️ Dynamic personality load failed, falling back to file: {e}")
             personality  = self._load_file(self.personality_path)
+        # 🌸 Snowflake decode is pure local math (see
+        # extras/groq_dm_instruct.decode_snowflake) — never fails on a
+        # valid Discord ID, but wrapped anyway so a malformed/None
+        # user_id from some non-standard caller can't take down the
+        # whole reply over an identity nicety.
+        try:
+            snowflake_info = format_snowflake_info(user_id)
+        except Exception as e:
+            print(f"⚠️ Snowflake decode failed for user_id={user_id}: {e}")
+            snowflake_info = f"ID {user_id} (creation date unavailable)"
+
         identity         = IDENTITY_INSTRUCTIONS.format(
             display_name=display_name or username,
             username=username,
+            global_name=global_name or "(not set)",
+            guild_nickname=guild_nickname or "(no nickname set here)",
+            snowflake_info=snowflake_info,
             owner_status=_build_owner_status(user_id),
         )
         if react_allowed:

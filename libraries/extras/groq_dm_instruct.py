@@ -26,7 +26,42 @@ groq_service.py without any circular-import juggling.
 """
 
 import re
+from datetime import datetime, timezone
 import discord
+
+# 🌸 DISCORD SNOWFLAKE DECODER — every Discord ID (user, message, channel,
+# guild...) is a 64-bit snowflake with the creation timestamp baked into
+# the top 42 bits, offset from the Discord Epoch (2015-01-01T00:00:00Z),
+# NOT the Unix Epoch. No API call, no "go paste it into discord.dog" — the
+# math is public and instant, so the bot can just answer this itself.
+# Reference: https://discord.com/developers/docs/reference#snowflakes
+DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00.000Z in Unix ms
+
+
+def decode_snowflake(snowflake: int) -> datetime:
+    """🌸 Extracts the creation timestamp baked into ANY Discord snowflake
+    (user ID, message ID, channel ID, guild ID — the format is identical
+    for all of them). Returns a timezone-aware UTC datetime.
+
+    Math: the first 42 bits of the 64-bit integer are milliseconds since
+    the Discord Epoch — shift right 22 bits to drop the worker/process/
+    increment bits, then add back the epoch offset.
+    """
+    timestamp_ms = (int(snowflake) >> 22) + DISCORD_EPOCH_MS
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+
+
+def format_snowflake_info(snowflake: int) -> str:
+    """🌸 Human/AI-readable one-liner combining the raw ID with its
+    decoded creation date — this is what gets fed into the identity
+    context so Groq can just STATE the answer instead of telling the
+    user to go run Dev Mode + a third-party decoder site themselves.
+    """
+    created = decode_snowflake(snowflake)
+    return (
+        f"ID {snowflake} was created "
+        f"{created.strftime('%B %d, %Y at %H:%M:%S UTC')}"
+    )
 
 # 🌸 Same "emit a bracketed tag, strip it server-side before the public
 # message goes out" shape as REACT_TAG_PATTERN in groq_instruct.py.

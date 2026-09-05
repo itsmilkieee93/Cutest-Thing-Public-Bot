@@ -613,9 +613,35 @@ EMOJI_NAME_MAP = {
 # get_ai_response) so the AI just *knows* who it's talking to — pulled
 # straight from the message author, never something the user has to state
 # themselves.
+#
+# 🌸 IDENTITY FIELDS — Discord has THREE separate name concepts and
+# display_name alone collapses them (it resolves nick → global_name →
+# username, in that priority), so get_ai_response now passes each one
+# separately instead of just the already-collapsed display_name:
+#   - username:      the unique @handle (message.author.name)
+#   - global_name:   the account-wide display name set in User Settings,
+#                     shown when there's no per-server nickname
+#                     (message.author.global_name — None for older
+#                     accounts that never set one)
+#   - guild_nickname: THIS server's nickname override, if any
+#                     (message.author.nick in a guild, always None in a DM)
+#   - snowflake_info: this user's ID plus its decoded creation date, from
+#                     extras.groq_dm_instruct.format_snowflake_info — so
+#                     "what's my snowflake id" / "when was my account
+#                     made" gets answered straight from context instead
+#                     of the model telling them to go run Dev Mode +
+#                     a third-party decoder site themselves.
 IDENTITY_INSTRUCTIONS = (
     "Talking to {display_name} (@{username}) — you already know their "
-    "name, use it naturally, never ask who they are.\n{owner_status}"
+    "name, use it naturally, never ask who they are.\n"
+    "Full identity breakdown for this person (only bring up whichever "
+    "part is actually relevant to what they asked — don't recite all of "
+    "it unprompted):\n"
+    "- Username (@handle): {username}\n"
+    "- Global display name (account-wide, set in User Settings): {global_name}\n"
+    "- Nickname in THIS server: {guild_nickname}\n"
+    "- Discord snowflake: {snowflake_info}\n"
+    "{owner_status}"
 )
 
 
