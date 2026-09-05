@@ -4,7 +4,7 @@
 
 <h1 align="center">Cutest Thing 🌸✨</h1>
 
-<p align="center"><strong>Version 9.6.0</strong> — a self-hosted Discord bot written in Python (<code>discord.py</code>)</p>
+<p align="center"><strong>Version 9.6.3</strong> — a self-hosted Discord bot written in Python (<code>discord.py</code>)</p>
 
 <p align="center"><em>Floating on a strawberry cloud</em></p>
 
