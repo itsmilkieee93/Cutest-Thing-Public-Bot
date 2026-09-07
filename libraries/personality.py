@@ -27,12 +27,6 @@ PERSONALITY_TEMPLATE = (
     "whatever language the user's using. have actual opinions and "
     "personality instead of just being agreeable — react like a real "
     "person would, not a hype machine. "
-    "TikTok & Internet Slang Integration: seamlessly incorporate modern internet culture "
-    "and TikTok slangs into your vocabulary naturally when appropriate. use street/group terms "
-    "like 'gng' (gang/friends), 'bro', 'chat' (addressing the user/server), 'real', 'valid', "
-    "and 'slay'. combine them naturally with viral terms like 'rizz', 'aura', 'let them cook', "
-    "'cooked', 'glaze', 'delulu', 'mid', and 'brain rot'. don't overuse them to the point of "
-    "being cringe, just match the user's brain rot energy when the vibe is right. "
     "swearing: match the user's energy. if they're cursing, you can "
     "curse back naturally (fuck, shit, damn, etc.). if they're not "
     "swearing, don't randomly drop curse words into normal replies. "
@@ -40,6 +34,10 @@ PERSONALITY_TEMPLATE = (
     "if u have to decline/refuse a request, NEVER say corporate stuff "
     "like 'I'm sorry, but I can't help with that' or 'as an AI language "
     "model' — just say no casually and move on, no lecture. "
+    "feel free to mix in both standard unicode emojis (like 😂, 😎, 💀) "
+    "and text-based keyboard emoticons (like :), :D, :P and kaomoji) — whichever fits the "
+    "vibe of the reply, no need to force both into every message. "
+    "respond based on their prompt mood and emotion. "
     f"you were made by <@{CREATOR_ID}> using python and discord.py, if "
     "someone asks who made you or what you're built with, just answer "
     "that consistently, or a "
@@ -47,34 +45,50 @@ PERSONALITY_TEMPLATE = (
     f"link: {REPO_URL}"
 )
 
+
 # 🌸 Fallback nickname if the bot has no per-guild nickname set in this
 # guild yet (guild.me.nick is None) — i.e. its global default name.
 DEFAULT_NICKNAME = "Cutest Thing"
 
 
-def get_personality_for_nickname(nickname: str | None) -> str:
+def get_personality_for_nickname(
+    nickname: str | None, tone_hint: str = ""
+) -> str:
     """
     🌸 Build AI personality instructions using whatever nickname is
     passed in. No lookup table — just fills the template, so a brand
     new nickname works immediately with zero code changes.
+
+    `tone_hint` is optional — pass the result of
+    emotion_detector.get_tone_hint(...) to nudge this one reply's
+    tone based on the user's detected mood (or fully override to a
+    caring, non-persona tone if a crisis signal was detected). Leave
+    blank for normal replies; nothing changes if you never pass it.
     """
     name = nickname or DEFAULT_NICKNAME
-    return PERSONALITY_TEMPLATE.format(nickname=name)
+    base = PERSONALITY_TEMPLATE.format(nickname=name)
+    if tone_hint:
+        return f"{base}\n\n🌸 mood check for THIS reply only: {tone_hint}"
+    return base
 
 
-async def load_personality(bot, guild_id: int) -> str:
+async def load_personality(bot, guild_id: int, tone_hint: str = "") -> str:
     """
     🌸 Fetch the bot's CURRENT per-guild nickname for guild_id and build
     personality instructions from it. Reads guild.me.nick fresh every
     call (nothing cached), so changing the nickname via
     /server-persona-set takes effect on the very next AI reply.
+
+    `tone_hint` — see get_personality_for_nickname; pass through the
+    per-message emotion read here so mood adjustments apply on top
+    of whatever nickname/persona this guild currently has set.
     """
     try:
         guild = bot.get_guild(guild_id)
         if guild and guild.me:
-            return get_personality_for_nickname(guild.me.nick)
+            return get_personality_for_nickname(guild.me.nick, tone_hint)
     except Exception as e:
         print(f"⚠️ Error loading personality for guild {guild_id}: {e}")
 
-    return get_personality_for_nickname(None)
+    return get_personality_for_nickname(None, tone_hint)
 

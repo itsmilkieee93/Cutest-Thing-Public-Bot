@@ -52,6 +52,10 @@ from extras.groq_attachments import (
     get_image_attachments, describe_attachments,
     get_text_attachments, read_and_format_text_attachments,
 )
+from extras.emotion_detector import (
+    check_crisis_signals, classify_mood, get_tone_hint,
+    apply_mood_reaction, EmotionResult, Mood,
+)
 from resources import shared
 
 # 🌸 Referential word gate for reply-context folding — see the comment
@@ -622,6 +626,31 @@ class GroqMentionService:
             # need repeated `guild.id if guild else 0` inline.
             guild_id = guild.id if guild else 0
 
+            # 🌸 EMOTION DETECTION — runs BEFORE every interceptor below
+            # (math/media/music/server-query) so a crisis message never
+            # gets derailed into "here's a cartoon pic" territory, and so
+            # the mood reaction lands on the user's ORIGINAL message
+            # regardless of which path eventually answers it.
+            #
+            # check_crisis_signals is a fast regex net, not an AI call —
+            # it must never depend on a model succeeding/being in budget.
+            # If it fires, we skip classify_mood entirely (no emoji
+            # reaction for a possible cry for help) and build the
+            # tone_hint straight from CRISIS_RESPONSE_NOTE so
+            # get_ai_response below drops the slang persona for this one
+            # reply and responds with genuine care instead.
+            #
+            # If no crisis signal, classify_mood makes one cheap Groq
+            # call to read casual vibe (upset/stressed/angry/excited/
+            # neutral) purely for tone-matching + an optional emoji
+            # reaction — never a safety decision, fails open to neutral.
+            if check_crisis_signals(dispatch_text):
+                emotion_result = EmotionResult(mood=Mood.CRISIS, is_crisis=True, confidence=1.0)
+            else:
+                emotion_result = await classify_mood(self.bot.groq.client, dispatch_text)
+                await apply_mood_reaction(message, emotion_result)
+            tone_hint = get_tone_hint(emotion_result)
+
             # 🌸 intercepted MUST be initialized here, before the `if guild:`
             # block below — it used to live inside that block (as
             # `intercepted = None`), which meant in a DM (guild=None) it was
@@ -636,7 +665,17 @@ class GroqMentionService:
             # having never actually been given the chance to try).
             intercepted = None
 
-            if guild:
+            # 🌸 CRISIS BYPASS — a message flagged by check_crisis_signals
+            # above skips EVERY interceptor (server-query, math, media,
+            # music) entirely. Those exist to serve pics/songs/answers,
+            # not to sit between a possible cry for help and an actual
+            # caring reply — e.g. someone typing "send me a pic, I don't
+            # want to be here anymore" must not get routed to
+            # handle_media_request just because "send me a pic" also
+            # matched. `intercepted` is left as None so control falls
+            # straight through to get_ai_response below, carrying
+            # tone_hint=CRISIS_RESPONSE_NOTE.
+            if guild and not emotion_result.is_crisis:
                 server_hint = _looks_server_related(dispatch_text)
 
                 LABEL_HANDLERS = {
@@ -763,7 +802,11 @@ class GroqMentionService:
             # still silently skipping the interceptors themselves in DMs.
             # `intercepted` is already guaranteed to exist here (initialized
             # above, before `if guild:`) whether or not that block ran.
-            if intercepted is None:
+            # 🌸 Crisis bypass continues here too — math/media/music are
+            # just as irrelevant to a possible crisis message as the
+            # server-query chain above, so the same is_crisis guard keeps
+            # `intercepted` at None straight through to get_ai_response.
+            if intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-CLASSIFIED MATH INTERCEPTOR — one cheap Groq call
                 # decides if this is actually a math computation request
                 # (not just a message that happens to contain a digit —
@@ -780,7 +823,7 @@ class GroqMentionService:
                 # None on any classifier hiccup or non-math message, so
                 # this never blocks unrelated chat.
                 intercepted = await handle_math_request(message, guild_id, shared, self.bot.groq.client)
-            if intercepted is None:
+            if intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-classified media request — one Groq call decides
                 # if this is "send me a pic/video/vector/cartoon of X",
                 # then dispatches to Pexels (photo/video) or Pixabay
@@ -788,7 +831,7 @@ class GroqMentionService:
                 # image set via set_image() — no raw link text visible,
                 # unlike the old bare-URL auto-embed approach.
                 intercepted = await handle_media_request(message, guild_id, shared)
-            if intercepted is None:
+            if intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-classified MUSIC request — same zero-token-gate-
                 # then-classify shape as everything else in this chain
                 # (MUSIC_INTENT_PATTERN local pre-filter, then one Groq
@@ -943,6 +986,7 @@ class GroqMentionService:
                 message_id=message.id,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_message_text=reply_to_message_text,
+                tone_hint=tone_hint,
             )
 
             if response:

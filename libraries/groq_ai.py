@@ -881,7 +881,7 @@ class GroqService:
             print(f"⚠️ Search-intent classifier error (falling back to regex) for {username}: {e}")
             return False
 
-    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, global_name: str = None, guild_nickname: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None) -> str | None:
+    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, global_name: str = None, guild_nickname: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None, tone_hint: str = "") -> str | None:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
         stalls the bot's event loop. Loads this user's saved chat history
@@ -940,6 +940,17 @@ class GroqService:
         id", "when was my account made", "what's my username vs my
         nickname here") straight from context, no tool/decoder site
         needed.
+
+        🌸 `tone_hint` — optional, from extras/emotion_detector.py's
+        get_tone_hint(). Empty string (default) means no mood was
+        detected worth nudging for, so personality-building below is
+        byte-for-byte the same as before this param existed. When
+        non-empty, it's appended to this turn's personality instructions
+        ONLY — never saved to history, never affects any other user's
+        reply, and (per emotion_detector's contract) is either a light
+        tone nudge (upset/stressed/angry/excited) or, for a detected
+        crisis, a full override telling the model to drop the slang
+        persona entirely and respond with genuine care instead.
         """
         if not self.client:
             return None
@@ -1002,7 +1013,7 @@ class GroqService:
         # inside get_personality_for_nickname().
         nickname         = guild.me.nick if guild and guild.me else None
         try:
-            personality  = get_personality_for_nickname(nickname)
+            personality  = get_personality_for_nickname(nickname, tone_hint)
         except Exception as e:
             # 🌸 Last-resort fallback if personality.py errors out for
             # any reason — keeps the bot answering instead of crashing.
