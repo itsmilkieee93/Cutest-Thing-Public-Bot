@@ -68,6 +68,23 @@ def format_snowflake_info(snowflake: int) -> str:
 # DOTALL so a multi-line secret/code block still gets captured whole.
 DM_TAG_PATTERN = re.compile(r"\[DM_START\](.*?)\[DM_END\]", re.DOTALL | re.IGNORECASE)
 
+# 🌸 FALLBACK / LENIENT MATCH — Groq sometimes drifts on the exact closing
+# tag it was told to emit (seen in the wild: "[yDM_END]" with a stray
+# leading letter, "</DM_END>" HTML-style). DM_TAG_PATTERN above requires
+# the literal "[DM_END]" and silently finds no match on these variants,
+# which used to mean the WHOLE raw "[DM_START]...secret...garbled_end"
+# string — password/secret included — fell through untouched into
+# public_content and got posted straight to the channel. This pattern
+# is intentionally loose: it only needs an opening "[DM_START]" and
+# ANY closing marker that contains "DM_END" (bracket style, angle-bracket
+# style, extra stray characters around it, or missing entirely — .*?$
+# fallback via re.DOTALL means an unterminated tag still gets caught up
+# to the end of the string rather than leaking forever).
+DM_TAG_PATTERN_LENIENT = re.compile(
+    r"\[DM_START\](.*?)(?:[\[<]/?\s*y?DM_END\s*[\]>]|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # 🌸 Detects the user EXPLICITLY asking to be DM'd — English and
 # Indonesian phrasing both covered ("dm me", "send it to my dm(s)",
 # "kirim ke dm", "dm dong", "say something in my dm", "pm me"). Same
@@ -197,6 +214,16 @@ async def route_dm_split(message: discord.Message, server_content: str, ai_notic
     called with no tag present.
     """
     match = DM_TAG_PATTERN.search(server_content)
+    pattern_used = DM_TAG_PATTERN
+
+    if not match:
+        # 🌸 Strict tag missing its exact "[DM_END]" — try the lenient
+        # fallback before giving up. This is what actually catches the
+        # "[yDM_END]" / "</DM_END>" drift cases that used to leak the
+        # raw tag (and whatever secret was inside it) into the channel.
+        match = DM_TAG_PATTERN_LENIENT.search(server_content)
+        pattern_used = DM_TAG_PATTERN_LENIENT
+
     if not match:
         return server_content
 
@@ -206,7 +233,22 @@ async def route_dm_split(message: discord.Message, server_content: str, ai_notic
     # what goes to the server channel FIRST — before attempting delivery
     # at all — so a delivery failure below can never leave the private
     # payload sitting in text that gets sent publicly.
-    public_content = DM_TAG_PATTERN.sub("", server_content).strip()
+    public_content = pattern_used.sub("", server_content).strip()
+
+    # 🌸 HARD SAFETY NET — even after both patterns ran, if the literal
+    # word "DM_START" (or a leftover bracket fragment of it) is somehow
+    # still sitting in public_content, something about this reply's
+    # formatting was too malformed to fully clean. Rather than trust a
+    # third regex to also get it right, refuse to publish the leftover
+    # text at all — better an empty/generic public message than any
+    # chance of a half-stripped secret going out to the whole channel.
+    if "DM_START" in public_content.upper():
+        print(
+            "⚠️ Residual DM_START fragment survived tag-stripping — "
+            "discarding public_content instead of risking a leak. "
+            f"Raw content was: {server_content!r}"
+        )
+        public_content = ""
 
     if not dm_content:
         # 🌸 Empty tag body (model emitted [DM_START][DM_END] with

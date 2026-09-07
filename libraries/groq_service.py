@@ -41,6 +41,7 @@ from groq_instruct import (
     RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
     _looks_server_related,
 )
+from extras.groq_math import handle_math_request
 from groq_pexels import handle_media_request
 from groq_music_suggestion import (
     handle_music_request, save_music_interaction,
@@ -763,6 +764,23 @@ class GroqMentionService:
             # `intercepted` is already guaranteed to exist here (initialized
             # above, before `if guild:`) whether or not that block ran.
             if intercepted is None:
+                # 🌸 AI-CLASSIFIED MATH INTERCEPTOR — one cheap Groq call
+                # decides if this is actually a math computation request
+                # (not just a message that happens to contain a digit —
+                # e.g. an ID, a date, "I have 9 apples"), and extracts the
+                # clean expression. The ANSWER itself always comes from
+                # calculator.py's proven safe-eval engine (same one /math
+                # uses) — Groq has no arithmetic guarantees and can
+                # confidently return a wrong number, so it never computes
+                # the result, only classifies intent and phrases the
+                # already-correct answer naturally afterward. Returns a
+                # plain string (handled by the isinstance(str) branch
+                # below), not an embed — reads like a normal in-character
+                # reply instead of a calculator receipt. Falls open to
+                # None on any classifier hiccup or non-math message, so
+                # this never blocks unrelated chat.
+                intercepted = await handle_math_request(message, guild_id, shared, self.bot.groq.client)
+            if intercepted is None:
                 # 🌸 AI-classified media request — one Groq call decides
                 # if this is "send me a pic/video/vector/cartoon of X",
                 # then dispatches to Pexels (photo/video) or Pixabay
@@ -811,6 +829,18 @@ class GroqMentionService:
                 elif isinstance(intercepted, discord.Embed):
                     await message.reply(embed=intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                 else:
+                    # 🌸 Plain-string interceptor output (currently just the
+                    # math interceptor's natural-language reply). Routed
+                    # through route_dm_split the SAME as a normal Groq chat
+                    # response below — "do 9*8*9*9 and send the result to my
+                    # dm" must still honor the DM request even though the
+                    # answer came from the math interceptor instead of
+                    # get_ai_response. Without this, math replies could
+                    # never be DM'd and "send to dm" would be silently
+                    # ignored for math questions specifically.
+                    intercepted = await route_dm_split(
+                        message, intercepted, self.bot.groq.generate_dm_notice,
+                    )
                     await message.reply(intercepted, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS)
                 return
 
