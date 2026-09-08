@@ -1612,18 +1612,3 @@ def _check_base64_for_severe_terms(text: str) -> tuple[bool, str | None]:
     return is_severe, decoded if is_severe else None
 
 
-# 🌸 Cute-but-firm decline replies shown when SAFEGUARD_POLICY flags a
-# message — casual/informal gen-z tone to match the bot's persona, still
-# a clear no.
-SAFEGUARD_BLOCK_REPLIES = [
-    "nah i'm not touching that one 🌸 ask me something else fr",
-    "lol nope, not doing that 🎀 next question?",
-    "that's too much for me rn 🥲 pick a different topic",
-    "yeah no, hard pass on that one 🌸",
-    "absolutely not bestie 💀 try again",
-    "we're not doing this today 🎀",
-    "hmm no 🌸 next",
-    "not it, chief 😭 ask me literally anything else",
-    "big fat no from me 🎀",
-    "denied ✨ pick a new topic",
-]

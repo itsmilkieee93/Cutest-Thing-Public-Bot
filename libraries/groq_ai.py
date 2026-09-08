@@ -7,7 +7,7 @@ import logging
 import asyncio
 import discord
 from datetime import datetime
-from groq import Groq
+from groq import Groq, AsyncGroq
 from groq import RateLimitError as GroqRateLimitError
 from groq import APIStatusError as GroqAPIStatusError
 
@@ -22,7 +22,7 @@ import key_config
 
 from groq_instruct import (
     MODEL_POOL, SAFEGUARD_MODEL, SAFEGUARD_POLICY, OUTPUT_SAFEGUARD_POLICY,
-    SAFEGUARD_BLOCK_REPLIES, REACT_EMOJI_POOL, REACT_INSTRUCTIONS_DISALLOWED,
+    REACT_EMOJI_POOL, REACT_INSTRUCTIONS_DISALLOWED,
     IDENTITY_INSTRUCTIONS, DM_CONTEXT_INSTRUCTIONS,
     REACT_TAG_PATTERN, REACT_REQUEST_PATTERN, EXPLICIT_EMOJI_PATTERN,
     REACT_EMOJI_POOL, RECENT_EMOJI_MEMORY, AUTO_REACT_CHANCE,
@@ -164,9 +164,13 @@ class GroqService:
         self.current_key_index = 0
 
         if self.api_keys:
+            # 🌸 self.client is SYNC (for modules using asyncio.to_thread)
+            # self.async_client is ASYNC (for direct await calls within groq_ai.py)
             self.client = Groq(api_key=self.api_keys[self.current_key_index])
+            self.async_client = AsyncGroq(api_key=self.api_keys[self.current_key_index])
         else:
             self.client = None
+            self.async_client = None
             print("❌ ERROR: No API keys found in key_config.GROQ_API_KEYS!")
 
         # 🌸 Exa search — see get_ai_response's _wants_web_search branch.
@@ -203,6 +207,7 @@ class GroqService:
             return
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         self.client = Groq(api_key=self.api_keys[self.current_key_index])
+        self.async_client = AsyncGroq(api_key=self.api_keys[self.current_key_index])
         print(f"🔄 Swapping to Groq API Key #{self.current_key_index + 1}...")
 
     # 🌸 Square thumbnail shown in the corner of the log embeds.
@@ -427,8 +432,8 @@ class GroqService:
         if not self.client:
             return True
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=SAFEGUARD_MODEL,
                 messages=[
                     {"role": "system", "content": SAFEGUARD_POLICY},
@@ -453,7 +458,7 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             verdict = (response.choices[0].message.content or "").strip().upper()
             if not verdict:
                 print(f"🛡️⚠️ Safeguard returned EMPTY content for {username} — check reasoning_effort/max_tokens (failing open)")
@@ -509,8 +514,8 @@ class GroqService:
         # show up early; capping the input here doesn't weaken the check.
         reply_for_check = reply[:2000]
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=SAFEGUARD_MODEL,
                 messages=[
                     {"role": "system", "content": OUTPUT_SAFEGUARD_POLICY},
@@ -523,7 +528,7 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             verdict = (response.choices[0].message.content or "").strip().upper()
 
             # 🌸 One retry before failing open — this gate gets a single
@@ -533,7 +538,7 @@ class GroqService:
             # only in the rare empty case, not on the normal path.
             if not verdict:
                 print(f"🛡️⚠️ Output safeguard returned EMPTY content for {username} on first attempt — retrying once")
-                response = await asyncio.to_thread(_call)
+                response = await _call()
                 verdict = (response.choices[0].message.content or "").strip().upper()
 
             if not verdict:
@@ -547,7 +552,7 @@ class GroqService:
             print(f"⚠️ Output safeguard check error (failing open): {e}")
             return True
 
-    async def _generate_safeguard_decline(self, username: str, display_name: str = None, guild=None) -> str:
+    async def _generate_safeguard_decline(self, username: str, display_name: str = None, guild=None, flagged_text: str = None) -> str:
         """
         🌸 LIVE decline, not a template. Previously both the input-side
         (check_safety) and output-side (check_output_safety) blocks fell
@@ -567,22 +572,86 @@ class GroqService:
         decline matches whatever nickname/vibe /server-persona-set gave
         that guild instead of sounding like a generic stand-in bot.
 
-        🌸 System prompt is JUST personality_instructions now — no extra
-        decline-specific rules layered on top. personality.py already
-        says "no corporate refusals, no lecture, just say no casually",
-        so repeating/rephrasing that here only fought with it and made
-        replies drift toward generic filler ("nope, not gonna happen")
-        or over-explained mini-lectures. The user turn is a minimal
-        bracketed scene-setter, not an instruction block, so the model's
-        own personality does all the talking.
+        🌸 System prompt is JUST personality_instructions — no extra
+        decline-specific PERSONALITY rules layered on top of it, so the
+        bot's core voice/vibe still comes entirely from personality.py.
+        (Update: the user turn below DOES now carry decline-specific
+        constraints — style + banned phrases — but those are call-
+        structure/variety constraints, not personality rules, and they
+        live in the user turn, not the system prompt, for exactly that
+        reason: they shape HOW this one reply is built, they don't
+        redefine WHO the bot is.)
 
-        FAILS CLOSED to the static SAFEGUARD_BLOCK_REPLIES list if this
-        call itself errors or comes back empty — a decline template is a
-        perfectly safe fallback (never blocks safety), it just shouldn't
-        be the DEFAULT path anymore.
+        🌸 No more static SAFEGUARD_BLOCK_REPLIES template — the decline
+        is ALWAYS AI-generated now. One retry on empty content before
+        giving up (mirrors check_output_safety's retry), and only a
+        single bare literal string is left as the true last-resort (no
+        client configured, or both generation attempts failed/errored) so
+        the bot never goes silent — that string is a safety-net, not a
+        rotating template.
+
+        🌸 `flagged_text` — the actual message that got blocked (either
+        the user's prompt, for an input-side block, or the model's own
+        would-be reply, for an output-side block). Previously the user
+        turn here was a content-free stub ("sent something you're
+        declining to engage with") — with literally nothing to react to,
+        the model kept converging on the same generic brush-off ("not
+        feeling that one 😅") every single call, which is exactly the
+        repetitive-template look this function was meant to avoid.
+        Feeding it the real flagged text gives the model something
+        concrete to riff on in-character, so declines actually vary like
+        every other reply does. Truncated hard — this is a stub the
+        model reacts to, not something it should quote back at length,
+        and it keeps the call cheap.
+
+        🌸 personality.py's "no corporate refusals" rule (see
+        PERSONALITY_TEMPLATE) only tells the model what NOT to say — it
+        doesn't push for variety, so the model's safest/highest-probability
+        "casual no" kept landing on the same phrasing every time, which is
+        just as repetitive as the corporate refusal it was avoiding. The
+        explicit "vary how you say no" nudge below lives here rather than
+        in personality.py because it's specific to this narrow decline
+        path, not something every normal reply needs reminding of.
+
+        🌸 Turns out "vary how you say no" alone wasn't enough — the model
+        (openai/gpt-oss-120b) has no memory of what it said on the LAST
+        decline, so an instruction to "not repeat itself" is something it
+        literally can't act on; it can only pick whatever's highest-
+        probability for THIS call, which converges on the same shape
+        ("Nah, I'm gonna pass on that 🌚" / "Nah, I'm not gonna help with
+        that 🚫") even at temperature=1.05. Fix: pick a random OPENING
+        STYLE (not full sentence — just a shape/angle) in code and hand
+        THAT to the model as a hard constraint, so the variety comes from
+        an explicit dice roll on our side instead of hoping high-temp
+        sampling breaks the model's own habit.
+
+        🌸 Even with varied styles, a few of them (curt/unbothered) kept
+        landing on bare "No." / "nope :P" with zero reason — technically
+        varied, but unhelpful for anyone reading it (including mods
+        trying to understand what got flagged). DECLINE_STYLES now all
+        point toward including the real reason, and the user turn makes
+        it a hard requirement regardless of which style got picked: style
+        controls the TONE, this controls the CONTENT — a decline can be
+        short and blunt and still name the reason in the same breath.
         """
+        DECLINE_STYLES = [
+            "deflect with a joke or a random tangent, but still slip in the real reason you won't do it",
+            "act genuinely confused why they'd even ask, then explain what's off about the request",
+            "call out the request itself (e.g. 'that's a wild one to ask a bot lol') and say why it's a no",
+            "say no plainly, then give a short blunt reason right after — no lecture, just the actual reason",
+            "turn it back on them with a question first, then land on the reason you're not doing it",
+            "act unbothered/bored by the request, but still toss out the reason almost as an afterthought",
+        ]
+        decline_style = random.choice(DECLINE_STYLES)
+
+        # 🌸 True last-resort only (no client, or both generation attempts
+        # failed/errored) — deliberately has NO reason attached, since at
+        # this point we have no live model call to generate one from and
+        # a fake/generic reason would be worse than none.
+        FALLBACK_DECLINE = "can't help with that one 🌸"
+
         if not self.client:
-            return random.choice(SAFEGUARD_BLOCK_REPLIES)
+            return FALLBACK_DECLINE
 
         # 🌸 Resolve live personality instructions the same way the main
         # chat path does: per-guild nickname lookup if we have a guild,
@@ -596,8 +665,8 @@ class GroqService:
             print(f"⚠️ Safeguard decline personality load failed (using default): {e}")
             personality_instructions = get_personality_for_nickname(None)
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=self.default_model,
                 messages=[
                     {
@@ -607,8 +676,28 @@ class GroqService:
                     {
                         "role": "user",
                         "content": (
+                            f"[{display_name or username} (@{username}) sent this, and "
+                            f"you're declining to engage with it: {flagged_text[:200]!r}. "
+                            f"Reply in character, reacting to what it actually was. "
+                            f"For THIS reply specifically: {decline_style}. "
+                            "No matter the style, the reply MUST include why you're "
+                            "saying no — a short, casual, real reason, not a vague "
+                            "brush-off. A bare 'No.' or 'nope :P' with no reason at "
+                            "all is not acceptable here, even if the style above "
+                            "leans short or unbothered — keep it brief but the reason "
+                            "has to be there. "
+                            "Don't say 'I'm not gonna help with that' or 'gonna pass "
+                            "on that' or any close variant — those are banned for "
+                            "this reply, find a different way in.]"
+                            if flagged_text else
                             f"[{display_name or username} (@{username}) sent something "
-                            "you're declining to engage with. Reply in character.]"
+                            "you're declining to engage with. Reply in character. "
+                            f"For THIS reply specifically: {decline_style}. "
+                            "No matter the style, the reply MUST include why you're "
+                            "saying no — a short, casual, real reason, not a vague "
+                            "brush-off. "
+                            "Don't say 'I'm not gonna help with that' or 'gonna pass "
+                            "on that' or any close variant.]"
                         ),
                     },
                 ],
@@ -618,15 +707,21 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             decline = _strip_reasoning(response.choices[0].message.content or "").strip()
+
             if not decline:
-                print(f"🛡️⚠️ Safeguard decline generation returned EMPTY for {username} — using static fallback")
-                return random.choice(SAFEGUARD_BLOCK_REPLIES)
+                print(f"🛡️⚠️ Safeguard decline generation returned EMPTY for {username} on first attempt — retrying once")
+                response = await _call()
+                decline = _strip_reasoning(response.choices[0].message.content or "").strip()
+
+            if not decline:
+                print(f"🛡️⚠️ Safeguard decline generation returned EMPTY for {username} on retry too — using literal fallback")
+                return FALLBACK_DECLINE
             return decline
         except Exception as e:
-            print(f"⚠️ Safeguard decline generation failed (using static fallback): {e}")
-            return random.choice(SAFEGUARD_BLOCK_REPLIES)
+            print(f"⚠️ Safeguard decline generation failed (using literal fallback): {e}")
+            return FALLBACK_DECLINE
 
     async def generate_dm_notice(self, message: discord.Message, outcome: str) -> str:
         """
@@ -721,8 +816,8 @@ class GroqService:
             # both comfortably.
             notice_max_tokens = 256
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=CLASSIFIER_MODEL,
                 messages=[
                     {"role": "system", "content": personality_instructions},
@@ -734,7 +829,7 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             finish_reason = getattr(response.choices[0], "finish_reason", None)
             notice = _strip_reasoning(response.choices[0].message.content or "").strip()
             if not notice:
@@ -790,8 +885,8 @@ class GroqService:
         if not self.client:
             return "none"
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=CLASSIFIER_MODEL,
                 messages=[
                     {"role": "system", "content": SERVER_QUERY_CLASSIFIER_POLICY},
@@ -814,7 +909,7 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             label = (response.choices[0].message.content or "").strip().lower()
             if not label:
                 print(f"⚠️ Server-query classifier returned EMPTY content for {username} — check reasoning_effort/max_tokens")
@@ -852,8 +947,8 @@ class GroqService:
         if not self.client or not prompt:
             return False
 
-        def _call():
-            return self.client.chat.completions.create(
+        async def _call():
+            return await self.async_client.chat.completions.create(
                 model=CLASSIFIER_MODEL,
                 messages=[
                     {"role": "system", "content": SEARCH_INTENT_CLASSIFIER_POLICY},
@@ -871,7 +966,7 @@ class GroqService:
             )
 
         try:
-            response = await asyncio.to_thread(_call)
+            response = await _call()
             verdict = (response.choices[0].message.content or "").strip().upper()
             if not verdict:
                 print(f"⚠️ Search-intent classifier returned EMPTY content for {username} — check reasoning_effort/max_tokens")
@@ -956,7 +1051,7 @@ class GroqService:
             return None
 
         if not await self.check_safety(prompt, username):
-            return await self._generate_safeguard_decline(username, display_name, guild)
+            return await self._generate_safeguard_decline(username, display_name, guild, flagged_text=prompt)
 
         # 🌸 Random model pick per turn (unless caller pinned model_id) —
         # see MODEL_POOL up top for what's in rotation. EXCEPTION: if the
@@ -1283,7 +1378,7 @@ class GroqService:
                 "content": f"[THIS IS THE MESSAGE BEING REPLIED TO] {reply_to_message_text}",
             })
 
-        def _call(slim: bool = False):
+        async def _call(slim: bool = False):
             # 1. Buat parameter dasar yang selalu digunakan semua model
             # 🌸 slim=True drops recent_history entirely — used for the
             # 413 ("Request Entity Too Large") retry below. Compound
@@ -1391,7 +1486,11 @@ class GroqService:
                     kwargs["reasoning_effort"] = "low"                    
 
             # 3. Jalankan request dengan mendekompresi (unpack) kwargs
-            return self.client.chat.completions.with_raw_response.create(**kwargs)
+            # 🌸 self.client is AsyncGroq — awaited directly here (no
+            # asyncio.to_thread needed, that was only correct for a sync
+            # Groq client; awaiting a coroutine from inside a worker
+            # thread doesn't work, there's no event loop running there).
+            return await self.async_client.chat.completions.with_raw_response.create(**kwargs)
 
         used_slim_retry = False
         # 🌸 STAGE 2 flags — a 413 that survives the slim retry falls
@@ -1417,10 +1516,10 @@ class GroqService:
         max_attempts = max(len(self.api_keys), 1) + 3
         for attempt in range(max_attempts):
             try:
-                raw_response = await asyncio.to_thread(_call, used_slim_retry)
+                raw_response = await _call(used_slim_retry)
                 self._log_rate_limits(raw_response.headers, username, model_to_use)
 
-                completion = raw_response.parse()
+                completion = await raw_response.parse()
                 reply = _strip_reasoning(completion.choices[0].message.content)
 
                 # 🌸 OUTPUT-SIDE safety gate — catches cases where an
@@ -1430,7 +1529,7 @@ class GroqService:
                 # flagged, swap in a refusal BEFORE it's saved to memory,
                 # written to the transcript log, or sent to Discord.
                 if not await self.check_output_safety(reply, username):
-                    reply = await self._generate_safeguard_decline(username, display_name, guild)
+                    reply = await self._generate_safeguard_decline(username, display_name, guild, flagged_text=prompt)
                     self._log_ai_transcript(
                         username, user_id, model_to_use, guild, channel,
                         prompt, "[BLOCKED BY OUTPUT SAFEGUARD — reply withheld]",

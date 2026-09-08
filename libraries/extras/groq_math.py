@@ -33,8 +33,25 @@ through to the rest of the pipeline untouched.
 
 import re
 import json
+import inspect
 
 from calculator import _preprocess, _safe_eval, _format
+
+
+async def _call_groq(groq_client, **kwargs):
+    """🌸 Calls groq_client.chat.completions.create and returns the result
+    regardless of whether the underlying client is sync (groq.Groq) or
+    async (groq.AsyncGroq). .create() on a sync client returns a
+    ChatCompletion directly — awaiting that raises "'ChatCompletion'
+    object can't be awaited". .create() on an async client returns a
+    coroutine that must be awaited. This checks which one we got back
+    before deciding whether to await it, so this module keeps working
+    no matter which client type self.bot.groq.client turns out to be.
+    """
+    result = groq_client.chat.completions.create(**kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 # 🌸 Zero-token local pre-filter — same shape as server_hint/
 # MUSIC_INTENT_PATTERN elsewhere in this pipeline. Cheap enough to run on
@@ -74,7 +91,8 @@ async def classify_math_request(message_text: str, groq_client) -> str | None:
     normal Groq chat instead of blocking the message.
     """
     try:
-        response = await groq_client.chat.completions.create(
+        response = await _call_groq(
+            groq_client,
             model="openai/gpt-oss-20b",
             reasoning_effort="low",
             max_tokens=150,
@@ -137,7 +155,8 @@ async def phrase_math_result(
     (still correct, still cute) sentence rather than blocking the reply.
     """
     try:
-        response = await groq_client.chat.completions.create(
+        response = await _call_groq(
+            groq_client,
             model="openai/gpt-oss-20b",
             reasoning_effort="low",
             max_tokens=200,
