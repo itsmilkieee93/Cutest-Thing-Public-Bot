@@ -140,18 +140,19 @@ async def classify_math_request(message_text: str, groq_client) -> str | None:
 
 
 async def phrase_math_result(
-    groq_client, user_text: str, expression: str, result_str: str, display_name: str,
+    groq_client, user_text: str, expression: str, display_name: str,
 ) -> str | None:
-    """🌸 Second cheap Groq call — takes the ALREADY-COMPUTED, verified-
-    correct result and phrases it naturally in the bot's kawaii voice,
-    instead of a raw "Expression: ... Result: ..." embed dump. The
-    NUMBER itself is never regenerated here — it's handed in as a fact
-    Groq narrates, same shape as _generate_safeguard_decline phrasing a
-    decision that was already made, or the snowflake decoder handing
-    Groq an already-decoded date to describe. Groq cannot alter the
-    answer, only the wording around it.
+    """🌸 Second cheap Groq call — writes a short, cute REACTION to the
+    math request. It deliberately never sees or repeats the actual
+    result: earlier versions handed Groq the full result_str and told
+    it not to alter the number, but an LLM regenerating a long digit
+    string token-by-token isn't a copy operation — for big results
+    (e.g. 2**4096, 1234 digits) it silently truncates at max_tokens or
+    drifts partway through. The verified number is now ALWAYS spliced
+    in by code in handle_math_request, after this call returns, so
+    Groq physically cannot corrupt it — it only ever writes words.
 
-    Returns None on any failure so the caller can fall back to a plain
+    Returns None on any failure so the caller falls back to a plain
     (still correct, still cute) sentence rather than blocking the reply.
     """
     try:
@@ -159,29 +160,26 @@ async def phrase_math_result(
             groq_client,
             model="openai/gpt-oss-20b",
             reasoning_effort="low",
-            max_tokens=200,
+            max_tokens=60,
             messages=[
                 {
                     "role": "system",
                     "content": (
                         "You are Cutest Thing, a kawaii Discord bot 🌸✨. "
-                        "The user asked a math question and it has ALREADY "
-                        "been computed correctly by a calculator — your ONLY "
-                        "job is to state that exact result naturally and "
-                        "cutely in 1-2 short sentences. Do NOT recompute, "
-                        "second-guess, or alter the number in any way — just "
-                        "report it exactly as given, in your own warm voice. "
-                        "No markdown headers, no code blocks, just a natural "
-                        "chat reply."
+                        "The user asked a math question and it's ALREADY "
+                        "been computed correctly by a calculator elsewhere. "
+                        "Write ONE short, cute reaction/intro sentence (e.g. "
+                        "'Ooh here you go!' / 'Easy one, here's your answer:'). "
+                        "CRITICAL: do NOT write the numeric answer, or any "
+                        "digit of it — not even a rounded guess. The exact "
+                        "verified number is appended separately by code "
+                        "right after your sentence. Just the reaction, "
+                        "no markdown, no code blocks."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": (
-                        f"{display_name} asked: {user_text}\n"
-                        f"Expression: {expression}\n"
-                        f"Correct result (do not change this number): {result_str}"
-                    ),
+                    "content": f"{display_name} asked: {user_text}\nExpression: {expression}",
                 },
             ],
         )
@@ -234,12 +232,20 @@ async def handle_math_request(message, guild_id: int, shared, groq_client) -> st
         # handle it instead of surfacing a scary raw error.
         return None
 
-    natural_reply = await phrase_math_result(
-        groq_client, raw, expression, result_str, message.author.display_name,
+    intro = await phrase_math_result(
+        groq_client, raw, expression, message.author.display_name,
     )
-    if natural_reply:
-        return natural_reply
+
+    # 🌸 The result is ALWAYS spliced in here by code — Groq never sees
+    # or retypes result_str, so this is correct regardless of how many
+    # digits it has. Long results (e.g. 2**4096) go in a code block so
+    # Discord renders them monospaced/legible instead of one wrapped
+    # bold blob.
+    answer = f"```\n{result_str}\n```" if len(result_str) > 40 else f"**{result_str}**"
+
+    if intro:
+        return f"{intro}\n{expression} = {answer} 🧮✨"
 
     # 🌸 Plain fallback if the phrasing call itself failed — the ANSWER
     # is still guaranteed correct even if Groq couldn't dress it up.
-    return f"{expression} = **{result_str}** 🧮✨"
+    return f"{expression} = {answer} 🧮✨"

@@ -29,7 +29,7 @@ import discord
 from datetime import datetime
 
 from groq_instruct import (
-    handle_role_query, handle_created_query, handle_server_info_query,
+    handle_role_query, handle_user_role_query, handle_member_lookup_query, handle_created_query, handle_server_info_query,
     handle_channel_count_query, handle_role_list_query,
     handle_server_avatar_query, handle_server_banner_query,
     handle_server_owner_query, handle_server_verification_query,
@@ -57,10 +57,25 @@ from extras.emotion_detector import (
     apply_mood_reaction, EmotionResult, Mood,
 )
 from resources import shared
+from engine.classifiers import extract_member_name
 
-# 🌸 Referential word gate for reply-context folding — see the comment
-# in handle_mention_reaction where this is used. Compiled once at import
-# time instead of per-call.
+# 🌸 Referential word gates for reply-context folding — see the comment
+# in handle_mention_reaction where these are used. Compiled once at
+# import time instead of per-call.
+#
+# Split into two tiers because they behave differently against the
+# "not _looks_server_related(message.content)" gate below:
+#   - Person-pronouns (he/she/they/...) NEVER form a complete,
+#     self-contained server question on their own — "is HE on this
+#     server" always needs an antecedent for "he", even though the
+#     message itself already contains "server" and would otherwise fail
+#     the _looks_server_related gate. These always fold in reply
+#     context when present.
+#   - Demonstratives (it/that/this/its) often modify "server" ITSELF in
+#     an already-complete question ("is THAT a cool server"), which is
+#     exactly the case the _looks_server_related gate exists to protect
+#     — these keep that gate.
+_PERSON_REFERENTIAL_PATTERN = re.compile(r"\b(he|she|they|him|her|them|who)\b", re.IGNORECASE)
 _REFERENTIAL_WORD_PATTERN = re.compile(r"\b(it|that|this|its|it's)\b", re.IGNORECASE)
 
 # 🔔 Reply-ping policy — pings ONLY the person being replied to (the
@@ -583,10 +598,12 @@ class GroqMentionService:
             # the actual "dangling pronoun" case ("when did it get made"
             # has no server keyword by itself) is unaffected.
             dispatch_text = message.content
-            if (
-                reply_to_message_text
-                and not _looks_server_related(message.content)
-                and _REFERENTIAL_WORD_PATTERN.search(message.content)
+            if reply_to_message_text and (
+                _PERSON_REFERENTIAL_PATTERN.search(message.content)
+                or (
+                    not _looks_server_related(message.content)
+                    and _REFERENTIAL_WORD_PATTERN.search(message.content)
+                )
             ):
                 dispatch_text = f"{reply_to_message_text}\n{message.content}"
 
@@ -693,20 +710,26 @@ class GroqMentionService:
                     "channel_count": handle_channel_count_query,
                     "role_list": handle_role_list_query,
                     "role_query": handle_role_query,
+                    "user_role_query": handle_user_role_query,
+                    "member_lookup": handle_member_lookup_query,
                     "created": handle_created_query,
                     "user_created": handle_user_created_query,
                 }
 
-                # 🌸 STRATEGY COIN-FLIP — per user request, randomly pick
-                # whether the AI classifier or the regex chain gets first
-                # crack at this message, instead of always trusting the
-                # classifier. Whichever one DOESN'T go first still runs as
-                # the fallback if the first pick comes back empty — this
-                # is purely about ORDER, nothing loses coverage. Only
-                # applies when server_hint is True; if the message doesn't
-                # look server-related at all, there's nothing to flip a
-                # coin over and we skip straight to "none" like before.
-                strategy = random.choice(["ai", "regex"]) if server_hint else "regex"
+                # 🌸 AI-FIRST — per user request (2026-09-09), the AI
+                # classifier ALWAYS gets first crack at server-related
+                # messages now, instead of a 50/50 coin flip with the
+                # regex chain. This matters most for phrasing the regex
+                # patterns don't cleanly cover, e.g. "does its.cuteee_
+                # have role p" / "does X have role of P" — the AI reads
+                # intent directly instead of depending on exact word
+                # order. Regex still runs as the fallback if the AI comes
+                # back with "none" or an unhandled label — nothing loses
+                # coverage, this only changes ORDER. Only applies when
+                # server_hint is True; if the message doesn't look
+                # server-related at all, we skip straight to "none" like
+                # before.
+                strategy = "ai" if server_hint else "regex"
 
                 async def _try_ai():
                     label = await self.bot.groq.classify_server_query(dispatch_text, message.author.name)
@@ -718,14 +741,67 @@ class GroqMentionService:
                     # its handler's own regex can't parse on its own
                     # (message.content only, no reply context, rigid word
                     # order). Trust that classification for every label
-                    # EXCEPT role_query — that handler's regex isn't just
-                    # a gate, it also EXTRACTS the role name via a capture
-                    # group, so skipping it would leave nothing to look
-                    # up. Every other handler only ever reads guild_id/
+                    # EXCEPT role_query/user_role_query — classify_server_query
+                    # only ever returns a bare label string, never an
+                    # extracted role/user name, so there's no hint to hand
+                    # either handler even though handle_role_query now
+                    # ACCEPTS one (see role_name_hint in groq_instruct.py).
+                    # Passing skip_pattern_check=True with no hint would
+                    # just make them silently re-run their own regex on
+                    # message.content internally anyway — so for now we
+                    # call them plainly and let them self-gate, same
+                    # effective behavior, no wasted no-op kwarg.
+                    # Every other handler only ever reads guild_id/
                     # message.guild/message.mentions once past the gate,
                     # so skipping their gate is safe.
-                    if label == "role_query":
-                        return await handler(message, guild.id, shared)
+                    if label == "member_lookup":
+                        # 🌸 AI-FIRST entity resolution — classify_server_query
+                        # already spent one call to know this is a
+                        # member_lookup question; extract_member_name spends
+                        # ONE more cheap call reading the same dispatch_text
+                        # (reply-context already folded in) to resolve WHO,
+                        # including a dangling pronoun follow-up like "does
+                        # he on this server" that handle_member_lookup_query's
+                        # own regex on message.content could never resolve
+                        # on its own. An actual @mention is free/instant and
+                        # always wins outright, so it skips the extra call.
+                        # 🌸 A mention only counts as the lookup TARGET if it
+                        # isn't the bot itself. "@EE does X exist" mentions
+                        # the bot just to address it, not to ask "is EE on
+                        # this server" — treating every mention (including
+                        # a self-mention) as the target was making a bare
+                        # "@EE" answer "Yep, EE is here" no matter what the
+                        # actual question was.
+                        real_mentions = [m for m in message.mentions if m.id != self.bot.user.id]
+                        if real_mentions:
+                            return await handle_member_lookup_query(message, guild.id, shared, groq_client=self.bot.groq.client)
+                        ai_name_hint = await extract_member_name(self.bot.groq, dispatch_text, message.author.name)
+                        # 🌸 dispatch_text can have the bot's OWN previous
+                        # reply folded into it (e.g. "EE is here on this
+                        # server!"), and extract_member_name reads that whole
+                        # blob — so it can end up "extracting" the bot's own
+                        # name from its own old answer instead of from the
+                        # user's actual new question. Treat that the same as
+                        # an empty hint so it falls through to the handler's
+                        # own regex-on-message.content path instead of
+                        # re-confirming the bot's own existence every time.
+                        bot_names = {n.lower() for n in (self.bot.user.name, self.bot.user.display_name) if n}
+                        if ai_name_hint and ai_name_hint.strip().lower() in bot_names:
+                            ai_name_hint = None
+                        result = await handle_member_lookup_query(
+                            message, guild.id, shared,
+                            groq_client=self.bot.groq.client,
+                            name_hint=ai_name_hint or None,
+                        )
+                        if result is not None:
+                            return result
+                        # 🌸 AI extraction came back empty/junk — fail open
+                        # to the handler's own regex-on-message.content path
+                        # rather than giving up, same contract as everywhere
+                        # else in this dispatch.
+                        return await handle_member_lookup_query(message, guild.id, shared, groq_client=self.bot.groq.client)
+                    if label in ("role_query", "user_role_query"):
+                        return await handler(message, guild.id, shared, groq_client=self.bot.groq.client)
                     return await handler(message, guild.id, shared, skip_pattern_check=True)
 
                 async def _try_regex():
@@ -765,7 +841,17 @@ class GroqMentionService:
                     if result is None:
                         result = await handle_role_list_query(message, guild.id, shared)
                     if result is None:
-                        result = await handle_role_query(message, guild.id, shared)
+                        result = await handle_role_query(message, guild.id, shared, groq_client=self.bot.groq.client)
+                    if result is None:
+                        # 🌸 "does USER have role X" — different query
+                        # shape from handle_role_query above (member →
+                        # role check, not role → member list). See
+                        # handle_user_role_query's docstring.
+                        result = await handle_user_role_query(message, guild.id, shared, groq_client=self.bot.groq.client)
+                    if result is None:
+                        # 🌸 "is X on this server" — pure existence check,
+                        # see handle_member_lookup_query's docstring.
+                        result = await handle_member_lookup_query(message, guild.id, shared, groq_client=self.bot.groq.client)
                     if result is None:
                         result = await handle_created_query(message, guild.id, shared)
                     if result is None:

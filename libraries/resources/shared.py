@@ -795,6 +795,89 @@ async def get_members_with_role(guild_id: int, role_name: str) -> list[dict]:
         await conn.close()
 
 
+async def find_member_by_name(guild_id: int, name: str) -> list[dict]:
+    """
+    🌸 Look up cached members by username/display_name (case-insensitive)
+    in the guild's roles.db `members` table — the same table
+    get_members_with_role already reads member rows from. Added for
+    "does USER have role X" lookups (handle_user_role_query in
+    groq_instruct.py) where the message gives a plain-text name instead
+    of an @mention, so there's no member_id to go on yet.
+
+    Tries an exact (case-insensitive) match on username OR display_name
+    first; if nothing exact hits, falls back to a substring match on
+    either field. Returns a list of member dicts (id, username,
+    display_name, discriminator, avatar, bot) — callers should treat
+    anything but exactly 1 result as "can't confidently resolve" (0 =
+    not found, 2+ = ambiguous), same convention as
+    handle_role_query's own partial-role-match handling.
+
+    Usage:
+        matches = await find_member_by_name(1479158469981376656, "its.cuteee_")
+        if len(matches) == 1:
+            roles = await get_member_roles(guild_id, matches[0]["id"])
+    """
+    if not name or not os.path.exists(_guild_db_dir(guild_id)):
+        return []
+
+    conn = await _get_roles_db(guild_id)
+    try:
+        cur = await conn.execute(
+            """
+            SELECT id, username, display_name, discriminator, avatar, bot
+            FROM members
+            WHERE LOWER(username) = LOWER(?) OR LOWER(display_name) = LOWER(?)
+            """,
+            (name, name),
+        )
+        rows = await cur.fetchall()
+
+        if not rows:
+            # 🌸 BUGFIX: SQLite's LIKE treats bare "_" as a single-char
+            # wildcard and "%" as a multi-char wildcard — Discord usernames
+            # commonly contain literal underscores (e.g. "its.cuteee_"),
+            # which were silently being read as "any one character" here
+            # instead of a literal underscore. That could make this
+            # fallback miss the real member (if the un-escaped pattern's
+            # implicit wildcard didn't line up with any row) or return
+            # 2+ ambiguous matches (if it accidentally matched OTHER
+            # members too) — either way the caller (handle_user_role_query)
+            # sees "not exactly 1 match" and fails open, which is exactly
+            # the silently-wrong "does its.cuteee_ have role p" case.
+            # Escaping the user-supplied name's own "_"/"%" chars before
+            # wrapping it in wildcards makes only the wrapping % symbols
+            # act as wildcards, restoring literal matching for the name.
+            escaped_name = name.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+            like = f"%{escaped_name}%"
+            cur = await conn.execute(
+                """
+                SELECT id, username, display_name, discriminator, avatar, bot
+                FROM members
+                WHERE username LIKE ? ESCAPE '\\' COLLATE NOCASE
+                   OR display_name LIKE ? ESCAPE '\\' COLLATE NOCASE
+                """,
+                (like, like),
+            )
+            rows = await cur.fetchall()
+
+        return [
+            {
+                "id": r[0],
+                "username": r[1],
+                "display_name": r[2],
+                "discriminator": r[3],
+                "avatar": r[4],
+                "bot": bool(r[5]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"❌ Query error (find_member_by_name): {e}")
+        return []
+    finally:
+        await conn.close()
+
+
 async def get_member_roles(guild_id: int, member_id: int) -> list[dict]:
     """
     🌸 Get all roles for a specific member in a guild.
@@ -836,6 +919,73 @@ async def get_member_roles(guild_id: int, member_id: int) -> list[dict]:
     except Exception as e:
         print(f"❌ Query error (get_member_roles): {e}")
         return []
+    finally:
+        await conn.close()
+
+
+async def get_staff_context_string(guild_id: int) -> str:
+    """
+    🌸 STAFF INTENT INJECTOR — cheap local-DB fetch for the AI-intent-
+    classifier's QUERY_STAFF fast path (see groq_ai.classify_user_intent
+    + the interceptor wired at the top of get_ai_response). Meant to be
+    called INSTEAD OF a full Groq chat generation whenever the message
+    is asking "who's staff / who are the mods" — same shape as
+    get_compact_roles/get_member_roles above, just pre-filtered to the
+    two staff-flagged role names and pre-formatted as a display string
+    so the caller can reply with it directly, no further LLM pass
+    needed.
+
+    Opens roles.db with the same WAL + NORMAL synchronous pragmas as
+    _get_roles_db (same schema) rather than calling that helper
+    directly, since this is a standalone, deliberately-minimal
+    connection for a hot, latency-sensitive interceptor path — it only
+    ever reads, never touches CREATE TABLE, so it doesn't need the rest
+    of _get_roles_db's setup.
+
+    Returns "" (empty string) if the guild has no cached roles.db yet,
+    or if the query errors/finds nobody — callers should treat an empty
+    return as "nothing to show" and fall back to the normal chat path
+    rather than reply with a blank message.
+
+    Usage:
+        staff_text = await get_staff_context_string(guild_id)
+        if staff_text:
+            await message.reply(staff_text)
+    """
+    if not os.path.exists(_guild_db_dir(guild_id)):
+        return ""
+
+    conn = await aiosqlite.connect(_guild_roles_db_path(guild_id))
+    try:
+        # 🌸 Same WAL/synchronous pragmas as every other guild DB
+        # connection in this file (see _get_roles_db, _get_metadata_db,
+        # _get_groq_db) — WAL lets this read-only interceptor query run
+        # concurrently with any in-flight writer (e.g. a guild-sync task
+        # repopulating member_roles) without blocking on a file lock,
+        # and NORMAL trades a sliver of durability for lower fsync
+        # overhead, which is the right tradeoff for a cache DB that's
+        # fully rebuildable from Discord's own API anyway.
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+
+        cur = await conn.execute("""
+            SELECT m.display_name, r.name
+            FROM member_roles mr
+            JOIN members m ON m.id = mr.member_id
+            JOIN roles r ON r.id = mr.role_id
+            WHERE r.name IN ('Senior Moderator', 'Moderator')
+            ORDER BY r.position DESC, m.display_name ASC
+        """)
+        rows = await cur.fetchall()
+
+        if not rows:
+            return ""
+
+        lines = [f"- {display_name} ({role_name})" for display_name, role_name in rows]
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"❌ Query error (get_staff_context_string): {e}")
+        return ""
     finally:
         await conn.close()
 
