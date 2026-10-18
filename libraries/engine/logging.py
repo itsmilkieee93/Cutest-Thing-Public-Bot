@@ -25,8 +25,10 @@ GroqService.SUCCESS_THUMBNAIL_URL directly).
 """
 import os
 import re
+import time
 import logging
 import discord
+from collections import OrderedDict
 from datetime import datetime
 
 from log_webhook import add_stdout_relay
@@ -164,6 +166,150 @@ def _build_rate_limit_embed(service, error: Exception, username: str, user_id: i
     return embed
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 🌸 USER-FACING AI ERROR EMBEDS
+#
+# _build_rate_limit_embed above is the ADMIN embed (org id, key index,
+# usage numbers) that goes to the log channels. The functions below build
+# the opposite: a tiny embed for the person who talked to the bot when the
+# AI provider answers with anything other than 200. It never contains the
+# raw provider text, org id, key number or billing link.
+# ─────────────────────────────────────────────────────────────────────
+
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|d|h|m|s)", re.IGNORECASE)
+_DURATION_UNITS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _parse_duration_seconds(text) -> float | None:
+    """"7m12.768s" / "2h3m" / "850ms" / "30" (bare seconds) -> seconds, else None."""
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not text:
+        return None
+    parts = _DURATION_RE.findall(text)
+    if parts:
+        return sum(float(value) * _DURATION_UNITS[unit.lower()] for value, unit in parts)
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_error_status(error: Exception) -> int | None:
+    """HTTP status code of a provider error (groq.APIStatusError exposes
+    .status_code; .response.status_code is the fallback), or None when the
+    exception has no HTTP status (connection error, timeout, plain bug)."""
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return status
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _retry_after_seconds(error: Exception, limit_type: str) -> float | None:
+    """How long until the limit resets. Order of trust: the Retry-After
+    header, the "try again in 7m12s" text in the error body, then the
+    x-ratelimit-reset-* header matching the limit that was hit."""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    candidates = []
+    if headers:
+        try:
+            candidates.append(headers.get("retry-after"))
+        except Exception:
+            pass
+    candidates.append(_parse_groq_429(error).get("retry_after"))
+    if headers:
+        try:
+            kind = "tokens" if "token" in limit_type.lower() else "requests"
+            candidates.append(headers.get(f"x-ratelimit-reset-{kind}"))
+        except Exception:
+            pass
+    for raw in candidates:
+        seconds = _parse_duration_seconds(raw)
+        if seconds is not None and seconds >= 0:
+            return seconds
+    return None
+
+
+def build_user_error_embed(error: Exception) -> discord.Embed | None:
+    """Minimal embed for the user who triggered a failed AI call, or None
+    when `error` isn't a provider/connection error (so the caller can
+    re-raise real bugs untouched). Rate limits (429) say whether the
+    token or the request quota ran out and show when it resets as a live
+    Discord timestamp (<t:...:R> renders as "in 7 minutes")."""
+    status = get_error_status(error)
+    if status is None:
+        if type(error).__name__ not in ("APIConnectionError", "APITimeoutError"):
+            return None
+        title, desc, color = (
+            "📡 AI is unreachable",
+            "I couldn't reach the AI service. Please try again in a moment.",
+            0x95A5A6,
+        )
+        footer = "Connection error"
+    elif status == 429:
+        limit_type = _parse_groq_429(error).get("limit_type") or ""
+        lowered = limit_type.lower()
+        what = "Token" if "token" in lowered else "Request" if "request" in lowered else "Usage"
+        period = "daily " if "per day" in lowered else "per-minute " if "per minute" in lowered else ""
+        seconds = _retry_after_seconds(error, limit_type)
+        if seconds is not None:
+            reset = f"Resets <t:{int(time.time() + seconds) + 1}:R>."
+        else:
+            reset = "Please try again in a little while."
+        title = f"⏳ {what} limit reached"
+        desc = f"My {period}{what.lower()} quota is used up. {reset}"
+        color = 0xF39C12
+        footer = "Error 429"
+    elif status == 401:
+        title, desc, color = (
+            "🔑 AI key rejected",
+            "The AI service rejected my credentials. Please let the bot owner know.",
+            0xE74C3C,
+        )
+        footer = "Error 401"
+    elif status == 403:
+        title, desc, color = (
+            "🚫 AI access denied",
+            "The AI service refused this request. Please let the bot owner know.",
+            0xE74C3C,
+        )
+        footer = "Error 403"
+    elif status == 404:
+        title, desc, color = (
+            "❓ AI model not found",
+            "The AI model I'm set up to use wasn't found. Please let the bot owner know.",
+            0xE74C3C,
+        )
+        footer = "Error 404"
+    elif status == 413:
+        title, desc, color = (
+            "📏 Message too large",
+            "That message (with its context) is too big for the AI. Try something shorter.",
+            0xF39C12,
+        )
+        footer = "Error 413"
+    elif status >= 500:
+        title, desc, color = (
+            "🛠️ AI service is having issues",
+            "The AI provider had a problem on its side. Please try again soon.",
+            0x95A5A6,
+        )
+        footer = f"Error {status}"
+    else:
+        title, desc, color = (
+            "⚠️ AI request failed",
+            "The AI service couldn't process that request. Please try again.",
+            0xE74C3C,
+        )
+        footer = f"Error {status}"
+
+    embed = discord.Embed(title=title, description=desc, color=color)
+    embed.set_footer(text=footer)
+    return embed
+
+
 def _build_success_embed(service, username: str, user_id: int, guild, channel, model_id: str, headers=None) -> discord.Embed:
     """🌸 Green success-log embed sent after every completed Groq reply,
     with user/server/channel snowflake IDs for tracing, plus every raw
@@ -285,3 +431,29 @@ def _log_rate_limits(service, headers, username: str, model_id: str):
             groq_logger.info(f"[{username} | {model_id} | Key #{service.current_key_index + 1}] {summary}")
     except Exception as e:
         print(f"⚠️ Rate-limit log error: {e}")
+
+
+# 🌸 Side channel for the user-facing error embed. run_completion_loop
+# swallows provider errors and returns None (callers rely on that), so it
+# records the LAST error here, keyed by the incoming Discord message id, and
+# groq_service.py pops it when it gets None back. Bounded so a record whose
+# message never gets popped can't pile up.
+_LAST_AI_ERRORS: "OrderedDict[int, Exception]" = OrderedDict()
+_LAST_AI_ERRORS_MAX = 200
+
+
+def remember_ai_error(message_id, error: Exception) -> None:
+    """Called from run_completion_loop right before it gives up (returns None)."""
+    if message_id is None:
+        return
+    _LAST_AI_ERRORS[message_id] = error
+    _LAST_AI_ERRORS.move_to_end(message_id)
+    while len(_LAST_AI_ERRORS) > _LAST_AI_ERRORS_MAX:
+        _LAST_AI_ERRORS.popitem(last=False)
+
+
+def pop_ai_error(message_id) -> Exception | None:
+    """Removes and returns the recorded error for this message (or None)."""
+    if message_id is None:
+        return None
+    return _LAST_AI_ERRORS.pop(message_id, None)

@@ -900,7 +900,29 @@ def _build_music_view(result: dict, max_tracks: int = 5):
     return view, tracks, result["summary"]
 
 
-async def handle_music_request(message: "discord.Message", guild_id: int, shared):
+# 🌸 Zero-token track-count heuristic for the tool-calling path (see
+# handle_music_request's query_hint). The legacy path spends a Groq call
+# on decide_track_count; with tool calling the whole point is fewer
+# calls, and the only cases that really matter — an explicit number
+# ("give me 10 songs") or a single song ("play a song by X") — are
+# trivially regex-able. Everything else gets the same default (5)
+# decide_track_count falls back to.
+_TRACK_COUNT_NUMBER = re.compile(r"\b(\d{1,2})\s+(?:\w+\s+)?(?:songs?|tracks?|tunes?)\b", re.IGNORECASE)
+_TRACK_COUNT_SINGLE = re.compile(r"\b(?:a|one|1)\s+(?:\w+\s+)?(?:song|track|tune)\b", re.IGNORECASE)
+
+
+def _local_track_count(text: str, default: int = 5) -> int:
+    m = _TRACK_COUNT_NUMBER.search(text or "")
+    if m:
+        return max(1, min(int(m.group(1)), MAX_SUGGESTED_TRACKS))
+    if _TRACK_COUNT_SINGLE.search(text or ""):
+        return 1
+    return default
+
+
+async def handle_music_request(
+    message: "discord.Message", guild_id: int, shared, query_hint: str | None = None,
+):
     """🌸 Interceptor entry point, same call contract as
     handle_media_request(message, guild_id, shared) in groq_pexels.py —
     slot this into the SAME spot in groq_service.py's interceptor chain
@@ -945,28 +967,51 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
                 )
             else:
                 await message.reply(embed=embed)
+
+    🌸 `query_hint` (new): the `search_and_play_music` tool's JSON
+    argument — a song title and/or artist the main chat model already
+    extracted. When given, MUSIC_INTENT_PATTERN, classify_music_intent
+    and decide_track_count (all upfront AI/regex gates) are skipped and
+    the hint is searched directly; track count comes from the free
+    _local_track_count heuristic on message.clean_content. The return
+    contract is unchanged — (view, tracks | None, query, summary) — and
+    the CALLER still sends the view / calls save_music_interaction with
+    the sent message's id. Leave None for the legacy behavior.
     """
-    text = message.clean_content.strip()
-    if not text:
-        return None
+    if query_hint is not None:
+        # 🌸 TOOL-CALLING PATH — the main model already decided "this is
+        # a music request" and extracted what to search for.
+        text = query_hint.strip()
+        if not text:
+            return None
+        track_count = _local_track_count(message.clean_content)
+        # 🌸 If the literal hint finds nothing, the rewriter below gets
+        # the user's ORIGINAL words (vague asks like "something chill"
+        # carry more signal there than in a one-word hint).
+        rewrite_source = message.clean_content.strip() or text
+    else:
+        text = message.clean_content.strip()
+        if not text:
+            return None
 
-    # 🌸 Same zero-token-gate-then-classify shape as the server_hint /
-    # classify_server_query pairing in groq_service.py — MUSIC_INTENT_PATTERN
-    # is the free local pre-filter, classify_music_intent is the one
-    # paid Groq call, only spent when the pre-filter already thinks
-    # this MIGHT be music-related.
-    if not MUSIC_INTENT_PATTERN.search(text):
-        return None
+        # 🌸 Same zero-token-gate-then-classify shape as the server_hint /
+        # classify_server_query pairing in groq_service.py — MUSIC_INTENT_PATTERN
+        # is the free local pre-filter, classify_music_intent is the one
+        # paid Groq call, only spent when the pre-filter already thinks
+        # this MIGHT be music-related.
+        if not MUSIC_INTENT_PATTERN.search(text):
+            return None
 
-    wants_music = await music_service.classify_music_intent(text)
-    if not wants_music:
-        return None
+        wants_music = await music_service.classify_music_intent(text)
+        if not wants_music:
+            return None
 
-    # 🌸 How many tracks to show — explicit user number ("give me 10
-    # songs") wins, otherwise the AI picks a sensible amount based on
-    # phrasing (single song vs "a few" vs "a playlist"). Always clamped
-    # to [1, MAX_SUGGESTED_TRACKS] inside decide_track_count itself.
-    track_count = await music_service.decide_track_count(text)
+        # 🌸 How many tracks to show — explicit user number ("give me 10
+        # songs") wins, otherwise the AI picks a sensible amount based on
+        # phrasing (single song vs "a few" vs "a playlist"). Always clamped
+        # to [1, MAX_SUGGESTED_TRACKS] inside decide_track_count itself.
+        track_count = await music_service.decide_track_count(text)
+        rewrite_source = text
 
     # 🌸 Try the raw message as a literal ytmusicapi search first — the
     # common case (a real title/artist named) is handled here with no
@@ -978,7 +1023,7 @@ async def handle_music_request(message: "discord.Message", guild_id: int, shared
     # than a hallucinated result.
     result = await music_service.suggest(text, limit=track_count)
     if not result["results"]:
-        rewritten_query = await music_service.rewrite_search_query(text)
+        rewritten_query = await music_service.rewrite_search_query(rewrite_source)
         if rewritten_query:
             result = await music_service.suggest(rewritten_query, limit=track_count)
 

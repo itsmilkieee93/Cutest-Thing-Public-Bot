@@ -9,6 +9,14 @@ sibling function takes `self` explicitly and is exposed as a bound
 method on GroqService, so nothing outside this package needs to know
 the split happened).
 
+🌸 TOOL-CALLING OVERHAUL: the upfront classify_user_intent call (the
+QUERY_STAFF short-circuit) is switched off by LEGACY_INTENT_CLASSIFIER
+below — intent is now decided by the main model itself via the custom
+tools registered in engine/tools.py, in the same pass that writes the
+reply. get_ai_response takes the discord `message` (+ `allow_tools`) and
+hands them to the completion loop so tool handlers can post back to the
+channel.
+
 groq_ai.py re-exports GroqService from here so `from groq_ai import
 GroqService` keeps working unchanged for every existing caller/test.
 """
@@ -44,6 +52,13 @@ from engine import prompt as _prompt_mod
 from engine import memory_window as _memory_window_mod
 from engine import completion as _completion_mod
 from engine.dm_notice import generate_dm_notice as _generate_dm_notice
+
+# 🌸 False = the old "separate cheap AI call guesses an intent label before
+# the real chat call" path (classify_user_intent → QUERY_STAFF) is OFF.
+# That call cost an extra Groq request on EVERY guild message. Flip to True
+# only to restore the staff-list short-circuit until it gets a tool of its
+# own (get_staff_context_string is still the data source).
+LEGACY_INTENT_CLASSIFIER = False
 
 
 class GroqService:
@@ -100,7 +115,53 @@ class GroqService:
         # from MODEL_POOL via random.choice; this is just the last-resort
         # default if an explicit model_id is ever passed as None/empty.
         self.default_model = "openai/gpt-oss-120b"
+
+        # 🌸 Tool-call cards (image embeds, music views) queued by
+        # engine/tools.py, keyed by the triggering message id. They post
+        # AFTER the text reply — see flush_tool_sends.
+        self._pending_tool_sends = {}
         print(f"🌸 Groq priority-reply online with {len(self.api_keys)} hearts (API Keys)!")
+
+    async def flush_tool_sends(self, message, text: str | None = None) -> bool:
+        """🌸 Posts any media/music cards the tool calls queued for
+        `message`.
+
+        When `text` is provided and there are queued cards, the text is
+        sent first (so it appears above the card(s)) and this method
+        returns True — the caller should NOT send a second reply.
+        When there is nothing queued, returns False so the caller can
+        send the text itself as a normal reply.
+
+        Idempotent — pops the queue — and one failed send never blocks
+        the rest. The bare call in the `finally` block still works.
+        """
+        pending = self._pending_tool_sends.pop(message.id, [])
+        if not pending:
+            return False
+
+        # 🌸 Text was given and cards are waiting: send the text first
+        # so it sits above the card(s), then flush the queued sends.
+        # Returns True so the caller skips its own message.reply.
+        if text:
+            try:
+                await message.reply(
+                    content=text[:2000],
+                    mention_author=True,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, roles=False, users=False, replied_user=True
+                    ),
+                    suppress_embeds=False,
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to send text with tool cards ({type(e).__name__}): {e}")
+
+        for send in pending:
+            try:
+                await send()
+            except Exception as e:
+                print(f"⚠️ Failed to post queued tool result ({type(e).__name__}): {e}")
+
+        return bool(text)
 
     def _load_keys(self, path):
         try:
@@ -193,7 +254,7 @@ class GroqService:
     #      all live INSIDE the completion loop — see contract notes in
     #      engine/completion.py; get_ai_response never inlines them.)
     # ------------------------------------------------------------------
-    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, global_name: str = None, guild_nickname: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None, tone_hint: str = "") -> str | None:
+    async def get_ai_response(self, prompt: str, username: str, user_id: int, display_name: str = None, global_name: str = None, guild_nickname: str = None, model_id: str = None, react_allowed: bool = False, dm_requested: bool = False, guild=None, channel=None, recent_react_emoji: list[str] = None, shared=None, message_id: int = None, reply_to_message_id: int = None, reply_to_message_text: str = None, tone_hint: str = "", message: "discord.Message | None" = None, allow_tools: bool = True) -> str | None:
         """
         Runs the (blocking) Groq SDK call in a worker thread so it never
         stalls the bot's event loop. Loads this user's saved chat history
@@ -264,6 +325,15 @@ class GroqService:
         tone nudge (upset/stressed/angry/excited) or, for a detected
         crisis, a full override telling the model to drop the slang
         persona entirely and respond with genuine care instead.
+
+        🌸 TOOL CALLING: `message` is the incoming discord.Message — the
+        custom tool handlers (math / media / music / role / member lookup,
+        engine/tools.py) need it to send embeds and cards back to the
+        channel. With message=None no tools are attached and this behaves
+        like a plain chat completion. `allow_tools=False` turns tools off
+        for this one reply — groq_service.py passes it for crisis messages
+        so a possible cry for help can never be derailed into "here's a
+        cartoon pic" (the old interceptor chain's crisis bypass, kept).
         """
         if not self.client:
             return None
@@ -300,7 +370,7 @@ class GroqService:
         # callers of classify_user_intent that don't go through
         # groq_service.py's flow can still detect it), but the actual
         # role-query routing lives in exactly one place: groq_service.py.
-        if guild is not None:
+        if LEGACY_INTENT_CLASSIFIER and guild is not None:
             intent_label = await self.classify_user_intent(prompt)
             if intent_label == "QUERY_STAFF":
                 staff_context = await shared.get_staff_context_string(guild.id) if shared else ""
@@ -317,6 +387,7 @@ class GroqService:
         # _wants_web_search / Exa-first order this preserves.
         model_to_use, exa_context, is_compound_call = await _prompt_mod.pick_model_and_search(
             self, prompt, username, model_id,
+            tools_possible=(allow_tools and message is not None),
         )
 
         # 🌸 Build the full system prompt (personality, react/DM/identity
@@ -372,4 +443,7 @@ class GroqService:
             message_id=message_id,
             guild_id=guild_id,
             dm_channel_id=dm_channel_id,
+            message=message,
+            shared_ctx=shared,
+            allow_tools=allow_tools,
         )

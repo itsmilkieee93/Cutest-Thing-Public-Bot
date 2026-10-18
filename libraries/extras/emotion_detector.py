@@ -310,3 +310,49 @@ async def mood_reaction_scope(message, result: EmotionResult, *, remove_on_exit:
         if remove_on_exit:
             with contextlib.suppress(Exception):
                 await message.remove_reaction(emoji, message.guild.me if message.guild else message.channel.me)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 🌸 TOOL-CALLING path (`react_to_mood` tool, engine/tools.py).
+#
+# classify_mood() above is an upfront AI call that ran on EVERY message
+# just to produce a tone hint + an optional emoji. With tool calling the
+# MAIN model reads the message itself and calls react_to_mood only when a
+# mood is clearly expressed — the tone hint comes back as the TOOL RESULT,
+# so it still shapes the reply exactly like the old prompt-injected hint.
+# check_crisis_signals() is deliberately untouched: crisis detection stays
+# a deterministic regex that never depends on a model.
+# ─────────────────────────────────────────────────────────────────
+
+_TOOL_MOODS = {
+    "upset": Mood.UPSET, "sad": Mood.UPSET, "down": Mood.UPSET,
+    "stressed": Mood.STRESSED, "anxious": Mood.STRESSED, "overwhelmed": Mood.STRESSED,
+    "excited": Mood.EXCITED, "happy": Mood.EXCITED, "hyped": Mood.EXCITED,
+    "angry": Mood.ANGRY, "mad": Mood.ANGRY, "frustrated": Mood.ANGRY,
+}
+
+
+async def react_to_mood_tool(message, mood: str) -> str:
+    """🌸 Handler for the `react_to_mood` tool. Adds the mood emoji to the
+    user's original message (apply_mood_reaction) and returns the tone
+    guidance for the model to follow in its reply, as a plain string.
+    Never raises (apply_mood_reaction already swallows permission /
+    rate-limit errors).
+
+    Belt-and-suspenders: the tool is never offered on crisis turns
+    (groq_service passes allow_tools=False), but if the message text
+    still trips check_crisis_signals this refuses to react and returns
+    CRISIS_RESPONSE_NOTE instead — crisis always wins."""
+    if check_crisis_signals(getattr(message, "content", "") or ""):
+        return CRISIS_RESPONSE_NOTE
+
+    result_mood = _TOOL_MOODS.get((mood or "").strip().lower())
+    if result_mood is None:
+        return "No mood reaction needed — just reply normally."
+
+    result = EmotionResult(mood=result_mood, is_crisis=False, confidence=0.9)
+    await apply_mood_reaction(message, result)
+    return (
+        "Reaction added to the user's message. Tone guidance for your reply: "
+        f"{get_tone_hint(result)}"
+    )

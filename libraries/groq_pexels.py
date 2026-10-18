@@ -26,55 +26,7 @@ Design:
       * video  -> Pexels /videos/search
       * vector -> Pixabay ?image_type=vector
       * cartoon (illustration/clipart/drawing/sketch/animated) ->
-        Pixabay ?image_type=illustration
-        
-  (2026 update: video results went BACK to a plain str — a bare .mp4
-  CDN link, no embed wrapper, no caption. Discord's own crawler renders
-  a native inline video player for a bare link; wrapping it in a
-  discord.Embed just produces a broken/blank image box since embeds
-  don't support a true playable video field. See _build_video_reply().)
-  - 45% of the time (CAPTION_CHANCE), a short cute one-liner from a second
-    quick Groq call becomes the embed's description. Photo/vector/
-    cartoon only — video has no caption at all now.
-  - Photo (Pexels) / vector / cartoon (Pixabay) results are returned as a
-    discord.Embed — set_image() (no raw link text visible, unlike a
-    bare-URL reply where Discord shows the link text above its own
-    auto-generated embed). Both providers now get Discord-style linked
-    attribution: embed.title links to the original post (Pexels photo
-    page / Pixabay pageURL) and embed.set_author() links the
-    photographer's/uploader's name to their profile, with an avatar icon
-    when the provider has one (Pixabay only — Pexels has no avatar
-    field). Pexels photos additionally use avg_color as the embed's
-    accent color instead of the flat kawaii pink.
-  - Video results are a bare str (the direct .mp4 link) — see
-    _build_video_reply().
-  - Pexels: photo["src"]["large2x"] for the image, photo["url"] for the
-    post link, photo["photographer"]/["photographer_url"] for the
-    author byline, photo["avg_color"] for the embed accent color, and a
-    direct .mp4 video_files link for videos. Pixabay: hit["webformatURL"]
-    for the image (falling back to hit["largeImageURL"]/["vectorURL"]),
-    hit["pageURL"] for the post link, hit["user"]/["user_id"] for the
-    author byline (profile URL is built manually — Pixabay doesn't
-    return one), hit["userImageURL"] for the author avatar.
-  - Returns None if classification says "not a media request", the
-    relevant API key is missing, the request fails, or nothing is found —
-    caller falls through to the next interceptor / Groq's full reply as
-    normal. Otherwise returns a discord.Embed (photo/vector/cartoon) or a
-    bare str (video) — bot_service.py's reply site must check
-    isinstance(intercepted, discord.Embed) to decide between
-    message.reply(embed=...) and message.reply(content=...).
-
-Pixabay notes:
-  - Auth is a `key` query param, NOT a header (different from Pexels).
-  - image_type accepts "photo", "illustration", "vector", "all".
-  - Hotlinking Pixabay URLs long-term isn't allowed per their ToS, but
-    "temporarily displaying search results" is explicitly permitted —
-    which is exactly what an ephemeral Discord embed is, so this is fine.
-  - webformatURL (max 640px) is available on the free tier and is
-    Pixabay's own recommended size for temporary/hotlinked display — it's
-    preferred here for embed reliability. vectorURL / fullHDURL /
-    imageURL require an approved "full API access" account and are only
-    used as a fallback if webformatURL is somehow missing from a hit.
+        Pixabay ?image_type=illustration        
 """
 
 import os
@@ -87,6 +39,23 @@ import asyncio
 import aiohttp
 import discord
 from groq import Groq
+
+# 🌸 Guarded so a missing/broken nekosbest install can NEVER stop the bot
+# from booting — the anime path just reports "unavailable" and tools.py
+# falls through to Pixabay. The stub exceptions keep the `except` clauses
+# below valid when the import fails.
+try:
+    from nekosbest import Client as NekosBestClient, APIError, NotFound
+    _NEKOSBEST_OK = True
+except ImportError:
+    NekosBestClient = None
+    _NEKOSBEST_OK = False
+
+    class APIError(Exception):
+        pass
+
+    class NotFound(Exception):
+        pass
 
 # 🌸 key_config.py lives at auth/key_config.py, gitignored — see generate_key_config.py.
 if "auth" not in sys.path:
@@ -500,9 +469,29 @@ async def _get_pexels_avatar_url(photographer_id: int | None, profile_url: str |
 
 # ── Single entry point: classify once, dispatch to the right API ──────────
 
-async def handle_media_request(message, guild_id: int, shared) -> discord.Embed | str | None:
+def _clean_media_query_hint(query: str) -> str:
+    """🌸 Same defensive cleanup _classify_media_request applies to the
+    classifier's query (strip quotes, lowercase, drop a leading article),
+    reused for the tool-call path where the MAIN chat model supplies the
+    query instead. Unlike the classifier path it doesn't reject long
+    queries — it trims to the first 8 words, since a tool call must still
+    return something useful rather than silently going "not a media
+    request"."""
+    query = (query or "").strip().strip('"').strip("'").lower()
+    query = re.sub(r"^(?:a|an|the)\s+", "", query).strip()
+    return " ".join(query.split()[:8])
+
+
+async def handle_media_request(
+    message,
+    guild_id: int,
+    shared,
+    query_hint: str | None = None,
+    kind_hint: str | None = None,
+) -> discord.Embed | str | None:
     """
     🌸 AI-CLASSIFIED MEDIA HANDLER — the single interceptor entry point.
+
     Replaces the old handle_pexels_photo_request / handle_pexels_video_
     request / handle_pixabay_style_request trio with one classifier call
     that decides intent + kind + query, then dispatches to Pexels (photo/
@@ -520,13 +509,33 @@ async def handle_media_request(message, guild_id: int, shared) -> discord.Embed 
     bot_service.py's reply site must check isinstance(result,
     discord.Embed) to know whether to call message.reply(embed=...) or
     message.reply(content=...) (str case, video).
-    """
-    classification = await _classify_media_request(message.content)
-    if not classification or not classification["is_media_request"]:
-        return None
 
-    kind = classification["kind"]
-    query = classification["query"]
+    🌸 `query_hint` / `kind_hint` (new): the `search_visual_media` tool's
+    JSON arguments, extracted by the main chat model in the same pass
+    that decided to call the tool. When `query_hint` is given the
+    _classify_media_request Groq call is skipped entirely; `kind_hint`
+    (photo/video/vector/cartoon, defaults to "photo" if missing/invalid)
+    picks the provider. `message` is still used for logging and the
+    anime-regex safety net. Leave both None for the legacy behavior of
+    classifying message.content.
+    """
+    if query_hint is not None:
+        query = _clean_media_query_hint(query_hint)
+        if not query:
+            return None
+        kind = kind_hint if kind_hint in VALID_KINDS else "photo"
+        # 🌸 Same belt-and-suspenders as _classify_media_request: a real
+        # photo is the wrong answer to "anime image" no matter what kind
+        # the model picked.
+        if kind == "photo" and ANIME_STYLE_PATTERN.search(f"{message.content} {query}"):
+            kind = "cartoon"
+    else:
+        classification = await _classify_media_request(message.content)
+        if not classification or not classification["is_media_request"]:
+            return None
+
+        kind = classification["kind"]
+        query = classification["query"]
 
     if kind == "video":
         return await _fetch_pexels_video(message, guild_id, query)
@@ -852,3 +861,130 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
         author_avatar_url=credit_avatar_url,
         provider="Pixabay",
     )
+
+
+# ── Nekos providers (nekos.best + nekos.life) ───────────────────────────
+# 🌸 The endpoints, category detection, fetchers and the pink embed live
+# here. The dice roll (50/30/20) and the Pixabay fallback decision stay in
+# engine/tools.py::_exec_media.
+
+NEKOS_EMBED_COLOR = 0xFFB6D9
+NEKOS_TIMEOUT_SECONDS = 6
+
+NEKOS_LIFE_API_BASE = "https://nekos.life/api/v2/img/"
+
+# Footer credit per provider: (label, favicon). Swap a favicon URL here if
+# Discord shows no icon — it's the only place they're defined.
+NEKOS_PROVIDERS = {
+    "best": ("nekos.best", "https://nekos.best/favicon.ico"),
+    "life": ("nekos.life", "https://nekos.life/favicon.ico"),
+}
+
+# Sub-categories in detection priority order (English + the Indonesian words
+# users commonly type). Anything unmatched → "neko". Every name below exists
+# on BOTH nekos.best and nekos.life.
+_NEKOS_CATEGORY_PATTERNS = (
+    ("hug",    re.compile(r"\b(hug|hugs|hugging|peluk|pelukan)\b", re.IGNORECASE)),
+    ("pat",    re.compile(r"\b(pat|pats|patting|headpat|usap|elus)\b", re.IGNORECASE)),
+    ("slap",   re.compile(r"\b(slap|slaps|slapping|tampar)\b", re.IGNORECASE)),
+    ("cuddle", re.compile(r"\b(cuddle|cuddles|cuddling|snuggle)\b", re.IGNORECASE)),
+    ("kiss",   re.compile(r"\b(kiss|kisses|kissing|cium)\b", re.IGNORECASE)),
+    ("poke",   re.compile(r"\b(poke|pokes|poking|colek)\b", re.IGNORECASE)),
+    ("tickle", re.compile(r"\b(tickle|tickles|tickling|gelitik)\b", re.IGNORECASE)),
+    ("feed",   re.compile(r"\b(feed|feeding|suapin|suap)\b", re.IGNORECASE)),
+    ("smug",   re.compile(r"\b(smug)\b", re.IGNORECASE)),
+    ("waifu",  re.compile(r"\b(waifu)\b", re.IGNORECASE)),
+)
+
+
+def pick_nekos_category(query: str, message_text: str) -> str:
+    """Default 'neko'; switch if an interaction word (hug/pat/slap/…) shows
+    up in the query or the user's message."""
+    haystack = f"{query} {message_text}"
+    for category, pattern in _NEKOS_CATEGORY_PATTERNS:
+        if pattern.search(haystack):
+            return category
+    return "neko"
+
+
+async def fetch_nekos_url(category: str) -> str | None:
+    """nekos.life: GET /api/v2/img/<category> → image URL, or None on ANY
+    failure (timeout, non-200, bad JSON, unknown category). Never raises."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=NEKOS_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{NEKOS_LIFE_API_BASE}{category}") as resp:
+                if resp.status != 200:
+                    logger.warning(f"Nekos.life HTTP {resp.status} (category={category})")
+                    return None
+                data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning(f"Nekos.life request failed: {type(e).__name__}: {e}")
+        return None
+
+    url = data.get("url") if isinstance(data, dict) else None
+    if isinstance(url, str) and url.startswith("http"):
+        return url
+    return None
+
+
+async def _fetch_nekosbest(category: str) -> tuple[str, str | None] | None:
+    """nekos.best via the official async `nekosbest` library (aiohttp
+    inside, so it never blocks the event loop). Returns (image_url, credit)
+    or None on ANY failure. Never raises."""
+    if not _NEKOSBEST_OK:
+        logger.warning("nekosbest is not installed (pip install -U nekosbest)")
+        return None
+    try:
+        async with NekosBestClient() as client:
+            result = await asyncio.wait_for(
+                client.get_image(category), timeout=NEKOS_TIMEOUT_SECONDS
+            )
+    except NotFound:
+        logger.warning(f"nekos.best: category '{category}' not found")
+        return None
+    except APIError as e:
+        logger.warning(f"nekos.best API error (category={category}): {e}")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(f"nekos.best timed out after {NEKOS_TIMEOUT_SECONDS}s (category={category})")
+        return None
+    except Exception as e:  # lib's own ClientError, DNS/connection resets, etc.
+        logger.warning(f"nekos.best request failed: {type(e).__name__}: {e}")
+        return None
+
+    url = getattr(result, "url", None)
+    if not (isinstance(url, str) and url.startswith("http")):
+        return None
+    # Still images carry artist_name; GIF categories carry anime_name.
+    credit = getattr(result, "artist_name", None) or getattr(result, "anime_name", None)
+    return url, (str(credit) if credit else None)
+
+
+async def fetch_nekos_embed(provider: str, category: str) -> discord.Embed | None:
+    """🌸 The handler tools.py calls once its dice roll picks an anime API.
+
+    provider: "best" (nekos.best library) or "life" (nekos.life REST).
+    Returns a pink discord.Embed with the image and a footer credit +
+    favicon, or None if the provider failed / timed out / returned nothing
+    — the caller then falls back to Pixabay. Never raises.
+    """
+    if provider not in NEKOS_PROVIDERS:
+        return None
+    label, favicon = NEKOS_PROVIDERS[provider]
+
+    credit = None
+    if provider == "best":
+        found = await _fetch_nekosbest(category)
+        image_url, credit = found if found else (None, None)
+    else:
+        image_url = await fetch_nekos_url(category)
+
+    if not image_url:
+        return None
+
+    embed = discord.Embed(color=NEKOS_EMBED_COLOR)
+    embed.set_image(url=image_url)
+    footer = f"via {label}" + (f" · {credit}" if credit else "")
+    embed.set_footer(text=footer[:200], icon_url=favicon)
+    return embed

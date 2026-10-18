@@ -148,6 +148,70 @@ async def maybe_rephrase_db_result(raw_text: str, user_message: str, groq_client
         return raw_text
 
 
+# 🌸 SNOWFLAKE / MENTION INPUT — every server query below that takes a
+# person or a role now also accepts the way Discord itself writes them:
+#   user:  <@123456789012345678>  <@!123456789012345678>  or the bare ID
+#   role:  <@&123456789012345678>                         or the bare ID
+# Real Discord IDs are 17-20 digits (see decode_snowflake in
+# groq_dm_instruct.py), so a bare number only counts as an ID in that
+# range — a 4-digit "name" like "2024" is still looked up as a name.
+_USER_MENTION_ID = re.compile(r"^<@!?(\d{17,20})>$")
+_ROLE_MENTION_ID = re.compile(r"^<@&(\d{17,20})>$")
+_BARE_ID = re.compile(r"^\d{17,20}$")
+
+
+def parse_user_id(text: str | None) -> int | None:
+    """🌸 <@ID>, <@!ID> or a bare 17-20 digit ID → int, else None."""
+    text = (text or "").strip()
+    m = _USER_MENTION_ID.match(text)
+    if m:
+        return int(m.group(1))
+    if _BARE_ID.match(text):
+        return int(text)
+    return None
+
+
+def parse_role_id(text: str | None) -> int | None:
+    """🌸 <@&ID> or a bare 17-20 digit ID → int, else None."""
+    text = (text or "").strip()
+    m = _ROLE_MENTION_ID.match(text)
+    if m:
+        return int(m.group(1))
+    if _BARE_ID.match(text):
+        return int(text)
+    return None
+
+
+def member_mention(member: dict) -> str:
+    """🌸 Discord mention markup for a matched member dict — renders as a
+    clickable @name chip. groq_service sends replies with users=False in
+    its AllowedMentions, so it never actually pings anyone."""
+    return f"<@{member['id']}>"
+
+
+async def _resolve_members(shared, guild_id: int, target: str) -> list[dict]:
+    """🌸 One resolver for "who is this?" — WHO a person is comes from
+    members.db (username / global name / per-server name + avatar/banner
+    links); WHAT ROLES they have still comes from roles.db (see
+    handle_user_role_query, which resolves the person here and then calls
+    shared.get_member_roles by ID). An ID/mention goes through the exact
+    ID lookup, anything else through the name lookup (exact → substring),
+    so every handler gets the same 0 / 1 / 2+ contract either way.
+
+    Falls back to roles.db's member table when members.db isn't usable yet
+    (not generated until the first guild sync, or only the bot was
+    visible) so a fresh install never answers "no such member" just
+    because the new file is missing."""
+    user_id = parse_user_id(target)
+    if await shared.members_db_ready(guild_id):
+        if user_id is not None:
+            return await shared.find_member_profile_by_id(guild_id, user_id)
+        return await shared.find_member_profile_by_name(guild_id, target)
+    if user_id is not None:
+        return await shared.find_member_by_id(guild_id, user_id)
+    return await shared.find_member_by_name(guild_id, target)
+
+
 async def handle_role_query(message: discord.Message, guild_id: int, shared, skip_pattern_check: bool = False, role_name_hint: str | None = None, groq_client=None) -> str | None:
     """
     🌸 REGEX/AI ROLE QUERY HANDLER — intercepts "who has the X role",
@@ -201,8 +265,24 @@ async def handle_role_query(message: discord.Message, guild_id: int, shared, ski
             return None
 
     try:
+        # 🌸 Role given as an ID / <@&ID> mention → resolve it to the real
+        # role first (exact, can't be confused by duplicate names).
+        role_id = parse_role_id(role_name_raw)
+        if role_id is not None:
+            all_roles = await shared.list_all_roles(guild_id)
+            hit = next((r for r in all_roles if r["id"] == role_id), None)
+            if hit is None:
+                return f"❌ No role with the ID {role_id} exists on this server."
+            role_name_raw = hit["name"]
+            members = await shared.get_members_with_role(guild_id, role_name_raw, role_id=role_id)
+            if not members:
+                return f"❌ Nobody has the **{role_name_raw}** role yet."
+        else:
+            members = None
+
         # Try exact match first
-        members = await shared.get_members_with_role(guild_id, role_name_raw)
+        if members is None:
+            members = await shared.get_members_with_role(guild_id, role_name_raw)
         
         # If no exact match, try partial match (contains)
         if not members:
@@ -229,8 +309,17 @@ async def handle_role_query(message: discord.Message, guild_id: int, shared, ski
         member_names = [m.get("display_name") or m.get("username") for m in members[:MAX_NAMES_SHOWN]]
         more_count = len(members) - MAX_NAMES_SHOWN
         more_text = f" +{more_count} more" if more_count > 0 else ""
+
+        # 🌸 Prefer clickable <@ID> mentions over plain names — but each is
+        # ~22 chars vs ~10 for a name, so 100 mentions would blow Discord's
+        # 2000-char limit. Use them when the list fits a safe budget,
+        # otherwise fall back to the plain-name list above.
+        mention_list = ", ".join(member_mention(m) for m in members[:MAX_NAMES_SHOWN])
+        if len(mention_list) <= 1400:
+            member_names = None  # sentinel: use mention_list below
         
-        raw_result = f"**{role_name_raw}** ({len(members)}): {', '.join(member_names)}{more_text} 🌸"
+        shown = mention_list if member_names is None else ", ".join(member_names)
+        raw_result = f"**{role_name_raw}** ({len(members)}): {shown}{more_text} 🌸"
 
         # 🌸 Strategy roll — see maybe_rephrase_db_result docstring above.
         # Most calls return raw_result unchanged (same instant/free path
@@ -292,7 +381,7 @@ async def handle_user_role_query(message: discord.Message, guild_id: int, shared
         # already does exact-then-substring matching and returns []/1/2+
         # for not-found/resolved/ambiguous respectively.
         try:
-            matches = await shared.find_member_by_name(guild_id, name_hint)
+            matches = await _resolve_members(shared, guild_id, name_hint)
         except Exception as e:
             print(f"⚠️ User-role query member lookup error: {e}")
             return None
@@ -324,11 +413,12 @@ async def handle_user_role_query(message: discord.Message, guild_id: int, shared
                 has_role = True
                 role_name_raw = partial_matches[0]["name"]
 
-        display = target_display or str(target_id)
+        # 🌸 Clickable <@ID> mention instead of plain bold name.
+        display = f"<@{target_id}>"
         if has_role:
-            raw_result = f"✅ Yep, **{display}** has the **{role_name_raw}** role! 🌸"
+            raw_result = f"✅ Yep, {display} has the **{role_name_raw}** role! 🌸"
         else:
-            raw_result = f"❌ Nope, **{display}** doesn't have the **{role_name_raw}** role."
+            raw_result = f"❌ Nope, {display} doesn't have the **{role_name_raw}** role."
 
         return await maybe_rephrase_db_result(raw_result, message.content, groq_client, message.author.name)
     except Exception as e:
@@ -427,9 +517,11 @@ async def handle_member_lookup_query(message: discord.Message, guild_id: int, sh
             "display_name": target.display_name, "bot": target.bot,
         }]
     elif name_hint and name_hint.strip().lower() not in _MEMBER_LOOKUP_PRONOUN_STOPWORDS:
+        # 🌸 name_hint may be a name, a username, a bare Discord ID or a
+        # <@ID> mention the model extracted — _resolve_members handles all.
         target_name = name_hint.strip()
         try:
-            matches = await shared.find_member_by_name(guild_id, target_name)
+            matches = await _resolve_members(shared, guild_id, target_name)
         except Exception as e:
             print(f"⚠️ Member lookup query error: {e}")
             return None
@@ -447,23 +539,26 @@ async def handle_member_lookup_query(message: discord.Message, guild_id: int, sh
             return None
 
         try:
-            matches = await shared.find_member_by_name(guild_id, target_name)
+            matches = await _resolve_members(shared, guild_id, target_name)
         except Exception as e:
             print(f"⚠️ Member lookup query error: {e}")
             return None
 
     try:
         if not matches:
-            raw_result = f"❌ Nope, I don't see anyone named **{target_name}** on this server."
+            if parse_user_id(target_name) is not None:
+                raw_result = f"❌ Nope, I don't see anyone with the ID **{parse_user_id(target_name)}** on this server."
+            else:
+                raw_result = f"❌ Nope, I don't see anyone named **{target_name}** on this server."
         elif len(matches) == 1:
-            m = matches[0]
-            display = m.get("display_name") or m.get("username")
-            raw_result = f"✅ Yep, **{display}** is here on this server! 🌸"
+            # 🌸 <@ID> mention → renders as a clickable @name chip.
+            raw_result = f"✅ Yep, {member_mention(matches[0])} is here on this server! 🌸"
         else:
             # 🌸 2+ ambiguous matches — same convention as
             # handle_user_role_query: don't guess, surface the
-            # candidates instead of a confident-sounding wrong answer.
-            names = ", ".join(m.get("display_name") or m.get("username") for m in matches[:10])
+            # candidates (mention + @username to tell them apart)
+            # instead of a confident-sounding wrong answer.
+            names = ", ".join(f"{member_mention(m)} (@{m.get('username')})" for m in matches[:10])
             raw_result = f"Found a few people close to that — {names}. Which one did you mean?"
 
         return await maybe_rephrase_db_result(raw_result, message.content, groq_client, message.author.name)

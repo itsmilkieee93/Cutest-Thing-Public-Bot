@@ -26,6 +26,56 @@ MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024  # 🌸 8 MB cap on avatar/banner uploads
 BIO_MAX_LENGTH = 190  # 🌸 Discord's member bio length cap
 DB_PATH_TEMPLATE = "interactions/persona/{guild_id}/custom_{guild_id}.db"  # 🌸 one SQLite file per guild
 
+# 🌸 DM personality overrides — one db file PER DM CHANNEL, matching the
+# per-guild pattern exactly (each guild gets its own file; each DM
+# channel gets its own file too). Keyed by channel_id, not user_id —
+# in a 1:1 bot DM these end up being the same person either way, but
+# channel_id is the correct scope key since it mirrors guild_id's role
+# (the container the override belongs to), not who's inside it.
+DM_DB_PATH_TEMPLATE = "interactions/persona/dm/{channel_id}/dm_{channel_id}.db"
+
+# 🌸 PRESET PERSONAS — {key: (label, instructions)}. `instructions` gets
+# dropped straight into the system prompt in place of the default
+# PERSONALITY_TEMPLATE body (personality.py handles the actual splice).
+# Keep each one self-contained (doesn't reference "the template") since
+# it fully REPLACES the default rather than layering on top of it.
+PRESET_PERSONAS: dict[str, tuple[str, str]] = {
+    "kawaii": (
+        "🌸 Kawaii (default)",
+        "keep replies short and casual, like texting a friend. sprinkle in "
+        "kaomoji and cutesy energy (☆ﾟ.*･｡ﾟ vibes) without overdoing it. "
+        "sweet and a little bubbly, but still has real opinions instead of "
+        "just being agreeable.",
+    ),
+    "tsundere": (
+        "😤 Tsundere",
+        "act a little cold/annoyed on the surface but obviously still cares — "
+        "classic 'it's not like I wanted to help you or anything' energy. "
+        "short, blunt replies, occasional huffing (hmph), but comes through "
+        "for people anyway. never actually mean.",
+    ),
+    "chill": (
+        "😎 Chill",
+        "laid-back, low-key, unbothered tone. short replies, dry humor, "
+        "doesn't get worked up about much. talks like a chill friend who's "
+        "seen it all, not a hype machine.",
+    ),
+    "genki": (
+        "🎉 Genki (hyper)",
+        "big energy, enthusiastic, lots of exclamation points and excitement "
+        "about everything. hypes people up, celebrates small wins loudly, "
+        "very 'let's gooo' energy. still keep individual replies short.",
+    ),
+    "calm": (
+        "🕊️ Calm & mature",
+        "soft-spoken, thoughtful, a little more formal but still warm. "
+        "takes a beat before responding, gives measured/grounded replies "
+        "instead of reacting instantly. reassuring presence, not stiff or "
+        "corporate.",
+    ),
+}
+DEFAULT_PRESET_KEY = "kawaii"
+
 # 🌸 Font IDs 1-16, straight from the spec. Label text mirrors Discord's
 # own modal wording where known (11 = gg sans, 12 = Tempo, etc.).
 FONT_OPTIONS: list[tuple[int, str]] = [
@@ -374,24 +424,139 @@ class ConfirmResetView(ui.View):
             )
         await db.commit()
 
-        # 4. Disable buttons and confirm
-        for child in self.children:
-            child.disabled = True
-            
+        # 4. Overwrite the ORIGINAL confirm message with the success
+        # text and remove the buttons entirely (view=None) — instead of
+        # disabling them in place and sending a separate followup,
+        # which left the "are you sure?" message sitting there stale
+        # underneath a new confirmation. Matches the same fix applied
+        # to persona-set/persona-view/persona-reset below.
         if self.reset_type == "profile":
             msg = "🔄 Reset my profile (nick/avatar/banner/bio) back to global defaults! 🌸"
         else:
             msg = "🔄 Reset my Display Name Style (font/effect/colors) back to normal! ✨"
-            
-        await interaction.followup.send(msg, ephemeral=True)
+
+        await interaction.edit_original_response(content=msg, view=None)
+        self.stop()
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(content="Okay, left everything as-is! 🌸", view=None)
+        self.stop()
+
+
+class PersonaCustomTextModal(ui.Modal, title="✍️ Custom AI Personality"):
+    """🌸 Free-text modal for a fully custom personality, used by both the
+    guild (/persona-set custom) and DM (/persona-set custom) flows. The
+    caller passes an on_submit callback since what happens after differs
+    (save to guild db vs. save to DM db)."""
+
+    instructions = ui.Label(
+        text="Personality instructions",
+        description="Describe how the bot should act/talk. Replaces the default personality entirely.",
+        component=ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1500,
+            placeholder="e.g. speak like a pirate, always offer snack recommendations, never use emoji...",
+        ),
+    )
+
+    def __init__(self, on_submit_callback, current_text: str | None = None):
+        super().__init__()
+        self._on_submit_callback = on_submit_callback
+        if current_text:
+            self.instructions.component.default = current_text
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.instructions.component.value.strip()
+        await self._on_submit_callback(interaction, text)
+
+
+class PersonaPresetSelect(ui.Select):
+    """🌸 Dropdown of preset personas + a 'Custom...' entry. Shared by both
+    the guild and DM /persona-set flows via the on_pick callback."""
+
+    def __init__(self, on_pick_callback, current_preset_key: str | None):
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=key,
+                default=(key == current_preset_key),
+            )
+            for key, (label, _instructions) in PRESET_PERSONAS.items()
+        ]
+        options.append(
+            discord.SelectOption(
+                label="✍️ Custom...",
+                value="custom",
+                default=(current_preset_key == "custom"),
+                description="Write your own personality from scratch",
+            )
+        )
+        super().__init__(placeholder="Choose a personality...", options=options)
+        self._on_pick_callback = on_pick_callback
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._on_pick_callback(interaction, self.values[0])
+
+
+class PersonaPickView(ui.View):
+    """🌸 Wraps PersonaPresetSelect so /persona-set can send one message
+    with a dropdown instead of needing a subcommand per preset."""
+
+    def __init__(self, on_pick_callback, current_preset_key: str | None):
+        super().__init__(timeout=120)
+        self.add_item(PersonaPresetSelect(on_pick_callback, current_preset_key))
+
+
+class ConfirmResetPersonaView(ui.View):
+    """🌸 Same confirm/cancel shape as ConfirmResetView above, but for the
+    AI personality reset (guild or DM) instead of profile/style."""
+
+    def __init__(self, on_confirm_callback):
+        super().__init__(timeout=60)
+        self._on_confirm_callback = on_confirm_callback
+
+    @ui.button(label="Reset", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await self._on_confirm_callback(interaction)
         self.stop()
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: ui.Button):
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="Okay, left everything as-is! 🌸", view=self)
+        await interaction.response.edit_message(content="Okay, left the personality as-is! 🌸", view=self)
         self.stop()
+
+
+class PersonaEditButtonView(ui.View):
+    """🌸 Single "✏️ Edit" button shown under /persona-view's reply when
+    the current personality is custom text — opens the same modal as
+    /persona-set's "Custom..." option, pre-filled with the text pulled
+    straight from the db, so tweaking wording doesn't require going
+    back through the dropdown flow. Guild edits still enforce the
+    Moderator permission check on click (not just on the original
+    /persona-view call) since the button can sit in chat a while."""
+
+    def __init__(self, on_edit_callback, require_moderator: bool):
+        super().__init__(timeout=180)
+        self._on_edit_callback = on_edit_callback
+        self._require_moderator = require_moderator
+
+    @ui.button(label="✏️ Edit", style=discord.ButtonStyle.secondary)
+    async def edit(self, interaction: discord.Interaction, button: ui.Button):
+        if self._require_moderator:
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not member.guild_permissions.moderate_members:
+                await interaction.response.send_message(
+                    "Nahhhh, you need **Moderator** permission (Timeout Members) to do that!!! 😭🙏",
+                    ephemeral=True,
+                )
+                return
+        await self._on_edit_callback(interaction)
 
 
 class ServerPersona(commands.Cog):
@@ -400,10 +565,13 @@ class ServerPersona(commands.Cog):
         # 🌸 One aiosqlite connection per guild, opened lazily and cached
         # here since each guild gets its own db file on disk.
         self._db_cache: dict[int, aiosqlite.Connection] = {}
+        # 🌸 One aiosqlite connection per DM CHANNEL, same shape as
+        # _db_cache above — each DM channel gets its own db file too.
+        self._dm_db_cache: dict[int, aiosqlite.Connection] = {}
 
     async def cog_load(self):
-        # 🌸 Nothing to open up front — connections are per-guild and
-        # opened on first use via _get_db().
+        # 🌸 Nothing to open up front — connections are per-guild/DM and
+        # opened on first use via _get_db()/_get_dm_db().
         pass
 
     async def cog_unload(self):
@@ -412,6 +580,9 @@ class ServerPersona(commands.Cog):
         for conn in self._db_cache.values():
             await conn.close()
         self._db_cache.clear()
+        for conn in self._dm_db_cache.values():
+            await conn.close()
+        self._dm_db_cache.clear()
 
     async def _get_db(self, guild_id: int) -> aiosqlite.Connection:
         """🌸 Returns the aiosqlite connection for this guild's own db
@@ -449,10 +620,129 @@ class ServerPersona(commands.Cog):
                 await conn.execute(f"ALTER TABLE server_bios ADD COLUMN {column} {coltype}")
             except aiosqlite.OperationalError:
                 pass  # 🌸 column already exists
+
+        # 🌸 AI personality override for this guild — separate table, same
+        # db file. preset_key is one of PRESET_PERSONAS or "custom"; when
+        # "custom", custom_text holds the actual instructions. NULL/no row
+        # means "use the default template" (personality.py's own fallback).
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_persona (
+                guild_id INTEGER PRIMARY KEY,
+                preset_key TEXT NOT NULL,
+                custom_text TEXT,
+                set_by INTEGER
+            )
+            """
+        )
         await conn.commit()
 
         self._db_cache[guild_id] = conn
         return conn
+
+    async def _get_dm_db(self, channel_id: int) -> aiosqlite.Connection:
+        """🌸 Returns the aiosqlite connection for this DM channel's own
+        db file — mirrors _get_db(guild_id) above exactly, just scoped
+        to channel_id instead of guild_id. Opens/creates it (folder +
+        table) the first time this channel is touched."""
+        if channel_id in self._dm_db_cache:
+            return self._dm_db_cache[channel_id]
+
+        db_path = DM_DB_PATH_TEMPLATE.format(channel_id=channel_id)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        conn = await aiosqlite.connect(db_path)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_ai_persona (
+                channel_id INTEGER PRIMARY KEY,
+                preset_key TEXT NOT NULL,
+                custom_text TEXT
+            )
+            """
+        )
+        await conn.commit()
+        self._dm_db_cache[channel_id] = conn
+        return conn
+
+    # ── AI personality resolve/set/reset (guild + DM) ───────────────────
+    async def get_guild_ai_persona(self, guild_id: int) -> str | None:
+        """🌸 Returns the assembled instructions text for this guild's AI
+        personality override, or None if no override is set (caller should
+        fall back to the default template). Called from personality.py."""
+        conn = await self._get_db(guild_id)
+        async with conn.execute(
+            "SELECT preset_key, custom_text FROM ai_persona WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        preset_key, custom_text = row
+        if preset_key == "custom":
+            return custom_text
+        preset = PRESET_PERSONAS.get(preset_key)
+        return preset[1] if preset else None
+
+    async def get_dm_ai_persona(self, channel_id: int) -> str | None:
+        """🌸 Same as get_guild_ai_persona but for a DM channel's own
+        override. Returns None if this channel hasn't set one."""
+        conn = await self._get_dm_db(channel_id)
+        async with conn.execute(
+            "SELECT preset_key, custom_text FROM dm_ai_persona WHERE channel_id = ?",
+            (channel_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        preset_key, custom_text = row
+        if preset_key == "custom":
+            return custom_text
+        preset = PRESET_PERSONAS.get(preset_key)
+        return preset[1] if preset else None
+
+    async def set_guild_ai_persona(
+        self, guild_id: int, set_by: int, preset_key: str, custom_text: str | None = None
+    ) -> None:
+        conn = await self._get_db(guild_id)
+        await conn.execute(
+            """
+            INSERT INTO ai_persona (guild_id, preset_key, custom_text, set_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                preset_key = excluded.preset_key,
+                custom_text = excluded.custom_text,
+                set_by = excluded.set_by
+            """,
+            (guild_id, preset_key, custom_text, set_by),
+        )
+        await conn.commit()
+
+    async def set_dm_ai_persona(
+        self, channel_id: int, preset_key: str, custom_text: str | None = None
+    ) -> None:
+        conn = await self._get_dm_db(channel_id)
+        await conn.execute(
+            """
+            INSERT INTO dm_ai_persona (channel_id, preset_key, custom_text)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                preset_key = excluded.preset_key,
+                custom_text = excluded.custom_text
+            """,
+            (channel_id, preset_key, custom_text),
+        )
+        await conn.commit()
+
+    async def reset_guild_ai_persona(self, guild_id: int) -> None:
+        conn = await self._get_db(guild_id)
+        await conn.execute("DELETE FROM ai_persona WHERE guild_id = ?", (guild_id,))
+        await conn.commit()
+
+    async def reset_dm_ai_persona(self, channel_id: int) -> None:
+        conn = await self._get_dm_db(channel_id)
+        await conn.execute("DELETE FROM dm_ai_persona WHERE channel_id = ?", (channel_id,))
+        await conn.commit()
 
     # ── low-level PATCH helper ──────────────────────────────────────────
     async def _patch_current_member(self, guild_id: int, **fields) -> dict:
@@ -596,4 +886,237 @@ class ServerPersona(commands.Cog):
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
+
+    # ── AI personality commands (guild: admin-only / DM: self-serve) ────
+    # 🌸 Same three commands work in BOTH contexts — interaction.guild is
+    # None in a DM, so each handler branches on that to decide which
+    # store (guild ai_persona table vs. dm_ai_persona table) to hit and
+    # whether to enforce the moderate_members permission check. Discord
+    # doesn't let a single @app_commands.command mix a guild-only perm
+    # check with DM availability via decorator alone, so the permission
+    # gate is done manually inside the handler instead of via
+    # @app_commands.checks.has_permissions (which would block DM usage
+    # entirely since that check assumes a guild context).
+
+    @app_commands.command(
+        name="persona-set",
+        description="🌸 Change the bot's AI personality (server admins in a server, anyone in DMs)",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
+    async def persona_set(self, interaction: discord.Interaction):
+        if interaction.guild is not None:
+            # 🌸 Guild context — admin-only, same permission bar as the
+            # other /server-persona-* commands.
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not member.guild_permissions.moderate_members:
+                await interaction.response.send_message(
+                    "Nahhhh, you need **Moderator** permission (Timeout Members) to do that!!! 😭🙏",
+                    ephemeral=True,
+                )
+                return
+
+            conn = await self._get_db(interaction.guild.id)
+            async with conn.execute(
+                "SELECT preset_key, custom_text FROM ai_persona WHERE guild_id = ?", (interaction.guild.id,)
+            ) as cur:
+                row = await cur.fetchone()
+            current_key = row[0] if row else DEFAULT_PRESET_KEY
+            current_custom_text = row[1] if row and row[0] == "custom" else None
+
+            async def on_pick(pick_interaction: discord.Interaction, preset_key: str):
+                if preset_key == "custom":
+                    async def on_custom_submit(modal_interaction: discord.Interaction, text: str):
+                        await self.set_guild_ai_persona(
+                            interaction.guild.id, modal_interaction.user.id, "custom", text
+                        )
+                        # 🌸 Overwrite the ORIGINAL "Pick a personality..."
+                        # message (via pick_interaction) with a plain
+                        # success confirmation and drop the view — same
+                        # pattern as persona-view's Edit flow and the
+                        # profile/style reset confirms, instead of
+                        # leaving the dropdown message stale underneath
+                        # a new one.
+                        await pick_interaction.edit_original_response(
+                            content="Done! Custom AI personality set for this server 🌸",
+                            view=None,
+                        )
+                        await modal_interaction.response.defer()
+
+                    # 🌸 Pre-fill with the existing custom text (if any) so
+                    # picking "Custom..." again to tweak wording EDITS it
+                    # instead of forcing a blank rewrite from scratch.
+                    await pick_interaction.response.send_modal(
+                        PersonaCustomTextModal(on_custom_submit, current_text=current_custom_text)
+                    )
+                else:
+                    await self.set_guild_ai_persona(interaction.guild.id, pick_interaction.user.id, preset_key)
+                    label = PRESET_PERSONAS[preset_key][0]
+                    await pick_interaction.response.edit_message(
+                        content=f"Done! This server's AI personality is now **{label}** 🌸", view=None
+                    )
+
+            await interaction.response.send_message(
+                "Pick a personality for this server:",
+                view=PersonaPickView(on_pick, current_key),
+                ephemeral=True,
+            )
+        else:
+            # 🌸 DM context — scoped to THIS DM channel (channel_id), not
+            # the user, so it mirrors the guild's per-guild_id scoping.
+            # In a 1:1 DM these end up the same person either way, but
+            # channel_id is the structurally correct key.
+            conn = await self._get_dm_db(interaction.channel.id)
+            async with conn.execute(
+                "SELECT preset_key, custom_text FROM dm_ai_persona WHERE channel_id = ?",
+                (interaction.channel.id,),
+            ) as cur:
+                row = await cur.fetchone()
+            current_key = row[0] if row else DEFAULT_PRESET_KEY
+            current_custom_text = row[1] if row and row[0] == "custom" else None
+            dm_channel_id = interaction.channel.id
+
+            async def on_pick(pick_interaction: discord.Interaction, preset_key: str):
+                if preset_key == "custom":
+                    async def on_custom_submit(modal_interaction: discord.Interaction, text: str):
+                        await self.set_dm_ai_persona(dm_channel_id, "custom", text)
+                        # 🌸 Same pattern as the guild branch above —
+                        # overwrite the original dropdown message with a
+                        # plain confirmation, no leftover text/view.
+                        await pick_interaction.edit_original_response(
+                            content="Done! Your custom AI personality is set for our DMs 🌸",
+                            view=None,
+                        )
+                        await modal_interaction.response.defer()
+
+                    # 🌸 Pre-fill with the existing custom text (if any) so
+                    # picking "Custom..." again to tweak wording EDITS it
+                    # instead of forcing a blank rewrite from scratch.
+                    await pick_interaction.response.send_modal(
+                        PersonaCustomTextModal(on_custom_submit, current_text=current_custom_text)
+                    )
+                else:
+                    await self.set_dm_ai_persona(dm_channel_id, preset_key)
+                    label = PRESET_PERSONAS[preset_key][0]
+                    await pick_interaction.response.edit_message(
+                        content=f"Done! I'll be **{label}** in our DMs now 🌸", view=None
+                    )
+
+            await interaction.response.send_message(
+                "Pick a personality for our DMs:",
+                view=PersonaPickView(on_pick, current_key),
+                ephemeral=True,
+            )
+
+    @app_commands.command(
+        name="persona-view",
+        description="🌸 See the current AI personality (this server, or your DM setting)",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
+    async def persona_view(self, interaction: discord.Interaction):
+        is_guild = interaction.guild is not None
+        if is_guild:
+            scope_id = interaction.guild.id
+            conn = await self._get_db(scope_id)
+            async with conn.execute(
+                "SELECT preset_key, custom_text FROM ai_persona WHERE guild_id = ?",
+                (scope_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            scope = "this server's"
+        else:
+            scope_id = interaction.channel.id
+            conn = await self._get_dm_db(scope_id)
+            async with conn.execute(
+                "SELECT preset_key, custom_text FROM dm_ai_persona WHERE channel_id = ?",
+                (scope_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            scope = "your DM"
+
+        view = None
+        if row is None:
+            msg = f"{scope.capitalize()} AI personality is currently the **default** 🌸"
+        else:
+            preset_key, custom_text = row
+            if preset_key == "custom":
+                msg = f"{scope.capitalize()} AI personality is **custom**:\n> {custom_text}"
+
+                # 🌸 Custom text exists — offer a one-tap Edit button that
+                # opens the SAME modal /persona-set's "Custom..." option
+                # uses, pre-filled straight from the db row we just read
+                # (custom_text), so it's a genuine edit-in-place instead
+                # of a blank rewrite.
+                async def on_edit(edit_interaction: discord.Interaction):
+                    async def on_custom_submit(modal_interaction: discord.Interaction, text: str):
+                        if is_guild:
+                            await self.set_guild_ai_persona(
+                                scope_id, modal_interaction.user.id, "custom", text
+                            )
+                        else:
+                            await self.set_dm_ai_persona(scope_id, "custom", text)
+
+                        # 🌸 Overwrite the ORIGINAL /persona-view message
+                        # entirely with a plain success confirmation and
+                        # drop the Edit button (view=None) — rather than
+                        # showing the updated text with the button still
+                        # live, which invites tapping Edit again on a
+                        # message that's already "done". edit_interaction
+                        # is the button click that opened this modal, so
+                        # its original_response IS the /persona-view
+                        # message.
+                        done_msg = "Done! Personality updated 🌸"
+                        await edit_interaction.edit_original_response(content=done_msg, view=None)
+                        await modal_interaction.response.defer()
+
+                    await edit_interaction.response.send_modal(
+                        PersonaCustomTextModal(on_custom_submit, current_text=custom_text)
+                    )
+
+                view = PersonaEditButtonView(on_edit, require_moderator=is_guild)
+            else:
+                label = PRESET_PERSONAS.get(preset_key, (preset_key, ""))[0]
+                msg = f"{scope.capitalize()} AI personality is currently **{label}** 🌸"
+
+        await interaction.response.send_message(msg, view=view, ephemeral=True)
+
+    @app_commands.command(
+        name="persona-reset",
+        description="🌸 Reset the AI personality back to default (this server, or your DM setting)",
+    )
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
+    async def persona_reset(self, interaction: discord.Interaction):
+        if interaction.guild is not None:
+            member = interaction.user
+            if not isinstance(member, discord.Member) or not member.guild_permissions.moderate_members:
+                await interaction.response.send_message(
+                    "Nahhhh, you need **Moderator** permission (Timeout Members) to do that!!! 😭🙏",
+                    ephemeral=True,
+                )
+                return
+
+            async def on_confirm(confirm_interaction: discord.Interaction):
+                await self.reset_guild_ai_persona(interaction.guild.id)
+                await confirm_interaction.response.edit_message(
+                    content="Reset! This server's AI personality is back to default 🌸", view=None
+                )
+
+            await interaction.response.send_message(
+                "Reset this server's AI personality back to default?",
+                view=ConfirmResetPersonaView(on_confirm),
+                ephemeral=True,
+            )
+        else:
+            dm_channel_id = interaction.channel.id
+
+            async def on_confirm(confirm_interaction: discord.Interaction):
+                await self.reset_dm_ai_persona(dm_channel_id)
+                await confirm_interaction.response.edit_message(
+                    content="Reset! I'm back to my default personality in our DMs 🌸", view=None
+                )
+
+            await interaction.response.send_message(
+                "Reset your DM AI personality back to default?",
+                view=ConfirmResetPersonaView(on_confirm),
+                ephemeral=True,
+            )
 

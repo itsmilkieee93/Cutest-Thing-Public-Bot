@@ -83,6 +83,18 @@ CURRENTS_CATEGORIES = [
     "real_estate",
 ]
 
+# 🌸 When the MAIN chat model supplies the Exa category itself (the
+# `search_web` tool's optional `category` argument), the separate
+# classify_categories Groq call is skipped — this maps that Exa category
+# to the closest Currents one for the jina_news_fallback tier.
+EXA_TO_CURRENTS_CATEGORY = {
+    "news": "general",
+    "research paper": "science_technology",
+    "github": "science_technology",
+    "company": "economy_business_finance",
+    "financial report": "economy_business_finance",
+}
+
 # 🌸 Same smallest/fastest model as JINA_SUMMARY_MODEL — this call
 # returns a tiny JSON object, no reasoning needed.
 CATEGORY_CLASSIFIER_MODEL = "openai/gpt-oss-20b"
@@ -495,7 +507,7 @@ class ExaSearchService:
         exa_logger.info(f"[jina_news_fallback] query={query!r} url={article_url} chars={len(summary)}")
         return summary
 
-    async def search(self, query: str) -> str | None:
+    async def search(self, query: str, category_hint: str | None = None) -> str | None:
         """🌸 Main entry point for groq_ai.py — tries get_answer() first
         (cheapest, cleanest, already-summarized), falls back to
         search_summary() if that comes back empty, then falls back to
@@ -514,11 +526,25 @@ class ExaSearchService:
         unfiltered. get_answer() is skipped for category filtering since
         Exa's answer() endpoint doesn't accept a category param at all —
         it stays exactly as before.
+
+        🌸 TOOL CALLING: `category_hint` (new) is the Exa category the main
+        chat model picked in the `search_web` tool call. When it's one of
+        EXA_CATEGORIES the classify_categories Groq call is skipped
+        entirely (that call existed only because nothing upstream knew
+        what kind of query this was — now the model does). Anything else
+        / None keeps the legacy classify-first behavior.
         """
         if not query:
             return None
 
-        categories = await self.classify_categories(query)
+        hint = (category_hint or "").strip().lower()
+        if hint in EXA_CATEGORIES:
+            categories = {
+                "exa_category": hint,
+                "currents_category": EXA_TO_CURRENTS_CATEGORY.get(hint, "general"),
+            }
+        else:
+            categories = await self.classify_categories(query)
 
         if self.client:
             answer = await self.get_answer(query)

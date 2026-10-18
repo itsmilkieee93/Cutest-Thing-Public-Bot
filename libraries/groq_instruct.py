@@ -33,6 +33,7 @@ from instruct.models_search import (
     SEARCH_INTENT_CLASSIFIER_POLICY,
     SEARCH_TOPIC_DOMAINS,
     _wants_web_search,
+    _looks_bot_internal,
     _search_domains_for_prompt,
 )
 from instruct.reasoning import (

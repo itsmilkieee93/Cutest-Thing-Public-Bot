@@ -13,3 +13,4 @@ isodate
 speedtest-cli
 exa_py
 requests
+nekosbest

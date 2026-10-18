@@ -33,9 +33,28 @@ through to the rest of the pipeline untouched.
 
 import re
 import json
+import asyncio
 import inspect
 
+import discord
+
 from calculator import _preprocess, _safe_eval, _format
+
+# 🌸 Tool-calling mode (expression_hint) — how long the worker thread
+# gets to evaluate before we give up and tell the model it took too
+# long. _safe_eval is pure CPU, so it runs in asyncio.to_thread to keep
+# a monster expression (2**100000, factorial(50000)) from freezing the
+# bot's event loop for every server at once.
+MATH_EVAL_TIMEOUT = 10.0
+
+# 🌸 Results longer than this are posted straight to the channel by code
+# (never retyped by the chat model) — same guarantee the legacy path gave
+# via the "splice the verified number in after Groq returns" trick.
+LONG_RESULT_CHARS = 40
+
+_MATH_REPLY_MENTIONS = discord.AllowedMentions(
+    everyone=False, roles=False, users=False, replied_user=True,
+)
 
 
 async def _call_groq(groq_client, **kwargs):
@@ -190,8 +209,72 @@ async def phrase_math_result(
         return None
 
 
-async def handle_math_request(message, guild_id: int, shared, groq_client) -> str | None:
+async def _handle_math_hint(message, expression: str) -> str:
+    """🌸 TOOL-CALLING path for handle_math_request — the main chat model
+    already decided this is a math request and extracted `expression`
+    (the `calculate_local_math` tool's JSON argument), so the classify +
+    phrase Groq calls are both skipped: the main model phrases the final
+    reply itself after reading this function's return string.
+
+    Always returns a plain string for the tool message (never None — a
+    tool call must always get an answer back):
+      - short result  -> "<expr> = <result>" for the model to restate
+      - long result   -> the exact value is posted to the channel here,
+        by code, and the string returned tells the model NOT to retype it
+        (an LLM regenerating 1000+ digits token-by-token silently drifts)
+      - failure       -> an "ERROR: ..." string the model can phrase kindly
+    """
+    expression = (expression or "").strip()
+    if not expression:
+        return "ERROR: empty expression."
+
+    try:
+        expr = _preprocess(expression)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_safe_eval, expr), timeout=MATH_EVAL_TIMEOUT,
+        )
+        result_str = _format(result)
+    except asyncio.TimeoutError:
+        return f"ERROR: evaluating '{expression}' took too long and was cancelled."
+    except ValueError as e:
+        return f"ERROR: could not evaluate '{expression}': {e}"
+    except Exception as e:
+        print(f"⚠️ math tool eval failed for {expression!r}: {type(e).__name__}: {e}")
+        return f"ERROR: could not evaluate '{expression}'."
+
+    if len(result_str) > LONG_RESULT_CHARS:
+        try:
+            await message.reply(
+                f"{expression} = ```\n{result_str}\n```",
+                mention_author=True,
+                allowed_mentions=_MATH_REPLY_MENTIONS,
+            )
+        except discord.HTTPException as e:
+            print(f"⚠️ math tool: failed to post long result: {e}")
+            return (
+                f"'{expression}' evaluated fine but the result ({len(result_str)} chars) "
+                "could not be posted. Tell the user it was too big to send."
+            )
+        return (
+            f"'{expression}' evaluated correctly. The exact result ({len(result_str)} characters) "
+            "was ALREADY posted in the channel inside a code block. Do NOT write out the "
+            "number or any of its digits — just add a short cute reaction."
+        )
+
+    return f"{expression} = {result_str}  (exact, verified by a calculator — use this value exactly)"
+
+
+async def handle_math_request(
+    message, guild_id: int, shared, groq_client, expression_hint: str | None = None,
+) -> str | None:
     """🌸 Full three-stage math interceptor — see module docstring.
+
+    🌸 `expression_hint` (new): when given, this is the raw expression the
+    main chat model extracted via the `calculate_local_math` tool call.
+    Classification + phrasing are skipped entirely (see _handle_math_hint)
+    and a plain tool-result string is returned. Leave it None for the
+    legacy message.content-parsing behavior below.
+
     Returns a natural-language string ready for message.reply(), or None
     if this doesn't look like (or isn't confirmed as) a math request, so
     the rest of the mention pipeline runs untouched.
@@ -206,6 +289,9 @@ async def handle_math_request(message, guild_id: int, shared, groq_client) -> st
     call site that needs the Groq client (e.g. describe_attachments in
     handle_mention_reaction) gets it the same explicit way.
     """
+    if expression_hint is not None:
+        return await _handle_math_hint(message, expression_hint)
+
     raw = message.content.strip()
     raw = re.sub(r"^<@!?\d+>\s*", "", raw).strip()
 

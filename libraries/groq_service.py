@@ -5,8 +5,11 @@ bot_service.py's EnchantedBot god-class.
 
 Owns:
   - The mention/reply reaction pipeline (handle_mention_reaction) —
-    regex server-question interceptors → media-request interceptor →
-    Groq AI fallback → emoji reactions → reply.
+    mood/crisis check → get_ai_response (the main model now decides for
+    itself, via Groq custom tools, when to do math / fetch media / play
+    music / look up a role or member — see engine/tools.py) → emoji
+    reactions → reply. The old regex/AI-classified interceptor chain is
+    switched off by LEGACY_INTERCEPTORS below.
   - Reply-context resolution (formal reply chains + implicit "posted
     then pinged in a follow-up" context).
   - Guild data syncing into metadata.db/roles.db/channels.db, and the
@@ -22,6 +25,7 @@ purely the "someone @mentioned/replied to the bot, or asked a
 server-info question" path.
 """
 
+import asyncio
 import time
 import random
 import re
@@ -58,6 +62,8 @@ from extras.emotion_detector import (
 )
 from resources import shared
 from engine.classifiers import extract_member_name
+from engine.tools import member_tool_ran, get_member_tool_result, card_delivered
+from engine.logging import build_user_error_embed, get_error_status, pop_ai_error
 
 # 🌸 Referential word gates for reply-context folding — see the comment
 # in handle_mention_reaction where these are used. Compiled once at
@@ -88,6 +94,135 @@ SAFE_REPLY_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users
 # 🌸 How long a guild's lightweight identity-line cache stays valid
 # before get_server_context_text re-derives it. See get_server_context_text.
 GUILD_INFO_CACHE_TTL = 300  # 5 minutes
+
+# 🌸 TOOL-CALLING OVERHAUL switch. False (default) = every message flows
+# straight to get_ai_response and the MAIN model calls tools itself
+# (math, media, music, role lookup, member lookup — engine/tools.py).
+# True = re-enable the legacy pre-chat interceptor chain (AI-classified
+# server queries + regex fallbacks, math, media, music), each of which
+# spent an extra Groq call BEFORE the real reply. The blocks stay in the
+# file, guarded by this flag, so the old behavior is one edit away.
+#
+# ⚠️ The server-info interceptors that did NOT become tools (server
+# avatar/banner/owner/verification/member-count/age/boost/locale/
+# description/all-metadata/server-info/channel-count/role-list/
+# user-role/created/user-created) only exist in that legacy chain — with
+# this False they're not reachable until they get tools of their own.
+LEGACY_INTERCEPTORS = False
+
+# 🌸 Returned by GroqMentionService._guarded_ai_response when the AI call failed with a
+# provider/connection error and the user was already told with an error embed.
+_AI_ERROR_HANDLED = object()
+
+# 🌸 False (default) = no upfront classify_mood AI call on every message.
+# The main model calls the `react_to_mood` tool only when a mood is clearly
+# expressed (tone guidance comes back as the tool result; the emoji reaction
+# is added by the tool). The CRISIS regex net is NOT affected by this flag —
+# it always runs first. True restores the per-message classifier + prompt
+# tone hint (also what you get on turns that carry no tools).
+LEGACY_MOOD_CLASSIFIER = False
+
+# 🌸 members.db's banner_url + accent_color: Discord's gateway never sends user
+# banners or accent colours, only REST does (one GET /users/{id} per member —
+# it returns both). The avatar decoration needs no flag: the gateway sends it. False (default) = banner_url is
+# filled only when discord.py already has it, and banners found earlier are
+# kept across syncs (shared.save_members_db). True = fetch every missing banner
+# on each guild sync (5 at a time) — fine for a few hundred members, slow for
+# tens of thousands.
+FETCH_MEMBER_BANNERS = True
+
+
+# 🌸 MEMBER-CHECK SAFETY NET — strict "is NAME here / in this server" shape.
+# Anchored on the WHOLE message so ordinary chat ("is pizza good here") isn't
+# caught. Only used when the model skipped check_member_existence entirely;
+# the lookup itself is the same local DB query the tool runs (no API cost).
+_PRESENCE_RE = re.compile(
+    r"^\W*(?:is|are|does|do|did)\s+(?P<name>@?[^\n?!,]{1,60}?)\s+"
+    r"(?:(?:here|there|around|exists?|joined)\b"
+    r"|(?:on|in|a\s+member\s+of|part\s+of)\s+(?:this\s+|the\s+|here\s+)?\w+)"
+    r"(?:\s+(?:in|on|at|of)\s+(?:this\s+|the\s+)?\w+)?\W*$",
+    re.IGNORECASE,
+)
+_PRESENCE_BAD_NAME_WORDS = frozenset({
+    "it", "he", "she", "they", "that", "this", "there", "the", "anyone", "anybody",
+    "someone", "somebody", "everyone", "who", "what", "which", "any", "good", "bad",
+    "cool", "nice", "open", "closed", "safe", "allowed", "ok", "okay", "working",
+    "raining", "cold", "hot", "wifi", "food",
+})
+
+
+def _extract_presence_target(text: str, bot_names) -> str | None:
+    """'@Bruh is Spy Ultimate here' -> 'Spy Ultimate'; None if it isn't a
+    clean 'is <person> in this server' question."""
+    t = text or ""
+    for n in bot_names:
+        if n:
+            t = re.sub(r"@?" + re.escape(n), " ", t, count=1, flags=re.IGNORECASE)
+    m = _PRESENCE_RE.match(t.strip())
+    if not m:
+        return None
+    name = m.group("name").strip().strip("@").strip()
+    words = name.split()
+    if not name or len(words) > 4:
+        return None
+    if any(w.lower().strip("@") in _PRESENCE_BAD_NAME_WORDS for w in words):
+        return None
+    return name
+
+
+# 🌸 Member-check safety net policy.
+#   False (default): the model's own sentence ALWAYS wins. The database
+#     template ("Yep, <@id> is here…") is used only when the model's reply
+#     FAILED (empty / emoji-only / raw system text).
+#   True: additionally, if the model never called check_member_existence but
+#     the message is a clean "is X here?" question, replace even a fluent
+#     answer with the real lookup — the model's answer is a guess in that case
+#     (this is what produced the bare "✅" for a person who wasn't there).
+GROUND_UNVERIFIED_MEMBER_ANSWERS = False
+
+# 🌸 Text that means the model leaked tool/system plumbing instead of answering.
+_RAW_SYSTEM_TEXT_RE = re.compile(
+    r"^\s*(?:LOOKUP RESULT\s*:|ERROR\s*:|\[(?:Tools?|Note)\])"
+    r"|<function[=>/ ]|</?tool_call|\btool_calls?\b"
+    r"|\bcheck_member_existence\b|\bquery_peran_server\b"
+    r"|Reply with ONE short sentence|Keep every <@id> mention|Never reply with only an emoji"
+    r"|\(truncated\)",
+    re.IGNORECASE,
+)
+
+
+def _ai_reply_failed(response) -> bool:
+    """True when the model's reply is not a usable natural-language answer:
+    empty, only emoji/punctuation (a lone ✅), only a bare <@id> mention, or
+    leaked system/tool text. A short real answer like "Yes!" or "Nope 🌸"
+    is NOT a failure."""
+    text = REACT_TAG_PATTERN.sub("", response or "").strip()
+    if not text:
+        return True
+    # a reply that is nothing but mentions carries no sentence
+    words_only = re.sub(r"<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>", "", text)
+    # [^\W_] = a letter or digit in any script (unlike \w, '_' doesn't count)
+    if not re.search(r"[^\W_]", words_only):
+        return True
+    if _RAW_SYSTEM_TEXT_RE.search(text):
+        return True
+    return False
+
+
+def _accent_hex(user) -> str | None:
+    """🌸 "#RRGGBB" of a user's accent colour, or None when unset/unknown.
+    (The gateway never sends it — only a REST fetch_user does.)"""
+    color = getattr(user, "accent_color", None)
+    return f"#{color.value:06X}" if color is not None else None
+
+
+def _decoration_url(user) -> str | None:
+    """🌸 CDN link of the user's avatar decoration (the frame around the
+    pfp), or None. The gateway DOES send this one; needs a discord.py
+    version that exposes User.avatar_decoration (getattr keeps older
+    versions working — they just always give None)."""
+    deco = getattr(user, "avatar_decoration", None)
+    return deco.url if deco else None
 
 
 class GroqMentionService:
@@ -210,10 +345,27 @@ class GroqMentionService:
                         "nickname": m.nick,
                         "pending": bool(getattr(m, "pending", False)),
                         "roles": [r.id for r in m.roles if r.name != "@everyone"],
+                        # 🌸 Extra keys for members.db (shared.save_guild_db's
+                        # 4th database): account global name, the name shown
+                        # in THIS server, and account avatar/banner CDN links
+                        # (default-avatar link when no custom avatar; banner
+                        # is None unless discord.py already knows it — the
+                        # gateway doesn't send banners, see FETCH_MEMBER_BANNERS).
+                        "global_name": m.global_name,
+                        "server_name": m.display_name,
+                        "avatar_url": (m.avatar or m.default_avatar).url,
+                        "banner_url": (getattr(m, "banner", None).url if getattr(m, "banner", None) else None),
+                        # 🌸 accent colour is REST-only (filled by
+                        # _fetch_member_banners); the decoration comes from the gateway.
+                        "accent_color": _accent_hex(m),
+                        "avatar_decoration_url": _decoration_url(m),
                     }
                     for m in guild.members
                 ],
             }
+
+            if FETCH_MEMBER_BANNERS:
+                await self._fetch_member_banners(guild_data["members"])
 
             await shared.save_guild_db(guild_data)
 
@@ -225,6 +377,37 @@ class GroqMentionService:
             }
         except Exception as e:
             print(f"⚠️ Failed to sync guild {guild.name} ({guild.id}) to DB: {e}")
+
+    async def _fetch_member_banners(self, members: list[dict]) -> None:
+        """🌸 REST-fetches banners AND accent colours (one GET /users/{id}
+        gives both) for member dicts missing either, filling banner_url /
+        accent_color in place. Small concurrency + a pause per request keeps
+        it far under Discord's rate limits; a failed fetch (deleted user,
+        404) just leaves them empty. Only runs when FETCH_MEMBER_BANNERS is True."""
+        sem = asyncio.Semaphore(5)
+        found_banners = 0
+        found_accents = 0
+
+        async def one(m):
+            nonlocal found_banners, found_accents
+            async with sem:
+                try:
+                    user = await self.bot.fetch_user(m["id"])
+                    if user.banner and not m.get("banner_url"):
+                        m["banner_url"] = user.banner.url
+                        found_banners += 1
+                    accent = _accent_hex(user)
+                    if accent and not m.get("accent_color"):
+                        m["accent_color"] = accent
+                        found_accents += 1
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(*(
+            one(m) for m in members if not m.get("banner_url") or not m.get("accent_color")
+        ))
+        print(f"🖼️ [MEMBERS] Fetched {found_banners} new banner(s), {found_accents} new accent colour(s)")
 
     async def sync_all_guilds(self):
         """🌸 Fetches + saves FULL data (metadata, roles, channels, members)
@@ -543,6 +726,44 @@ class GroqMentionService:
     # Mention / reply reaction pipeline
     # ─────────────────────────────────────────────────────────────────
 
+    async def _guarded_ai_response(self, *args, **kwargs):
+        """🌸 get_ai_response + user-facing error embed. Two ways a provider
+        failure (429 limit, 401/403 auth, 404 model, 413 size, 5xx, connection
+        error) reaches here:
+          1. an exception propagates out of get_ai_response, or
+          2. run_completion_loop swallowed it and returned None after
+             recording it (engine.logging.remember_ai_error).
+        Either way the user gets a minimal embed (build_user_error_embed) and
+        _AI_ERROR_HANDLED is returned. Exceptions with no HTTP status (real
+        bugs) are re-raised; a None with no recorded provider error is
+        returned unchanged, exactly like before."""
+        message = kwargs["message"]
+        error = None
+        try:
+            result = await self.bot.groq.get_ai_response(*args, **kwargs)
+        except Exception as e:
+            pop_ai_error(message.id)
+            if build_user_error_embed(e) is None:
+                raise
+            error = e
+        else:
+            recorded = pop_ai_error(message.id)  # always pop so nothing goes stale
+            if result is not None or recorded is None:
+                return result
+            error = recorded
+
+        embed = build_user_error_embed(error)
+        if embed is None:
+            return None  # recorded error wasn't a provider/connection error — old behavior
+        print(f"⚠️ AI call failed (status={get_error_status(error)}): {type(error).__name__}")
+        try:
+            await message.reply(
+                embed=embed, mention_author=True, allowed_mentions=SAFE_REPLY_MENTIONS,
+            )
+        except discord.HTTPException as send_err:
+            print(f"⚠️ Failed to send AI error embed: {send_err}")
+        return _AI_ERROR_HANDLED
+
     async def handle_mention_reaction(self, message: discord.Message):
         """🌸 Mention / reply reaction handler (e.g. random message roulette).
         Combines message content + Groq AI response + emoji reaction.
@@ -663,9 +884,12 @@ class GroqMentionService:
             # reaction — never a safety decision, fails open to neutral.
             if check_crisis_signals(dispatch_text):
                 emotion_result = EmotionResult(mood=Mood.CRISIS, is_crisis=True, confidence=1.0)
-            else:
+            elif LEGACY_MOOD_CLASSIFIER:
                 emotion_result = await classify_mood(self.bot.groq.client, dispatch_text)
                 await apply_mood_reaction(message, emotion_result)
+            else:
+                # 🌸 No upfront AI call — the model calls react_to_mood itself.
+                emotion_result = EmotionResult(mood=Mood.NEUTRAL, is_crisis=False, confidence=0.0)
             tone_hint = get_tone_hint(emotion_result)
 
             # 🌸 intercepted MUST be initialized here, before the `if guild:`
@@ -682,6 +906,14 @@ class GroqMentionService:
             # having never actually been given the chance to try).
             intercepted = None
 
+            # 🌸 TOOL-CALLING OVERHAUL — everything between here and the
+            # get_ai_response call below (the server-query dispatch and
+            # the math/media/music interceptors) is the LEGACY path, now
+            # behind LEGACY_INTERCEPTORS (False). The main model decides
+            # for itself when to call a tool — see engine/tools.py. The
+            # crisis check above still runs first, and a crisis message
+            # additionally gets allow_tools=False at the call below.
+            #
             # 🌸 CRISIS BYPASS — a message flagged by check_crisis_signals
             # above skips EVERY interceptor (server-query, math, media,
             # music) entirely. Those exist to serve pics/songs/answers,
@@ -692,7 +924,7 @@ class GroqMentionService:
             # matched. `intercepted` is left as None so control falls
             # straight through to get_ai_response below, carrying
             # tone_hint=CRISIS_RESPONSE_NOTE.
-            if guild and not emotion_result.is_crisis:
+            if LEGACY_INTERCEPTORS and guild and not emotion_result.is_crisis:
                 server_hint = _looks_server_related(dispatch_text)
 
                 LABEL_HANDLERS = {
@@ -892,7 +1124,7 @@ class GroqMentionService:
             # just as irrelevant to a possible crisis message as the
             # server-query chain above, so the same is_crisis guard keeps
             # `intercepted` at None straight through to get_ai_response.
-            if intercepted is None and not emotion_result.is_crisis:
+            if LEGACY_INTERCEPTORS and intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-CLASSIFIED MATH INTERCEPTOR — one cheap Groq call
                 # decides if this is actually a math computation request
                 # (not just a message that happens to contain a digit —
@@ -909,7 +1141,7 @@ class GroqMentionService:
                 # None on any classifier hiccup or non-math message, so
                 # this never blocks unrelated chat.
                 intercepted = await handle_math_request(message, guild_id, shared, self.bot.groq.client)
-            if intercepted is None and not emotion_result.is_crisis:
+            if LEGACY_INTERCEPTORS and intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-classified media request — one Groq call decides
                 # if this is "send me a pic/video/vector/cartoon of X",
                 # then dispatches to Pexels (photo/video) or Pixabay
@@ -917,7 +1149,7 @@ class GroqMentionService:
                 # image set via set_image() — no raw link text visible,
                 # unlike the old bare-URL auto-embed approach.
                 intercepted = await handle_media_request(message, guild_id, shared)
-            if intercepted is None and not emotion_result.is_crisis:
+            if LEGACY_INTERCEPTORS and intercepted is None and not emotion_result.is_crisis:
                 # 🌸 AI-classified MUSIC request — same zero-token-gate-
                 # then-classify shape as everything else in this chain
                 # (MUSIC_INTENT_PATTERN local pre-filter, then one Groq
@@ -1056,7 +1288,7 @@ class GroqMentionService:
             # above) so that dispatch could see reply context too — no
             # need to fetch them again here, just reuse the same values.
 
-            response = await self.bot.groq.get_ai_response(
+            response = await self._guarded_ai_response(
                 prompt,
                 username=message.author.name,
                 user_id=message.author.id,
@@ -1073,37 +1305,121 @@ class GroqMentionService:
                 reply_to_message_id=reply_to_message_id,
                 reply_to_message_text=reply_to_message_text,
                 tone_hint=tone_hint,
+                # 🌸 Tool calling: the handlers post media/music cards via
+                # this message. Crisis messages get NO tools — same
+                # guarantee the old interceptor bypass gave (a possible
+                # cry for help must never be answered with a pic/song).
+                message=message,
+                allow_tools=not emotion_result.is_crisis,
             )
 
-            if response:
-                # ✅ Extract and apply emoji reactions BEFORE stripping tags
-                await self._apply_emoji_reactions(message, response)
+            # 🌸 The AI call failed (429/401/403/404/...) and the user already got
+            # a minimal error embed — nothing more to send for this message.
+            if response is _AI_ERROR_HANDLED:
+                return
 
-                # ✅ Strip [REACT:emoji] tags from response text so they don't show to users
-                clean_response = REACT_TAG_PATTERN.sub("", response).strip()
+            # 🌸 Member-check safety net — fixes "✅"-only replies and guessed
+            # answers to "is X in this server" (see the method's docstring).
+            if guild and not emotion_result.is_crisis:
+                fixed_reply = await self._member_presence_safety_net(message, guild, shared, response)
+                if fixed_reply:
+                    response = fixed_reply
 
-                # 🌸 DM split-routing MUST run BEFORE the public send below —
-                # it further strips [DM_START]...[DM_END] out of
-                # clean_response (mutating what actually reaches the server
-                # channel), fires the private DM off to the side, and
-                # appends an AI-phrased, Discord-verified success/privacy-
-                # blocked notice. See extras/groq_dm_instruct.route_dm_split
-                # for the full contract; generate_dm_notice is what phrases
-                # that notice in the bot's own voice.
-                clean_response = await route_dm_split(
-                    message, clean_response, self.bot.groq.generate_dm_notice,
-                )
+            # 🌸 try/finally: queued tool cards (image embed / music view) are
+            # sent TOGETHER with the reply text (one message, text above the
+            # card) by flush_tool_sends inside the block below — and the
+            # `finally` still posts them alone if there was no text or the
+            # text send raised.
+            try:
+                if response:
+                    # ✅ Extract and apply emoji reactions BEFORE stripping tags
+                    await self._apply_emoji_reactions(message, response)
 
-                try:
-                    if clean_response:  # Only send if there's content after stripping
-                        await message.reply(
-                            content=clean_response[:2000],
-                            mention_author=True,
-                            allowed_mentions=SAFE_REPLY_MENTIONS,
-                            suppress_embeds=False
-                        )
-                except discord.HTTPException as e:
-                    print(f"⚠️ Failed to reply: {e}")
+                    # ✅ Strip [REACT:emoji] tags from response text so they don't show to users
+                    clean_response = REACT_TAG_PATTERN.sub("", response).strip()
+
+                    # 🌸 DM split-routing MUST run BEFORE the public send below —
+                    # it further strips [DM_START]...[DM_END] out of
+                    # clean_response (mutating what actually reaches the server
+                    # channel), fires the private DM off to the side, and
+                    # appends an AI-phrased, Discord-verified success/privacy-
+                    # blocked notice. See extras/groq_dm_instruct.route_dm_split
+                    # for the full contract; generate_dm_notice is what phrases
+                    # that notice in the bot's own voice.
+                    clean_response = await route_dm_split(
+                        message, clean_response, self.bot.groq.generate_dm_notice,
+                    )
+
+                    # 🌸 An image embed / music card already carries its own
+                    # caption or summary — don't also send the model's text as a
+                    # separate message above it.
+                    # (Skipped when a DM notice was appended, so that still shows.)
+                    if card_delivered(message.id) and not dm_requested:
+                        clean_response = ""
+
+                    try:
+                        if clean_response:  # Only send if there's content after stripping
+                            # 🌸 If a tool queued an image embed / music card,
+                            # the reply text goes INSIDE that same message
+                            # (text above the card) — flush_tool_sends returns
+                            # True when it consumed the text, so don't send
+                            # it a second time.
+                            if not await self.bot.groq.flush_tool_sends(message, text=clean_response):
+                                await message.reply(
+                                    content=clean_response[:2000],
+                                    mention_author=True,
+                                    allowed_mentions=SAFE_REPLY_MENTIONS,
+                                    suppress_embeds=False
+                                )
+                    except discord.HTTPException as e:
+                        print(f"⚠️ Failed to reply: {e}")
+            finally:
+                await self.bot.groq.flush_tool_sends(message)
+
+    async def _member_presence_safety_net(self, message: discord.Message, guild, shared, response):
+        """🌸 Natural AI text first, database template only as a fallback.
+
+        Returns replacement text, or None to keep the model's reply.
+
+          ai_failed = empty / emoji-only (a lone ✅) / leaked system text.
+
+          - AI wrote a real sentence      -> None (use the AI text).
+          - AI failed, tool DID run       -> the lookup result that tool got.
+          - AI failed, tool was skipped   -> run the same local lookup here
+                                             (only for a clean "is X here?").
+        With GROUND_UNVERIFIED_MEMBER_ANSWERS = True, a fluent answer is also
+        replaced when the tool was skipped (see the constant's comment).
+        """
+        ai_failed = _ai_reply_failed(response)
+        tool_ran = member_tool_ran(message.id)
+
+        if not ai_failed and (tool_ran or not GROUND_UNVERIFIED_MEMBER_ANSWERS):
+            return None
+
+        if tool_ran:
+            fixed = get_member_tool_result(message.id)
+            if fixed:
+                print("🛟 Member check: AI reply unusable — using the lookup result")
+            return fixed
+
+        bot_names = [
+            getattr(guild.me, "display_name", None), self.bot.user.display_name, self.bot.user.name,
+        ]
+        name = _extract_presence_target(message.clean_content, bot_names)
+        if not name:
+            return None
+        try:
+            result = await handle_member_lookup_query(
+                message, guild.id, shared, groq_client=None, name_hint=name,
+            )
+        except Exception as e:
+            print(f"⚠️ Member safety-net lookup failed: {e}")
+            return None
+        if isinstance(result, str) and result.strip():
+            why = "AI reply unusable" if ai_failed else "tool skipped (grounding on)"
+            print(f"🛟 Member check: {why} for {name!r} — answered from the lookup")
+            return result
+        return None
 
     async def _apply_emoji_reactions(self, message: discord.Message, response: str):
         """🌸 Extract [REACT:emoji] tags from response and apply them to the original message."""

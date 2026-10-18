@@ -288,7 +288,14 @@ async def extract_member_name(service, dispatch_text: str, username: str) -> str
         "LATEST message is itself asking about a specific person. A "
         "latest message that is just a greeting, a bare mention, or has "
         "no identifiable person of its own is NONE, even if a name is "
-        "sitting right there in the earlier context line."
+        "sitting right there in the earlier context line.\n\n"
+        "Discord usernames are a single literal token that can contain "
+        "underscores, dots, and digits (e.g. sunset_is_beautiful, "
+        "its.milkieee, stayhalal654) — these are NOT separate words and "
+        "must NEVER be split, spaced out, re-capitalized, or otherwise "
+        "'cleaned up' into a nicer-looking phrase. Copy the name EXACTLY "
+        "as it appears in the text, character for character, punctuation "
+        "and casing included — never paraphrase or reformat it."
     )
 
     async def _call():
@@ -313,7 +320,32 @@ async def extract_member_name(service, dispatch_text: str, username: str) -> str
             return ""
         # 🌸 Defensive strip — model sometimes wraps the name in quotes/
         # backticks/a trailing period despite the "nothing else" instruction.
-        return name.strip("`\"'.\n\t ").lstrip("@")
+        name = name.strip("`\"'.\n\t ").lstrip("@")
+
+        # 🌸 SANITY CHECK: despite the explicit "copy exactly, never
+        # reformat" instruction above, a model can still silently turn
+        # an underscore/dot-separated username into a spaced-out phrase
+        # (e.g. "sunset_is_beautiful" -> "sunset is beautiful") since it
+        # visually looks like three words. That reformatted string then
+        # fails find_member_by_name's exact-match AND its own LIKE
+        # fallback (neither matches on the real, underscored username),
+        # so the whole lookup silently reports "not found" for a member
+        # who is very much in the server — the actual DB/SQL layer was
+        # never the problem, the extracted name just stopped being the
+        # real username by the time it got there.
+        #
+        # A genuine extraction should be a literal substring of what it
+        # was extracted FROM. If it isn't (case-insensitive check, since
+        # casing can differ harmlessly), the model most likely
+        # paraphrased/reformatted rather than copied — treat that the
+        # same as "couldn't identify anyone" and fail open to the
+        # caller's own regex-on-message.content path, same contract as
+        # every other failure case here, rather than pass along a
+        # mangled name that's guaranteed to miss in the DB.
+        if name.lower() not in dispatch_text.lower():
+            return ""
+
+        return name
     except Exception as e:
         print(f"⚠️ Member-name extraction error (falling back to regex) for {username}: {e}")
         return ""

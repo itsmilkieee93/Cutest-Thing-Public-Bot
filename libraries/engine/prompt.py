@@ -25,15 +25,26 @@ from groq_instruct import (
     MODEL_POOL, REACT_EMOJI_POOL, REACT_INSTRUCTIONS_DISALLOWED,
     IDENTITY_INSTRUCTIONS, DM_CONTEXT_INSTRUCTIONS,
     _build_react_instructions, _build_owner_status,
-    _wants_web_search,
+    _wants_web_search, _looks_bot_internal,
 )
 from extras.groq_dm_instruct import build_dm_directives, format_snowflake_info
-from personality import get_personality_for_nickname
+from personality import load_personality_with_override
+from engine.tools import TOOL_CAPABLE_MODELS, TOOL_MODEL
 
 from resources import shared
 
 
-async def pick_model_and_search(service, prompt: str, username: str, model_id: str = None):
+
+def _pick_tool_model(service) -> str:
+    """🌸 Random pick for turns that carry tools — only from MODEL_POOL entries
+    that really support function calling (openai/gpt-oss-120b / -20b). Models
+    like qwen/qwen3.8-27b can't call tools and answered with a guessed "✅"
+    instead. If the pool has none, use TOOL_MODEL."""
+    pool = [m for m in MODEL_POOL if m.lower() in TOOL_CAPABLE_MODELS]
+    return random.choice(pool) if pool else TOOL_MODEL
+
+
+async def pick_model_and_search(service, prompt: str, username: str, model_id: str = None, tools_possible: bool = False):
     """
     🌸 Random model pick per turn (unless caller pinned model_id) —
     see MODEL_POOL up top for what's in rotation. EXCEPTION: if the
@@ -64,15 +75,52 @@ async def pick_model_and_search(service, prompt: str, username: str, model_id: s
     command) still wins over all of this — we only override the
     RANDOM/search-intent pick, never an explicit one.
 
+    🌸 TOOL CALLING: `tools_possible` (message present + tools allowed
+    for this reply) stops the RANDOM pick from landing on
+    groq/compound or groq/compound-mini — Groq's compound systems can't
+    take custom tools, so with 2 of 5 pool entries being compound, ~40%
+    of ordinary chat turns would have had no math/media/music/role/
+    member tools. Plain chat now rotates over the non-compound models
+    only. Real search turns are untouched: Exa-success still picks a
+    non-compound model, and the Exa-failed → groq/compound-mini
+    fallback stays (search needs outrank tools on that one turn).
+    A caller-pinned model_id still wins over everything.
+
+    🌸 TOOL CALLING: with `tools_possible` and an Exa service configured,
+    NO search-intent classification or Exa prefetch happens here at all —
+    see the elif branch below; the model calls the `search_web` tool.
+
     Returns (model_to_use, exa_context, is_compound_call).
     """
     exa_context = None
     if model_id:
         model_to_use = model_id
+    elif tools_possible and service.exa:
+        # 🌸 TOOL CALLING: web search is now the `search_web` tool, so the
+        # main model decides for itself whether a search is needed and
+        # what to search for. That removes the upfront classify_search_intent
+        # AI call, the pre-emptive Exa fetch (it ran on every "wants search"
+        # verdict, right or wrong), the _looks_bot_internal patch-over, AND
+        # the groq/compound-mini routing — compound can't take custom tools.
+        # No Exa configured → falls through to the legacy branch below.
+        model_to_use = _pick_tool_model(service)
     else:
         wants_search = await service.classify_search_intent(prompt, username)
         if not wants_search:
             wants_search = _wants_web_search(prompt)
+
+        # 🌸 DETERMINISTIC OVERRIDE — see _looks_bot_internal's own
+        # comment in instruct/models_search.py. Applied AFTER both the
+        # AI classifier and the regex fallback have already had their
+        # say, and can only flip an existing YES back to NO — this is
+        # what actually fixes "Now Dyno id" / "I mean Dyno Bot id in
+        # this server" incorrectly triggering an Exa search, since
+        # SEARCH_INTENT_PATTERN itself never matched those strings in
+        # the first place (confirmed directly) — it was
+        # classify_search_intent's own AI call saying YES despite its
+        # policy text already excluding "the bot/server itself".
+        if wants_search and _looks_bot_internal(prompt):
+            wants_search = False
 
         if wants_search:
             if service.exa:
@@ -83,7 +131,10 @@ async def pick_model_and_search(service, prompt: str, username: str, model_id: s
             else:
                 model_to_use = "groq/compound-mini"
         else:
-            model_to_use = random.choice(MODEL_POOL)
+            if tools_possible:
+                model_to_use = _pick_tool_model(service)
+            else:
+                model_to_use = random.choice(MODEL_POOL)
 
     # 🌸 COMPOUND TOKEN BUDGET (part 2): server_context/guild_summary
     # can be genuinely huge on an active server — full role/channel/
@@ -114,6 +165,8 @@ async def build_system_prompt(
     react_allowed: bool,
     dm_requested: bool,
     guild,
+    channel=None,
+    dm_via_tool: bool = False,
     recent_react_emoji,
     is_compound_call: bool,
     exa_context,
@@ -137,9 +190,25 @@ async def build_system_prompt(
     # next reply, with zero code changes needed for new personas.
     # guild.me is None in a DM, so nickname falls back to the default
     # inside get_personality_for_nickname().
+    #
+    # 🌸 ON TOP of that, load_personality_with_override checks for a
+    # per-server (/persona-set in a guild, admin-only) or per-DM-channel
+    # (/persona-set in a DM, self-serve) override FIRST — see
+    # personality.py. Falls back to the plain nickname template when
+    # no override is set, so servers/DMs that never touch /persona-set
+    # behave exactly as before. In a DM, channel is the DM channel
+    # itself — each DM channel gets its own override, mirroring how
+    # each guild gets its own.
     nickname = guild.me.nick if guild and guild.me else None
+    dm_channel_id = channel.id if (guild is None and channel is not None) else None
     try:
-        personality = get_personality_for_nickname(nickname, tone_hint)
+        personality = await load_personality_with_override(
+            bot=service.bot,
+            guild_id=guild.id if guild else None,
+            channel_id=dm_channel_id,
+            nickname=nickname,
+            tone_hint=tone_hint,
+        )
     except Exception as e:
         # 🌸 Last-resort fallback if personality.py errors out for
         # any reason — keeps the bot answering instead of crashing.
@@ -186,7 +255,11 @@ async def build_system_prompt(
     # turns where the user explicitly asked, instead of leaving
     # detection entirely up to the model's own judgement. See
     # extras/groq_dm_instruct.build_dm_directives for the full logic.
-    dm_directives = build_dm_directives(dm_allowed=bool(guild), dm_requested=dm_requested)
+    # 🌸 dm_via_tool: this reply's model has the send_dm_to_user tool, so
+    # it gets the tool-calling DM instructions instead of the tag ones.
+    dm_directives = build_dm_directives(
+        dm_allowed=bool(guild), dm_requested=dm_requested, via_tool=dm_via_tool,
+    )
 
     # 🌸 Server context — pulled from the v10 REST API and cached (see
     # GroqMentionService.get_server_context_text in groq_service.py) so

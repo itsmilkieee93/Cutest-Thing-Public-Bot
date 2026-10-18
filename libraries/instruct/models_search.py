@@ -26,10 +26,8 @@ import re
 # skip those params, same as the existing llama branch.
 MODEL_POOL = [
     "openai/gpt-oss-120b",
-    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
-    "groq/compound",
-    "groq/compound-mini",
 ]
 
 # 🌸 SEARCH-INTENT GATE — cheap regex pre-filter so "search for X" /
@@ -77,6 +75,56 @@ def _wants_web_search(prompt: str) -> bool:
     return bool(SEARCH_INTENT_PATTERN.search(prompt))
 
 
+# 🌸 BOT/SERVER-INTERNAL OVERRIDE — cheap, deterministic exclusion for
+# things that are never web-search questions, applied AFTER BOTH
+# classify_search_intent AND _wants_web_search have already had their
+# say (see pick_model_and_search's _looks_bot_internal check).
+#
+# WHY THIS EXISTS: "Now Dyno id" / "I mean Dyno Bot id in this server"
+# got classified as needing a live web search — SEARCH_INTENT_PATTERN
+# itself doesn't match either string (confirmed directly), so this was
+# the AI-first classify_search_intent call saying YES. The classifier's
+# own policy text already says "NO for ... anything about the bot/server
+# itself", but that's one clause at the end of a long list of POSITIVE
+# search triggers, and a short terse "what's the X id" question
+# apparently pattern-matches the SURFACE SHAPE of a real lookup question
+# ("what's the latest iPhone", "what's the current score") closely
+# enough to tip a cheap low-reasoning-budget classifier toward YES
+# despite the exclusion. SEARCH_INTENT_CLASSIFIER_POLICY's wording was
+# strengthened for this (see its own comment), but classifiers are
+# never 100% reliable turn to turn, so this is a deterministic backstop
+# that can't be swayed by phrasing the way a model can.
+#
+# Deliberately NARROW (unlike SEARCH_INTENT_PATTERN's deliberately
+# BROAD net) — this only OVERRIDES an existing YES back to NO, it can
+# never turn a NO into a YES, so a false positive here just means one
+# genuinely bot-internal-shaped message skips a search it didn't need
+# anyway; a false negative just leaves the existing (already-fixed)
+# classifier verdict standing, same as before this guard existed. Kept
+# to patterns that are unambiguous — bot's OWN id/uptime/ping/hosting —
+# rather than a broad "server" catch-all, since e.g. "is that server
+# still up" (a real Discord community, not THIS bot's own process)
+# should still be allowed to search.
+_BOT_INTERNAL_PATTERN = re.compile(
+    r"\b("
+    r"dyno\s*(?:bot\s*)?id"
+    r"|(?:bot|process|dyno|your)\s*(?:'s)?\s*(?:id|uptime|ping|latency)"
+    r"|what'?s\s+(?:the\s+)?(?:bot'?s?\s+)?(?:dyno|process)\s*id"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_bot_internal(prompt: str) -> bool:
+    """🌸 True if `prompt` is unambiguously asking about the BOT's own
+    internals (Dyno/process id, uptime, ping) rather than the outside
+    world — see _BOT_INTERNAL_PATTERN's own comment for why this guard
+    exists and why it's deliberately narrow/override-only."""
+    if not prompt:
+        return False
+    return bool(_BOT_INTERNAL_PATTERN.search(prompt))
+
+
 # 🌸 SEARCH-INTENT CLASSIFIER POLICY — AI-FIRST router, same pattern as
 # SERVER_QUERY_CLASSIFIER_POLICY above: one cheap Groq call (smallest
 # model in MODEL_POOL, max_tokens=4, temperature=0) decides whether THIS
@@ -93,9 +141,20 @@ SEARCH_INTENT_CLASSIFIER_POLICY = (
     "correctly (current events, prices, scores, news, release dates, "
     "\"is X still around/available\", weather, or anything that could've "
     "changed after an AI's training cutoff).\n"
-    "Reply YES if it needs current/real-world info to answer well. "
+    "Reply NO — even though it's a short, terse lookup-style question — "
+    "for anything about the BOT ITSELF or the Discord SERVER it's running "
+    "in: the bot's own Dyno/process/hosting ID, uptime, ping, latency, "
+    "which server/channel/role/member something is, bot settings, or any "
+    "other fact the bot already has in its own database/config rather "
+    "than needing to look up on the web. These are never web-search "
+    "questions no matter how much they resemble one on the surface — "
+    "'what's the Dyno id' and 'what's the latest iPhone' LOOK similarly "
+    "short and factual, but only one of them is actually about the "
+    "outside world.\n"
     "Reply NO for normal chat, opinions, jokes, general knowledge, math, "
-    "code, or anything about the bot/server itself.\n"
+    "or code too.\n"
+    "Reply YES only if it needs current/real-world info FROM OUTSIDE the "
+    "bot/server to answer well.\n"
     "Respond with EXACTLY one word, nothing else: YES or NO."
 )
 

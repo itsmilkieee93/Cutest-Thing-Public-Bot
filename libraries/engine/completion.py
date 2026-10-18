@@ -13,6 +13,16 @@ generic Exception, running check_output_safety on the reply, logging
 the transcript, saving memory, and firing the success embed. It
 returns the final reply string, or None on total failure — exactly
 the same contract get_ai_response had.
+
+🌸 TOOL CALLING (replaces the old upfront intent-classifier calls):
+_call() now registers the custom tools from engine/tools.py (math,
+media, music, role lookup, member lookup) on the main chat model with
+tool_choice="auto". When Groq answers with `tool_calls` instead of text,
+the loop runs the matching local handlers (engine/tools.py), appends the
+assistant tool-call message + one role="tool" reply per tool_call_id to
+the running message list, and `continue`s so the SAME model reads the
+data and writes the final in-character reply. All the 413 / 429 chain
+behavior below is unchanged.
 """
 import random
 import asyncio
@@ -22,6 +32,9 @@ from groq import APIStatusError as GroqAPIStatusError
 
 from groq_instruct import MODEL_POOL, _strip_reasoning, _search_domains_for_prompt
 from resources import shared
+from engine import tools as _tools_mod
+from extras.groq_dm_instruct import redact_dm_leaks
+from engine.logging import remember_ai_error
 
 
 async def run_completion_loop(
@@ -41,8 +54,20 @@ async def run_completion_loop(
     message_id,
     guild_id,
     dm_channel_id,
+    message=None,
+    shared_ctx=None,
+    allow_tools: bool = True,
 ):
     """
+    🌸 `message` is the incoming discord.Message — tool handlers need it to
+    send embeds/cards back to the channel (engine/tools.py). `shared_ctx`
+    is the resources.shared module handed down by get_ai_response (named
+    differently on purpose: a parameter called `shared` would shadow the
+    module imported above that shared.save_groq_memory below relies on).
+    With message=None (e.g. a caller with no Discord message) or
+    allow_tools=False (crisis messages — the old crisis bypass), no tools
+    are attached and this behaves exactly like the pre-tool-calling loop.
+
     Runs the (blocking) Groq SDK call in a worker thread so it never
     stalls the bot's event loop — see the async def _call closure
     below, which awaits self.async_client directly (AsyncGroq, not a
@@ -52,7 +77,30 @@ async def run_completion_loop(
     attempt in max_attempts is exhausted / a non-retryable error
     occurs.
     """
+    # 🌸 Tool-calling state shared by _call and the loop below.
+    #   tool_messages      — running assistant-tool_calls + role="tool" history
+    #   rounds             — model→tool→model round-trips used so far
+    #   delivered          — a tool already posted media/music (no second post)
+    #   attached           — did the LAST _call actually send `tools`?
+    #   disabled_by_error  — a 400 with tools attached → retry without them
+    tool_messages: list = []
+    private_payloads: list = []  # texts sent via send_dm_to_user (leak guard)
+    tool_state = {"rounds": 0, "delivered": False, "attached": False, "disabled_by_error": False}
+
+    def _retire_tools():
+        """🌸 Drops the tool-call history (needed whenever the next call
+        goes out WITHOUT tools — stage 2 / stage 3 / error retry; a
+        role="tool" message with no tools definition isn't valid). Any
+        results already obtained are folded into the prompt as text so a
+        verified math answer isn't lost to the model's own guesswork."""
+        nonlocal prompt
+        results = [m["content"] for m in tool_messages if m.get("role") == "tool"]
+        if results:
+            prompt = f"{prompt}\n\n(Tool results already obtained for this message: {' | '.join(results)})"
+        tool_messages.clear()
+
     async def _call(slim: bool = False):
+        nonlocal model_to_use
         # 1. Buat parameter dasar yang selalu digunakan semua model
         # 🌸 slim=True drops recent_history entirely — used for the
         # 413 ("Request Entity Too Large") retry below. Compound
@@ -65,10 +113,35 @@ async def run_completion_loop(
         if not slim:
             messages.extend(recent_history)
         messages.append({"role": "user", "content": prompt})
+        # 🌸 Tool round-trips so far (assistant tool_calls message + its
+        # role="tool" replies) ride along after the user turn — and
+        # survive a 429 key rotation or a 413 slim retry, since both
+        # just call _call() again.
+        messages.extend(tool_messages)
 
         # 🌸 Needed one line earlier than before (used for max_tokens
         # below too now) — same value, just computed before kwargs
         # instead of after.
+        # 🌸 FORCE A TOOL-CAPABLE MODEL — backstop for prompt.py's pick (a
+        # pinned model_id or the legacy branch can still land on e.g. qwen,
+        # which can't call tools and just guessed). Same conditions as the
+        # tools block below, evaluated BEFORE model_lower so the per-family
+        # kwargs (reasoning_effort etc.) match the model that's really used.
+        # Assigned to model_to_use itself so every later round (the
+        # post-tool follow-up call), the logs and the saved memory agree.
+        if (
+            allow_tools
+            and message is not None
+            and not tool_state["disabled_by_error"]
+            and not browser_search_active
+            and not used_final_fallback
+            and "compound" not in model_to_use.lower()
+            and "safeguard" not in model_to_use.lower()
+        ):
+            _forced = _tools_mod.model_for_tools(model_to_use, True)
+            if _forced != model_to_use:
+                print(f"🛠️ {model_to_use} can't take tools — using {_forced} for this reply")
+                model_to_use = _forced
         model_lower = model_to_use.lower()
 
         # 🌸 COMPOUND TOKEN BUDGET (part 3): even a FULLY slim request
@@ -159,6 +232,46 @@ async def run_completion_loop(
             if "gpt-oss" in model_lower:
                 kwargs["reasoning_effort"] = "low"
 
+        # 2b. 🌸 CUSTOM TOOLS — function calling for the main model.
+        # Skipped where a tool-less call is the whole point or tools
+        # can't work:
+        #   - compound: Groq's agentic systems manage their own tools.
+        #   - stage-2 browser_search / stage-3 plain fallback: those are
+        #     the thin-budget 413 recovery paths — keep them minimal.
+        #   - disabled_by_error: a 400 came back while tools were attached
+        #     (e.g. tool_use_failed), so the retry goes without them.
+        tool_state["attached"] = False
+        if (
+            allow_tools
+            and message is not None
+            and not tool_state["disabled_by_error"]
+            and not browser_search_active
+            and not used_final_fallback
+            and "compound" not in model_lower
+            and "safeguard" not in model_lower
+        ):
+            kwargs["tools"] = _tools_mod.get_tool_schemas(
+                in_guild=message.guild is not None,
+                has_search=getattr(service, "exa", None) is not None,
+            )
+            # 🌸 "none" (not removing `tools`) once the round cap is hit
+            # or a tool already posted media/music: the message list
+            # still contains tool-call history, which Groq wants to see
+            # alongside a tools definition, and "none" forces words.
+            if tool_state["rounds"] >= _tools_mod.MAX_TOOL_ROUNDS or tool_state["delivered"]:
+                kwargs["tool_choice"] = "none"
+            else:
+                kwargs["tool_choice"] = "auto"
+            messages[0]["content"] += _tools_mod.TOOL_USE_DIRECTIVE
+            # 🌸 Raise the randomized max_tokens floor (100 -> 300): a
+            # tool call is JSON the model has to finish emitting, and a
+            # reasoning model that spends a tiny budget on hidden thinking
+            # can get cut off mid-call (the same empty/truncated-output
+            # failure mode as the gpt-oss classifier fix — see memory of
+            # reasoning_effort="low" + larger max_tokens).
+            kwargs["max_tokens"] = random.randint(300, max_tokens_ceiling)
+            tool_state["attached"] = True
+
         # 3. Jalankan request dengan mendekompresi (unpack) kwargs
         # 🌸 self.client is AsyncGroq — awaited directly here (no
         # asyncio.to_thread needed, that was only correct for a sync
@@ -187,14 +300,56 @@ async def run_completion_loop(
     # iteration even with a single API key — without the extra slots,
     # a lone key runs the loop out of iterations partway through a
     # `continue` chain and a later-stage retry never actually happens.
-    max_attempts = max(len(service.api_keys), 1) + 3
+    # 🌸 Tool calling adds MAX_TOOL_ROUNDS more (each tool round-trip
+    # burns one `attempt`) + 1 for the "retry without tools" slot, so a
+    # reply that used its tool rounds still has its full 413/429 budget.
+    max_attempts = max(len(service.api_keys), 1) + 3 + 1 + _tools_mod.MAX_TOOL_ROUNDS
     for attempt in range(max_attempts):
         try:
             raw_response = await _call(used_slim_retry)
             service._log_rate_limits(raw_response.headers, username, model_to_use)
 
             completion = await raw_response.parse()
-            reply = _strip_reasoning(completion.choices[0].message.content)
+            response_message = completion.choices[0].message
+
+            # 🌸 TOOL CALL? — the model chose a custom tool instead of
+            # (or before) writing text. Execute each call (arguments
+            # JSON-decoded and handlers awaited / thread-offloaded inside
+            # engine/tools.py), append the assistant message + one
+            # role="tool" reply per tool_call_id, then `continue` so the
+            # same model reads the data and writes the final reply.
+            if getattr(response_message, "tool_calls", None):
+                if tool_state["rounds"] >= _tools_mod.MAX_TOOL_ROUNDS:
+                    # Model kept calling tools despite tool_choice="none".
+                    # Don't run them again (duplicate media posts) — burn
+                    # the attempt and try for a text answer.
+                    print("⚠️ Model requested more tool calls after the round cap — ignoring.")
+                    continue
+                tool_state["rounds"] += 1
+                tool_messages.append(_tools_mod.assistant_tool_call_message(response_message))
+                new_tool_messages, delivered, new_pending, new_private = await _tools_mod.run_tool_calls(
+                    service, response_message,
+                    message=message, shared_ctx=shared_ctx or shared,
+                )
+                tool_messages.extend(new_tool_messages)
+                # 🌸 Cards/embeds are NOT sent yet — they're parked on the
+                # service and flushed by groq_service.py right after the
+                # model's text reply goes out, so the text shows ABOVE the
+                # card (service.flush_tool_sends).
+                if new_pending:
+                    service._pending_tool_sends.setdefault(message.id, []).extend(new_pending)
+                private_payloads.extend(new_private)
+                if delivered:
+                    tool_state["delivered"] = True
+                continue
+
+            reply = _strip_reasoning(response_message.content)
+            # 🌸 DM LEAK GUARD — if the model sent something to the user's DMs
+            # via send_dm_to_user and then repeated it in the public reply,
+            # scrub it BEFORE the safety check, transcript, memory save and
+            # Discord send all see it.
+            if private_payloads:
+                reply = redact_dm_leaks(reply, private_payloads)
 
             # 🌸 OUTPUT-SIDE safety gate — catches cases where an
             # innocent-looking prompt (cipher/decode tricks, etc.)
@@ -264,6 +419,9 @@ async def run_completion_loop(
                 except Exception as log_err:
                     print(f"⚠️ Rate-limit embed error: {log_err}")
 
+            # 🌸 If every key ends up limited the loop runs out and returns None —
+            # keep the last 429 so the user can be told (engine.logging).
+            remember_ai_error(message_id, e)
             service.rotate_key()
             continue
         except GroqAPIStatusError as e:
@@ -277,6 +435,27 @@ async def run_completion_loop(
             # other non-429 status code (400, 500, etc.) falls
             # through to the generic handler below unchanged — this
             # branch only ever retries on a genuine 413.
+            # 🌸 400 with tools attached (tool_use_failed — malformed tool
+            # call JSON, or a model that can't do tool use at all). ONE
+            # retry with tools switched off so the user still gets a reply
+            # instead of silence. Only 400s: 413/429 have their own paths.
+            if (
+                getattr(e, "status_code", None) == 400
+                and tool_state["attached"]
+                and not tool_state["disabled_by_error"]
+            ):
+                err_headers = getattr(getattr(e, "response", None), "headers", None)
+                if err_headers:
+                    service._log_rate_limits(err_headers, username, model_to_use)
+                print(f"⚠️ Groq 400 on {model_to_use} with tools attached ({e}) — retrying without tools...")
+                tool_state["disabled_by_error"] = True
+                _retire_tools()
+                # 🌸 Tell the model it has no tools this turn so it declines
+                # honestly instead of improvising (it once invented a fake
+                # image link after a tool_use_failed 400).
+                personality = personality + _tools_mod.TOOLS_UNAVAILABLE_NOTE
+                continue
+
             if getattr(e, "status_code", None) == 413 and not used_slim_retry:
                 err_headers = getattr(getattr(e, "response", None), "headers", None)
                 if err_headers:
@@ -309,6 +488,7 @@ async def run_completion_loop(
                 print(f"⚠️ Groq 413 persisted on {model_to_use} — trying gpt-oss-120b + browser_search instead...")
                 used_browser_search_fallback = True
                 browser_search_active = True
+                _retire_tools()  # stage 2 carries browser_search only — no custom tools
                 model_to_use = "openai/gpt-oss-120b"
                 is_compound_call = False
                 continue
@@ -333,6 +513,7 @@ async def run_completion_loop(
                 print(f"⚠️ Groq 413 persisted on browser_search too — dropping search entirely, retrying plain...")
                 used_final_fallback = True
                 browser_search_active = False
+                _retire_tools()  # plain fallback — no tools, no tool history
                 fallback_pool = [
                     m for m in MODEL_POOL
                     if "compound" not in m.lower() and "gpt-oss-120b" not in m.lower()
@@ -349,6 +530,7 @@ async def run_completion_loop(
             if err_headers:
                 service._log_rate_limits(err_headers, username, model_to_use)
             print(f"⚠️ Groq APIStatusError (status_code={getattr(e, 'status_code', '?')}): {e}")
+            remember_ai_error(message_id, e)  # 🌸 lets groq_service.py show the user an error embed
             return None
         except Exception as e:
             # 🌸 BUGFIX: this used to check `"rate" in str(e).lower()`,
@@ -368,6 +550,7 @@ async def run_completion_loop(
                 service._log_rate_limits(err_headers, username, model_to_use)
 
             print(f"⚠️ Groq error ({type(e).__name__}): {e}")
+            remember_ai_error(message_id, e)  # 🌸 only connection/timeout errors become an embed
             return None
 
     return None

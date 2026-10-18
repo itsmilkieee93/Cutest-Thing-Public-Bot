@@ -150,7 +150,115 @@ DM_INSTRUCTIONS_REQUESTED = (
 DM_INSTRUCTIONS_DISALLOWED = "No [DM_START]/[DM_END] tag this time — this is a DM already."
 
 
-def build_dm_directives(dm_allowed: bool, dm_requested: bool) -> str:
+# 🌸 TOOL-CALLING VERSION of the DM instructions — used instead of the
+# [DM_START]/[DM_END] tag text above on turns where the main model has the
+# `send_dm_to_user` tool (engine/tools.py). Same policy (explicit ask OR
+# genuinely sensitive content, use rarely), but the model now CALLS A TOOL
+# and gets the REAL delivery outcome back before it writes its public
+# reply — so it can say "sent" / "your DMs are closed" truthfully, and the
+# separate generate_dm_notice AI call the tag path needed is skipped.
+DM_TOOL_INSTRUCTIONS = (
+    "To send something privately to the user's DMs — they explicitly ask (\"DM me "
+    "that\", \"kirim ke DM dong\", \"send it privately\") OR the content is genuinely "
+    "sensitive (a secret, coupon/redeem code, password, personal search results) — call "
+    "send_dm_to_user with ONLY the private text. Never write [DM_START]/[DM_END] tags. "
+    "NEVER repeat the private text in your public reply, not even partly. The tool "
+    "result says whether delivery worked: tell them honestly in your public message "
+    "(sent, or their DMs are blocked and they should allow DMs from server members). "
+    "Use it rarely — most replies need no DM."
+)
+DM_TOOL_INSTRUCTIONS_REQUESTED = (
+    "They just explicitly asked to be DM'd right now — you MUST call send_dm_to_user "
+    "this turn for whatever they asked to receive privately. Do not skip it."
+)
+
+
+async def send_private_dm(message: discord.Message, content: str) -> tuple[bool, str]:
+    """🌸 TOOL-CALLING path for the DM feature (`send_dm_to_user` tool).
+
+    Delivers `content` to message.author's DMs and returns (ok, result)
+    where `result` is a plain string for the tool message — it states the
+    REAL outcome (Discord's answer, not the model's hope) and tells the
+    model what to say / not say publicly. Never raises: Forbidden (DMs
+    closed / "Allow direct messages from server members" off) and any
+    other HTTPException become a failure string, same two cases
+    route_dm_split handles for the tag path.
+
+    Long text is split into <=2000-char messages (Discord's limit; the
+    tag path just truncated), capped at 3 so a runaway model can't spam.
+    """
+    content = (content or "").strip()
+    if not content:
+        return False, "ERROR: no content was provided to send."
+
+    user = message.author
+    chunks = [content[i:i + 2000] for i in range(0, len(content), 2000)][:3]
+    try:
+        for chunk in chunks:
+            await user.send(chunk)
+        print(f"✅ Sent DM (tool) to {user.name} ({user.id})")
+        return True, (
+            "DM delivered successfully. In your PUBLIC reply, say it's been sent to their "
+            "DMs without repeating any of the private content."
+        )
+    except discord.Forbidden:
+        print(f"⚠️ DM delivery blocked (Forbidden) for {user.name} ({user.id}) — privacy settings")
+        return False, (
+            "DM FAILED: the user's privacy settings block DMs from this bot/server members. "
+            "Tell them kindly to turn on 'Allow direct messages from server members' and ask "
+            "again. Do NOT put the private content in your public reply."
+        )
+    except discord.HTTPException as e:
+        print(f"⚠️ DM delivery failed (tool) for {user.name} ({user.id}): {e}")
+        return False, (
+            "DM FAILED: Discord had an error delivering it. Tell them to try again in a "
+            "moment. Do NOT put the private content in your public reply."
+        )
+
+
+_DIGIT_TOKEN = re.compile(r"[A-Za-z0-9_\-]{6,}")
+
+
+def redact_dm_leaks(reply: str, payloads: list[str]) -> str:
+    """🌸 LEAK GUARD for the tool-calling DM path. The tag path had
+    route_dm_split's hard safety net; here the private text lives in a
+    tool ARGUMENT, so the only way it reaches the channel is the model
+    repeating it in its public reply despite being told not to. This
+    scrubs that: any exact (case-insensitive) copy of a sent payload, plus
+    any 6+ char code-like token from it (letters+digits — coupon codes,
+    passwords, API keys) that shows up in `reply`, becomes 🔒.
+    Best-effort: a model that paraphrases a secret can't be caught by
+    string matching — the directive is still the first line of defense."""
+    if not reply or not payloads:
+        return reply
+    out = reply
+    for payload in payloads:
+        payload = (payload or "").strip()
+        if len(payload) >= 4:
+            out = re.sub(re.escape(payload), "🔒", out, flags=re.IGNORECASE)
+        for token in set(_DIGIT_TOKEN.findall(payload)):
+            if any(c.isdigit() for c in token) and any(c.isalpha() for c in token):
+                out = re.sub(re.escape(token), "🔒", out, flags=re.IGNORECASE)
+    return out
+
+
+def describe_snowflake(raw: str) -> str:
+    """🌸 TOOL-CALLING path for the snowflake decoder (`decode_discord_snowflake`
+    tool): accepts the ID the way a user would paste it (digits, maybe
+    wrapped in <@...>, <#...>, spaces or a URL tail), validates it, and
+    returns format_snowflake_info's sentence — or an ERROR string for the
+    tool message. Pure local math, no API call."""
+    digits = re.sub(r"\D", "", raw or "")
+    # Real snowflakes are 17-20 digits; shorter/longer is a typo or not an ID.
+    if not (17 <= len(digits) <= 20):
+        return "ERROR: that doesn't look like a Discord ID (they are 17-20 digits)."
+    try:
+        return format_snowflake_info(int(digits))
+    except (ValueError, OverflowError, OSError):
+        return "ERROR: that number can't be decoded as a Discord ID."
+
+
+def build_dm_directives(dm_allowed: bool, dm_requested: bool, via_tool: bool = False) -> str:
     """🌸 Single entry point groq_ai.get_ai_response calls to build the
     DM-related block of the system prompt, so the "which constant(s) for
     which situation" branching lives in ONE place instead of being
@@ -161,9 +269,17 @@ def build_dm_directives(dm_allowed: bool, dm_requested: bool) -> str:
     dm_requested: True when DM_REQUEST_PATTERN matched the user's
                   message this turn (computed by the caller, same shape
                   as user_asking_for_react in groq_service.py).
+    via_tool:     True when this reply's model has the send_dm_to_user
+                  tool — swaps the [DM_START] tag instructions for the
+                  tool-calling ones. False keeps the legacy tag text
+                  (turns with no tools: compound search, crisis, fallbacks).
     """
     if not dm_allowed:
         return DM_INSTRUCTIONS_DISALLOWED
+    if via_tool:
+        if dm_requested:
+            return f"{DM_TOOL_INSTRUCTIONS}\n{DM_TOOL_INSTRUCTIONS_REQUESTED}"
+        return DM_TOOL_INSTRUCTIONS
     if dm_requested:
         return f"{DM_INSTRUCTIONS}\n{DM_INSTRUCTIONS_REQUESTED}"
     return DM_INSTRUCTIONS
