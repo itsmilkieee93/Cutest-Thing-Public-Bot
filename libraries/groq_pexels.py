@@ -259,13 +259,148 @@ CAPTION_MODEL = "openai/gpt-oss-20b"
 
 CAPTION_SYSTEM_PROMPT = (
     "You are Cutest Thing, a kawaii-themed Discord bot with a pink/purple "
-    "sparkly aesthetic. You just found a photo or video for someone. Write "
-    "ONE short, cute, enthusiastic caption/reaction to go above the media "
-    "link — under 12 words, casual, can use 1-2 emoji (🌸💖✨🎀). No "
-    "quotation marks, no markdown, just the line itself. Don't describe "
-    "the image in detail since you haven't actually seen it yet — just "
-    "react with excitement about finding it."
+    "sparkly aesthetic. You just found a photo or video for someone. "
+    "Write ONE short, cute, enthusiastic caption/reaction to go above the image "
+    "(under 12 words). Be playful and varied each time — mix styles: "
+    "excited, soft, sparkly, teasing, warm, or bubbly. "
+    "Use 1-2 emoji max (🌸💖✨🎀💕⭐). No quotation marks, no markdown. "
+    "Don't describe the image in detail — just react with joy about finding it. "
+    "Output ONLY the caption text itself: no tags, no special tokens, no "
+    "angle-bracket markers, nothing before or after it."
 )
+
+
+
+# 🌸 gpt-oss models sometimes leak their Harmony chat-format control tokens
+# (<|constrain|>, <|channel|>, <|message|>, <|end|> ...) into the visible
+# content — that's the "<|constrain|>🎀 <|constrain|>🎀" junk that showed up
+# in the caption title. Everything after the first leaked token is garbage,
+# so we cut there; if that leaves nothing, we just strip the tokens out.
+_HARMONY_TOKEN_RE = re.compile(r"<\|[^|>\n]{0,40}\|>")
+_HARMONY_PARTIAL_RE = re.compile(r"<\|[^\n]*$")
+
+
+def _clean_caption(raw: str | None) -> str | None:
+    """🌸 Sanitize a model-written caption. Returns None if nothing usable."""
+    if not raw:
+        return None
+    text = raw
+
+    # Cut at the first leaked control token (keep what came before it)
+    m = _HARMONY_TOKEN_RE.search(text)
+    if m:
+        head = text[:m.start()].strip()
+        text = head if head else _HARMONY_TOKEN_RE.sub(" ", text)
+    # Dangling/truncated token like "<|constr" at the very end
+    text = _HARMONY_PARTIAL_RE.sub("", text)
+
+    # Single line, no markdown/quote noise, tidy whitespace
+    text = text.strip().splitlines()[0] if text.strip() else ""
+    text = re.sub(r"[*_`#>\"“”]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip().strip("'").strip()
+
+    # Must still contain something readable (not just emoji / punctuation)
+    if not re.search(r"[A-Za-z0-9]", text):
+        return None
+    return text or None
+
+
+# ── Vision caption: actually LOOKS at the image and describes it ───────────
+# 🌸 Groq's vision-capable models (as of Oct 2026): qwen/qwen3.8-27b and
+# qwen/qwen3.6-27b (llama-4-scout was retired in June 2026). Tried in order;
+# if the first is unavailable the next one is used, and if both fail the
+# caller falls back to the text-only caption below.
+VISION_MODELS = ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b"]
+
+VISION_CAPTION_SYSTEM_PROMPT = (
+    "You are Cutest Thing, a kawaii-themed Discord bot with a pink/purple "
+    "sparkly aesthetic. Look at the image and write ONE warm, cute sentence "
+    "that genuinely describes what is in it: the main subject, hair and "
+    "outfit colors, pose or expression, and the setting or mood. "
+    "Keep it under 160 characters and end with 1-2 emoji from 🌸💖✨🎀💕⭐. "
+    "Describe ONLY what you can actually see, and keep it wholesome. "
+    "NEVER mention where the image came from: no website, API, library, "
+    "photographer, artist, 'stock photo', and never write the words "
+    "Pexels, Pixabay, nekos, neko, or any site name. Say things like "
+    "'cat-eared girl' instead of 'neko'. "
+    "No quotation marks, no markdown, no special tokens. "
+    "Output ONLY the sentence."
+)
+
+# 🌸 Words that reveal the source/provider. If one slips into a caption we
+# retry once, then give up on that caption instead of showing it.
+_SOURCE_WORD_RE = re.compile(
+    r"\b(pexels|pixabay|nekos?(?:\.?best|\.?life)?|nekosbest|stock\s+(?:photo|image)s?)\b",
+    re.IGNORECASE,
+)
+
+# Qwen thinking models can emit <think>...</think> in the content.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+async def _describe_image_caption(image_url: str, hint: str | None = None) -> str | None:
+    """🌸 Sends the image URL to a Groq vision model and returns a one-line
+    cute DESCRIPTION of what's actually in the picture. Returns None on any
+    failure (no key, unsupported format such as some GIFs, network error,
+    source-name leak twice, empty output) — callers then fall back to the
+    text-only caption. Never raises."""
+    client = _get_groq_client()
+    if not client or not image_url:
+        return None
+
+    user_text = "Write the caption for this image."
+    if hint:
+        user_text += f" (It was found by searching for: {hint})"
+
+    def _call(model: str, extra_rule: str = ""):
+        kwargs = dict(
+            model=model,
+            messages=[
+                {"role": "system", "content": VISION_CAPTION_SYSTEM_PROMPT + extra_rule},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]},
+            ],
+            temperature=0.7,
+            max_tokens=500,
+        )
+        try:
+            # Ask for no thinking: we only want the final sentence.
+            return client.chat.completions.create(
+                **kwargs, extra_body={"reasoning_effort": "none"}
+            )
+        except Exception as e:
+            # Model/SDK rejected the reasoning param — retry plain.
+            if "reasoning" in str(e).lower():
+                return client.chat.completions.create(**kwargs)
+            raise
+
+    for model in VISION_MODELS:
+        extra_rule = ""
+        for attempt in (1, 2):
+            try:
+                response = await asyncio.to_thread(_call, model, extra_rule)
+            except Exception as e:
+                logger.warning(f"Vision caption failed ({model}): {type(e).__name__}: {e}")
+                break  # try next model
+
+            raw = response.choices[0].message.content or ""
+            raw = _THINK_RE.sub("", raw)
+            caption = _clean_caption(raw)
+            if caption and not _SOURCE_WORD_RE.search(caption):
+                if len(caption) > 200:
+                    caption = caption[:197].rstrip() + "..."
+                return caption
+
+            logger.warning(
+                f"Vision caption unusable ({model}, attempt {attempt}): raw={raw[:100]!r}"
+            )
+            extra_rule = (
+                " IMPORTANT: your last answer was rejected because it was empty or "
+                "mentioned a source/site name. Describe only the visible content."
+            )
+    return None
 
 
 async def _maybe_caption_text(query: str, kind: str, force: bool = False) -> str | None:
@@ -285,33 +420,59 @@ async def _maybe_caption_text(query: str, kind: str, force: bool = False) -> str
     if not client:
         return None
 
+    # Add a tiny random style hint for more variety
+    styles = ["soft and dreamy", "super excited", "bubbly and sparkly", "warm and sweet", "playful and teasing", "gentle and cute"]
+    style_hint = random.choice(styles)
+
     def _call():
         return client.chat.completions.create(
             model=CAPTION_MODEL,
             messages=[
                 {"role": "system", "content": CAPTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"You found a {kind} of: {query}"},
+                {"role": "user", "content": f"You found a {kind} of: {query}. Style: {style_hint}"},
             ],
             temperature=0.9,
-            # 🌸 Same reasoning-model headroom fix as _classify_media_request
-            # above — 30 tokens with default reasoning_effort risked an
-            # empty caption (silently skipped, which is low-stakes here,
-            # but no reason to leave the same bug lurking twice).
             reasoning_effort="low",
-            max_tokens=120,
+            # 🌸 Keep chain-of-thought out of message.content entirely.
+            # (extra_body so older groq SDK versions don't choke on the kwarg)
+            extra_body={"include_reasoning": False},
+            # 🌸 120 was tight for a reasoning model — if the hidden thinking
+            # eats the budget the caption gets cut off mid-token.
+            max_tokens=400,
         )
 
     try:
-        response = await asyncio.to_thread(_call)
-        caption = (response.choices[0].message.content or "").strip()
-        caption = caption.strip('"').strip("'").strip()
-        return caption or None
+        for attempt in (1, 2):
+            response = await asyncio.to_thread(_call)
+            raw = (response.choices[0].message.content or "")
+            caption = _clean_caption(raw)
+            if caption and not _SOURCE_WORD_RE.search(caption):
+                if len(caption.split()) > 16:
+                    caption = " ".join(caption.split()[:16])
+                return caption
+            logger.warning(
+                f"Caption unusable after cleaning (attempt {attempt}, {kind}, "
+                f"query='{query}'): raw={raw[:80]!r}"
+            )
+        return None
     except Exception as e:
         logger.warning(f"Caption generation failed ({kind}, query='{query}'): {e}")
         return None
 
 
-async def _build_image_embed(
+def _link_button_rows(buttons: list, per_row: int = 2) -> list:
+    """🌸 Packs link buttons into ActionRows of `per_row` (default 2) so a
+    4-button set renders as a tidy 2x2 grid instead of wrapping awkwardly."""
+    rows = []
+    for i in range(0, len(buttons), per_row):
+        row = discord.ui.ActionRow()
+        for b in buttons[i:i + per_row]:
+            row.add_item(b)
+        rows.append(row)
+    return rows
+
+
+async def _build_image_layout(
     query: str,
     image_url: str,
     kind: str,
@@ -322,57 +483,87 @@ async def _build_image_embed(
     author_avatar_url: str | None = None,
     color: int = 0xFFB6D9,
     provider: str = "Pexels",
-) -> discord.Embed:
-    """🌸 Builds a discord.Embed with the image set via set_image() — this
-    is what actually hides the raw link text; a bare-URL reply always
-    shows the link above Discord's own auto-embed, but embed.set_image()
-    renders the image with nothing else visible. The optional cute
-    caption (per CAPTION_CHANCE) becomes the embed description instead
-    of a prepended text line.
+) -> discord.ui.LayoutView:
+    """🌸 Builds a Discord Components V2 LayoutView that acts like an embed:
+    Container (accent colour) + optional caption TextDisplay + MediaGallery
+    for the image + ActionRow with a link Button for attribution.
 
-    Attribution — rewritten to satisfy Pexels' literal required phrasing
-    ("Photo by [Name] on Pexels", linked to the photo page) as ONE
-    unified, immediately-visible credit line rather than splitting the
-    name and the "on Pexels"/"on Pixabay" part across embed.title and
-    embed.set_author() the way this used to work. A reviewer (or a user)
-    glancing at the embed without clicking anything now sees the full
-    phrase at once, in embed.set_author():
-      - name  -> "Photo by {author_name} on {provider}" (or "Image by
-        ..." for Pixabay/vector/cartoon, since those aren't literally
-        "photos").
-      - url   -> the photo/post page itself (post_url, e.g. the Pexels
-        /photo/... page), NOT the photographer's profile — Pexels'
-        guideline is specifically "with a link to the photo page on
-        Pexels", not to the profile. This is also more useful to a user
-        wanting to see the original.
-      - icon_url -> author_avatar_url when the provider has one
-        (Pixabay's userImageURL; Pexels has no avatar field).
-    embed.title is no longer used for attribution at all — it's freed up
-    for the caption/description to do its normal job, so the credit line
-    can't be mistaken for a generic title.
+    Attribution is now a clickable link button ("Photo by Name on Pexels")
+    that opens the original post page, instead of set_author on an Embed.
     """
-    caption = await _maybe_caption_text(query, kind)
+    # 🌸 Vision caption first (describes what's actually in the picture);
+    # fall back to the text-only cute caption if vision isn't available.
+    caption = await _describe_image_caption(image_url, hint=query)
+    if not caption:
+        caption = await _maybe_caption_text(query, kind, force=True)
 
-    embed = discord.Embed(
-        description=caption if caption else None,
-        color=color,
+    view = discord.ui.LayoutView(timeout=None)
+    items = []
+
+    # AI caption as the title (fallback to query if caption fails)
+    title = caption or (query.strip().title() if query else "Image")
+    if len(title) > 200:
+        title = title[:197] + "..."
+    items.append(discord.ui.TextDisplay(f"## {title}"))
+
+    # Small separator for clean alignment
+    items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    # Image
+    gallery = discord.ui.MediaGallery(
+        discord.MediaGalleryItem(
+            media=image_url,
+            description=(query[:100] if query else None),
+        )
     )
+    items.append(gallery)
 
+    # Separator below the photo (matches the one above)
+    items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    # Attribution + direct photo link buttons
     if author_name and post_url:
         noun = "Photo" if provider == "Pexels" else "Image"
-        embed.set_author(
-            name=f"{noun} by {author_name} on {provider}",
-            url=post_url,
-            icon_url=author_avatar_url or None,
+        label = f"{noun} by {author_name} on {provider}"
+        if len(label) > 80:
+            label = label[:77] + "..."
+        row = discord.ui.ActionRow()
+        row.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label=label,
+                url=post_url,
+            )
         )
+        # Direct photo link
+        row.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Open photo",
+                url=image_url,
+            )
+        )
+        items.append(row)
     elif author_name:
-        # 🌸 Fallback if a post_url is somehow missing — still show the
-        # required phrase, just without it being a clickable link.
         noun = "Photo" if provider == "Pexels" else "Image"
-        embed.set_author(name=f"{noun} by {author_name} on {provider}")
+        items.append(discord.ui.TextDisplay(f"{noun} by {author_name} on {provider}"))
+    else:
+        # At least a direct photo button
+        row = discord.ui.ActionRow()
+        row.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Open photo",
+                url=image_url,
+            )
+        )
+        items.append(row)
 
-    embed.set_image(url=image_url)
-    return embed
+
+    container = discord.ui.Container(*items, accent_colour=color)
+    view.add_item(container)
+    return view
+
 
 
 async def _build_video_reply(query: str, video_url: str) -> str:
@@ -488,7 +679,7 @@ async def handle_media_request(
     shared,
     query_hint: str | None = None,
     kind_hint: str | None = None,
-) -> discord.Embed | str | None:
+) -> discord.ui.LayoutView | str | None:
     """
     🌸 AI-CLASSIFIED MEDIA HANDLER — the single interceptor entry point.
 
@@ -498,17 +689,20 @@ async def handle_media_request(
     video) or Pixabay (vector/cartoon).
 
     Returns:
-      - discord.Embed for photo (Pexels) / vector / cartoon (Pixabay).
+      - discord.ui.LayoutView for photo (Pexels) / vector / cartoon (Pixabay).
+        The layout uses Components V2 (Container + MediaGallery + link button
+        for attribution).
       - a bare str (the raw .mp4 CDN link, no caption) for video, so
         Discord's own embed crawler renders a native inline video player
-        instead of a broken image box inside a discord.Embed.
+        instead of a broken image box.
       - None if the message isn't a media request / the relevant API key
         is missing / the request fails / nothing is found — caller falls
         through to the next interceptor or Groq's full reply normally.
 
     bot_service.py's reply site must check isinstance(result,
-    discord.Embed) to know whether to call message.reply(embed=...) or
-    message.reply(content=...) (str case, video).
+    discord.ui.LayoutView) to know whether to call message.reply(view=...) or
+    message.reply(content=...) (str case, video). (tools.py already handles
+    LayoutView via its _deliver path.)
 
     🌸 `query_hint` / `kind_hint` (new): the `search_visual_media` tool's
     JSON arguments, extracted by the main chat model in the same pass
@@ -545,10 +739,10 @@ async def handle_media_request(
         return await _fetch_pexels_photo(message, guild_id, query)
 
 
-async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Embed | None:
+async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.ui.LayoutView | None:
     """🌸 Hits Pexels /v1/search for a real photo and returns a
-    discord.Embed with the image set via set_image(), or None on any
-    failure/empty result."""
+    Components V2 LayoutView (Container + MediaGallery + attribution button),
+    or None on any failure/empty result."""
     headers = _get_pexels_headers()
     if not headers:
         logger.warning("PEXELS_API_KEY missing — skipping Pexels intercept.")
@@ -620,7 +814,7 @@ async def _fetch_pexels_photo(message, guild_id: int, query: str) -> discord.Emb
     # raises; None just means no icon on the credit line, same as before.
     avatar_url = await _get_pexels_avatar_url(photographer_id, photographer_url)
 
-    return await _build_image_embed(
+    return await _build_image_layout(
         query, image_url, "photo",
         post_url=post_url,
         author_name=photographer,
@@ -693,11 +887,11 @@ async def _fetch_pexels_video(message, guild_id: int, query: str) -> str | None:
     return await _build_video_reply(query, video_url)
 
 
-async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) -> discord.Embed | None:
+async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) -> discord.ui.LayoutView | None:
     """🌸 Hits Pixabay's image search with image_type set from `kind`
     ("vector" -> vector, "cartoon" -> illustration) and returns a
-    discord.Embed with the best available CDN link set via set_image(),
-    or None on any failure/empty result."""
+    Components V2 LayoutView with the best available CDN link in a
+    MediaGallery plus attribution button, or None on any failure/empty result."""
     api_key = _get_pixabay_key()
     if not api_key:
         logger.warning("PIXABAY_API_KEY missing — skipping Pixabay intercept.")
@@ -854,7 +1048,7 @@ async def _fetch_pixabay_image(message, guild_id: int, query: str, kind: str) ->
         f"🎨 Media request ({kind}) | User: {message.author} ({message.author.id}) "
         f"| Query: '{query}' | image_type: {image_type} | Pixabay ID: {hit_id} | Guild: {guild_id}"
     )
-    return await _build_image_embed(
+    return await _build_image_layout(
         query, image_url, "image",
         post_url=post_url,
         author_name=credit_user,
@@ -928,10 +1122,10 @@ async def fetch_nekos_url(category: str) -> str | None:
     return None
 
 
-async def _fetch_nekosbest(category: str) -> tuple[str, str | None] | None:
-    """nekos.best via the official async `nekosbest` library (aiohttp
-    inside, so it never blocks the event loop). Returns (image_url, credit)
-    or None on ANY failure. Never raises."""
+async def _fetch_nekosbest(category: str) -> dict | None:
+    """nekos.best via the official async `nekosbest` library.
+    Returns a dict with url + optional artist/source fields, or None on failure.
+    Never raises."""
     if not _NEKOSBEST_OK:
         logger.warning("nekosbest is not installed (pip install -U nekosbest)")
         return None
@@ -949,42 +1143,119 @@ async def _fetch_nekosbest(category: str) -> tuple[str, str | None] | None:
     except asyncio.TimeoutError:
         logger.warning(f"nekos.best timed out after {NEKOS_TIMEOUT_SECONDS}s (category={category})")
         return None
-    except Exception as e:  # lib's own ClientError, DNS/connection resets, etc.
+    except Exception as e:
         logger.warning(f"nekos.best request failed: {type(e).__name__}: {e}")
         return None
 
     url = getattr(result, "url", None)
     if not (isinstance(url, str) and url.startswith("http")):
         return None
-    # Still images carry artist_name; GIF categories carry anime_name.
-    credit = getattr(result, "artist_name", None) or getattr(result, "anime_name", None)
-    return url, (str(credit) if credit else None)
+
+    # Images: artist_name + artist_href + source_url
+    # GIFs: anime_name only
+    return {
+        "url": url,
+        "artist_name": getattr(result, "artist_name", None) or getattr(result, "anime_name", None),
+        "artist_href": getattr(result, "artist_href", None),
+        "source_url": getattr(result, "source_url", None),
+    }
 
 
-async def fetch_nekos_embed(provider: str, category: str) -> discord.Embed | None:
+
+async def fetch_nekos_embed(provider: str, category: str) -> discord.ui.LayoutView | None:
     """🌸 The handler tools.py calls once its dice roll picks an anime API.
 
     provider: "best" (nekos.best library) or "life" (nekos.life REST).
-    Returns a pink discord.Embed with the image and a footer credit +
-    favicon, or None if the provider failed / timed out / returned nothing
-    — the caller then falls back to Pixabay. Never raises.
+    Returns a pink Components V2 LayoutView with the image + photo and
+    artist link buttons (when available), or None on failure.
     """
     if provider not in NEKOS_PROVIDERS:
         return None
-    label, favicon = NEKOS_PROVIDERS[provider]
+    label, _favicon = NEKOS_PROVIDERS[provider]
 
-    credit = None
+    image_url = None
+    artist_name = None
+    artist_href = None
+    source_url = None
+
     if provider == "best":
-        found = await _fetch_nekosbest(category)
-        image_url, credit = found if found else (None, None)
+        data = await _fetch_nekosbest(category)
+        if data:
+            image_url = data["url"]
+            artist_name = data.get("artist_name")
+            artist_href = data.get("artist_href")
+            source_url = data.get("source_url")
     else:
         image_url = await fetch_nekos_url(category)
 
     if not image_url:
         return None
 
-    embed = discord.Embed(color=NEKOS_EMBED_COLOR)
-    embed.set_image(url=image_url)
-    footer = f"via {label}" + (f" · {credit}" if credit else "")
-    embed.set_footer(text=footer[:200], icon_url=favicon)
-    return embed
+    view = discord.ui.LayoutView(timeout=None)
+    items = []
+
+    # 🌸 Vision caption describing the actual picture; no hint is passed so
+    # the category/provider name ("neko", "nekos.best") can't leak into it.
+    caption = await _describe_image_caption(image_url)
+    if not caption:
+        caption = await _maybe_caption_text("anime art", "cartoon", force=True)
+    # Generic categories read like a source name, so use a neutral fallback.
+    _generic = {"", "neko", "waifu", "kitsune", "husbando"}
+    fallback_title = (
+        "Anime art 🌸" if (category or "").lower() in _generic
+        else category.replace("_", " ").title()
+    )
+    title = caption or fallback_title
+    if len(title) > 200:
+        title = title[:197] + "..."
+    items.append(discord.ui.TextDisplay(f"## {title}"))
+
+    # Small separator so the image is cleanly aligned under the title
+    items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    gallery = discord.ui.MediaGallery(
+        discord.MediaGalleryItem(media=image_url, description=(caption or "anime art")[:1000])
+    )
+    items.append(gallery)
+
+    # Separator below the photo (matches the one above)
+    items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
+
+    # Link buttons: Photo/Source + Artist + CDN + site — 2 per row
+    buttons = []
+
+    # 1. Photo / original source button
+    photo_url = source_url or image_url
+    photo_label = "Photo" if source_url else "Open photo"
+    buttons.append(
+        discord.ui.Button(style=discord.ButtonStyle.link, label=photo_label, url=photo_url)
+    )
+
+    # 2. Artist button (only when we have a real artist page)
+    if artist_href and isinstance(artist_href, str) and artist_href.startswith("http"):
+        artist_label = f"Artist: {artist_name}" if artist_name else "Artist"
+        if len(artist_label) > 80:
+            artist_label = artist_label[:77] + "..."
+        buttons.append(
+            discord.ui.Button(style=discord.ButtonStyle.link, label=artist_label, url=artist_href)
+        )
+
+    # 3. Direct nekos CDN image link
+    buttons.append(
+        discord.ui.Button(style=discord.ButtonStyle.link, label="CDN", url=image_url)
+    )
+
+    # 4. Provider site button
+    site_url = "https://nekos.best" if provider == "best" else "https://nekos.life"
+    buttons.append(
+        discord.ui.Button(style=discord.ButtonStyle.link, label=f"via {label}", url=site_url)
+    )
+
+    items.extend(_link_button_rows(buttons, per_row=2))
+
+
+    container = discord.ui.Container(*items, accent_colour=NEKOS_EMBED_COLOR)
+    view.add_item(container)
+    return view
+
+

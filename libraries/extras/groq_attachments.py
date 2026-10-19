@@ -56,14 +56,14 @@ import discord
 
 # 🌸 Model choice — see module docstring for the per-model image-count
 # caps this is built around. qwen3.6-27b is the DEFAULT (more generous
-# 5-image cap, and it's already in groq_instruct.MODEL_POOL for the main
+# 5-image cap, and it's already in groq_instruct.MODEL_POOL for the mainkgiiui
 # text pipeline, so reusing it here doesn't introduce a brand new
 # unfamiliar model into the system). qwen3.8-27b is offered as the
 # explicit "stronger reasoning, fewer images" alternative — see
 # choose_vision_model below — for callers that want frontier-level
 # analysis of 1-3 images specifically (e.g. detailed OCR/comparison)
 # rather than just "what's in this picture".
-VISION_MODEL_DEFAULT = "qwen/qwen3.6-27b"
+VISION_MODEL_DEFAULT = "qwen/qwen3.8-27b"
 VISION_MODEL_STRONGER = "qwen/qwen3.8-27b"
 
 VISION_MODEL_MAX_IMAGES = {
