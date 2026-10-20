@@ -13,6 +13,8 @@ itself:
     search_and_play_music     -> groq_music_suggestion.handle_music_request
     query_peran_server        -> groq_instruct.handle_role_query
     check_member_existence    -> groq_instruct.handle_member_lookup_query
+                                 (+ intent='props': facts/jokes/roasts from real member props,
+                                  + intent='profile': pfp/banner description)
 
 Division of labor (so completion.py stays small):
   - TOOL_SCHEMAS / get_tool_schemas()  → what _call() puts in kwargs["tools"]
@@ -34,6 +36,7 @@ import asyncio
 import inspect
 import random
 from collections import OrderedDict
+from datetime import datetime, timezone
 
 import discord
 
@@ -88,6 +91,13 @@ _PROFILE_VISION_MAX_TOKENS = 700  # qwen may spend tokens on <think> first
 # same member is often asked about repeatedly.
 _PROFILE_DESC_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _PROFILE_DESC_CACHE_MAX = 100
+
+# 🌸 check_member_existence(intent='props'): the member's real server
+# properties (account age, join date, roles, badges…) for facts / jokes /
+# light roasts / trivia. Pure discord.py cache reads — no extra API call.
+_PROPS_MAX_ROLES = 12          # role names listed (highest first)
+_PROPS_MAX_CHARS = 750         # hard cap on the props block
+_MEMBER_RESULT_MAX_CHARS = 2600  # member lookups may carry profile + props
 
 
 TOOL_SCHEMAS = [
@@ -328,12 +338,16 @@ TOOL_SCHEMAS = [
                 "this ssrver', 'is X there'). Never answer yes or no from your own guess, and "
                 "call it AGAIN even if the same person was already asked about earlier in the "
                 "chat (membership changes, old answers are stale). "
-                "Also call it when the user asks about a specific member in general (opinion, "
-                "'is X friendly', 'what do you think of X') so you never guess about someone you "
-                "can't see — but that only confirms they're here; you do NOT know their personality. "
+                "ALSO call it for ANYTHING else about a specific member — a fun fact, joke, "
+                "light roast, compliment, trivia, rating, comparison, 'tell me about X', 'how long has "
+                "X been here', 'what roles does X have', an opinion — with intent='props': the result "
+                "then includes their REAL server properties (account age, join date, roles, nickname, "
+                "booster status, badges, status) and you build the fun/fact/joke ONLY from those. You "
+                "still do NOT know their personality or private life, so never invent any. "
                 "Pass intent='profile' ONLY when the user EXPLICITLY asks about their profile "
                 "picture / pfp / avatar / banner / avatar decoration / accent colour or how they look; "
-                "then the result includes a description of those. Never use it just because someone asked for an opinion. "
+                "then the result includes a description of those (use 'profile,props' for both). "
+                "Never use 'profile' just because someone asked for an opinion. "
                 "For the asker's OWN profile ('is my pfp cool') pass the asker's own name — the @mention that "
                 "addresses YOU (the bot) is never the target. "
                 "NOT for celebrities or public figures who aren't members here. Server-only."
@@ -355,9 +369,13 @@ TOOL_SCHEMAS = [
                     "intent": {
                         "type": "string",
                         "description": (
-                            "Optional. 'profile' ONLY when the user explicitly asks about this "
-                            "member's profile picture, avatar, banner, avatar decoration or accent colour, or how they look. Omit it "
-                            "for everything else (plain 'is X here', opinions, 'is X friendly')."
+                            "Optional. 'props' when the user wants ANYTHING beyond a plain yes/no about "
+                            "this member: a fact, joke, light roast, compliment, trivia, rating, comparison, "
+                            "opinion or 'tell me about X' — you then get their real server properties "
+                            "(account age, join date, roles, nickname, booster, badges, status) to build it from. "
+                            "'profile' ONLY when the user explicitly asks about their profile picture, avatar, "
+                            "banner, avatar decoration or accent colour, or how they look. 'profile,props' for "
+                            "both. Omit it for a plain 'is X here'."
                         ),
                     },
                 },
@@ -380,10 +398,13 @@ TOOL_USE_DIRECTIVE = (
     "name people from your own guess, even if it seems obvious. Call the tool again even "
     "if you answered the same question earlier in this chat. NEVER reply with only an "
     "emoji (a lone check or cross is not an answer): always write a short sentence naming the person. "
-    "If the user asks about a specific server member in general (opinion, 'is X friendly'), "
-    "still call check_member_existence, but WITHOUT intent — that only confirms they're here; "
-    "you know nothing about their personality, so say that sweetly instead of guessing. Only "
-    "when the user EXPLICITLY asks about their profile picture/banner/decoration/accent colour/looks, pass intent='profile'. "
+    "If the user asks anything about a specific server member (a fact, joke, light roast, "
+    "compliment, trivia, rating, 'tell me about X', 'how long has X been here', an opinion), call "
+    "check_member_existence with intent='props' and build the answer ONLY from the properties it "
+    "returns — you know nothing else about them, so never invent personality, hobbies or private "
+    "details; if they want something the properties don't cover, say sweetly you can't see that. "
+    "Only when the user EXPLICITLY asks about their profile picture/banner/decoration/accent "
+    "colour/looks, pass intent='profile' ('profile,props' for both). "
     "For 'my pfp/banner/accent' (the ASKER's own), target_name is the asker's own name — the "
     "@mention that addresses you is NEVER the target.\n"
 
@@ -500,10 +521,11 @@ def _with_mention_note(text: str) -> str:
     return text
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, limit: int | None = None) -> str:
+    limit = limit or _MAX_TOOL_RESULT_CHARS
     text = (text or "").strip()
-    if len(text) > _MAX_TOOL_RESULT_CHARS:
-        return text[:_MAX_TOOL_RESULT_CHARS] + "\n…(truncated)"
+    if len(text) > limit:
+        return text[:limit] + "\n…(truncated)"
     return text
 
 
@@ -760,16 +782,16 @@ async def _exec_music(ctx: _Ctx, args: dict) -> str:
     return await _deliver(ctx, result)
 
 
-async def _text_result(ctx: _Ctx, result, *, empty_msg: str) -> str:
+async def _text_result(ctx: _Ctx, result, *, empty_msg: str, limit: int | None = None) -> str:
     """🌸 Shared tail for the two server lookups: str/Embed → text for the
     model; any other shape (LayoutView, tuple) is delivered to the channel
     instead since it can't be flattened."""
     if result is None:
         return empty_msg
     if isinstance(result, str):
-        return _clip(_with_mention_note(result))
+        return _clip(_with_mention_note(result), limit)
     if isinstance(result, discord.Embed):
-        return _clip(_with_mention_note(_embed_to_text(result)))
+        return _clip(_with_mention_note(_embed_to_text(result)), limit)
     return await _deliver(ctx, result)
 
 
@@ -816,28 +838,54 @@ def card_delivered(message_id: int) -> bool:
     return message_id in _CARD_DELIVERED
 
 
-def _member_result_for_model(result: str, profile_block: str | None = None) -> str:
+_PROFILE_RULES = (
+    "The user explicitly asked about this member's profile picture/banner/looks. "
+    "Answer exactly that, in your own voice, using ONLY the PROFILE above — never invent "
+    "anything beyond it. Describing the images is fine, but don't turn them into claims "
+    "about the person's personality or character. Be warm and kind; no insults, no guesses "
+    "about who they really are. If an image couldn't be viewed or isn't set, say that "
+    "honestly. If the profile has NITRO_FLAG / DECO_FLAG lines, you may react to them "
+    "playfully in character (e.g. treat them like a fancy Nitro member, 'ooh Nitro vibes' / "
+    "'that a_ animated pfp is so fancy'); a NITRO_FLAG is a strong hint, a DECO_FLAG alone is "
+    "not proof of Nitro, and never state that they are rich or comment on their money."
+)
+
+_PROPS_RULES = (
+    "The user wants something about this member (a fact, joke, light roast, compliment, "
+    "trivia, rating, comparison or just info). Build it ONLY from the PROPS above — never "
+    "invent anything beyond it, and never claim to know their personality, hobbies, messages "
+    "or private life. Playful teasing about the stats (join date, account age, roles, badges, "
+    "boosting, 'ancient account', 'collects roles like trophies') is welcome, but keep it warm "
+    "and kind: no real insults, and no jokes about appearance, identity, religion, health, "
+    "family or money. Use the exact numbers/dates given. 1-3 short sentences unless they "
+    "ask for more, in your usual voice. If they ask for something the PROPS don't cover, say "
+    "sweetly that you can't see that."
+)
+
+
+def _member_result_for_model(result: str, profile_block: str | None = None,
+                             props_block: str | None = None) -> str:
     """🌸 Drops the leading ✅/❌ (models were copying ONLY that emoji as their
     whole reply) and tells the model to write a real sentence. With a
-    profile_block (explicit pfp/banner questions only) the instruction changes: give a short
-    in-character take on the member's profile instead of a bare yes/no."""
+    profile_block (explicit pfp/banner questions only) it gives an in-character
+    take on the member's profile; with a props_block (intent='props') it builds
+    a fact/joke/roast/etc. from the member's real server properties; with both,
+    both rule sets apply. Neither → a short existence answer."""
     body = re.sub(r"^[\s✅❌]+", "", result).strip()
-    if profile_block:
-        return (
-            f"LOOKUP RESULT: {body}\n"
-            f"PROFILE (you can't see images — this is a description of what is there):\n{profile_block}\n"
-            "(The user explicitly asked about this member's profile picture/banner/looks. "
-            "Answer exactly that, in your own voice, 1-3 short sentences, using ONLY the "
-            "profile above — never invent anything beyond it. Describing the images is fine, "
-            "but don't turn them into claims about the person's personality or character. "
-            "Be warm and kind; no insults, no guesses about who they really are. If an image "
-            "couldn't be viewed or isn't set, say that honestly. If the profile has NITRO_FLAG / "
-            "DECO_FLAG lines, you may react to them playfully in character (e.g. treat them like a "
-            "fancy Nitro member, 'ooh Nitro vibes' / 'that a_ animated pfp is so fancy'); a "
-            "NITRO_FLAG is a strong hint, a DECO_FLAG alone is not proof of Nitro, and never "
-            "state that they are rich or comment on their money. Keep the <@id> mention "
-            "exactly as written.)"
-        )
+    if profile_block or props_block:
+        parts = [f"LOOKUP RESULT: {body}"]
+        rules = []
+        if profile_block:
+            parts.append(
+                "PROFILE (you can't see images — this is a description of what is there):\n"
+                f"{profile_block}"
+            )
+            rules.append(_PROFILE_RULES)
+        if props_block:
+            parts.append(f"PROPS (real data about this member; nothing else is known):\n{props_block}")
+            rules.append(_PROPS_RULES)
+        parts.append("(" + " ".join(rules) + " Keep the <@id> mention exactly as written.)")
+        return "\n".join(parts)
     return (
         f"LOOKUP RESULT: {body}\n"
         "(Reply with ONE short sentence in your own voice that states this result in "
@@ -924,9 +972,15 @@ def _is_bot_self(ctx, target: str) -> bool:
     return bool(t) and t in names
 
 
+_SELF_WORDS = frozenset({"me", "myself", "aku", "gue", "gw", "gua", "saya"})
+
+
 def _resolve_asker_target(ctx, target: str) -> str:
     """🌸 The bot's own name/mention is never the lookup target when the asker says
-    'my pfp/banner/…': use the asker's ID instead (an ID resolves exactly)."""
+    'my pfp/banner/…': use the asker's ID instead (an ID resolves exactly). A bare
+    'me' / 'myself' / 'aku' target ('roast me') is the asker too."""
+    if (target or "").strip().lstrip("@").lower() in _SELF_WORDS:
+        return str(ctx.message.author.id)
     if _is_bot_self(ctx, target) and _FIRST_PERSON_RE.search(getattr(ctx.message, "content", "") or ""):
         return str(ctx.message.author.id)
     return target
@@ -1164,23 +1218,177 @@ async def _profile_block(ctx: _Ctx, target: str, user_id: int | None = None):
     return "\n".join(lines)
 
 
-async def _exec_self_profile(ctx: _Ctx) -> str:
+# ─────────────────────────────────────────────────────────────────────
+# Member props (intent='props') — facts / jokes / light roasts / trivia
+# ─────────────────────────────────────────────────────────────────────
+
+_PROPS_INTENTS = frozenset({
+    "props", "prop", "properties", "info", "facts", "fact", "fun", "joke", "jokes",
+    "roast", "compliment", "trivia", "stats", "details", "about",
+})
+
+# Badges that say nothing fun about a person (or shouldn't be mentioned).
+_HIDDEN_BADGES = frozenset({"spammer", "team_user", "system", "quarantined"})
+
+
+def _wants_props(args: dict) -> bool:
+    """True when the model asked for the member's properties. Unlike
+    _wants_profile there is NO regex gate on the user's text: props are plain
+    public server data, and the whole point is 'anything about this member'."""
+    intent = str(args.get("intent") or "").strip().lower()
+    return bool({t for t in re.split(r"[^a-z]+", intent) if t} & _PROPS_INTENTS)
+
+
+def _member_id_from_result(result: str) -> int | None:
+    """The member's ID out of a clean single-hit lookup ('✅ Yep, <@id> is here…')."""
+    m = re.search(r"<@!?(\d{17,20})>", result or "")
+    return int(m.group(1)) if m else None
+
+
+def _humanize_age(dt) -> str:
+    if dt is None:
+        return "unknown"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    days = max((datetime.now(timezone.utc) - dt).days, 0)
+    years, rem = divmod(days, 365)
+    months = rem // 30
+    if years:
+        out = f"{years} year{'s' if years != 1 else ''}"
+        return out + (f" {months} month{'s' if months != 1 else ''}" if months else "")
+    if months:
+        return f"{months} month{'s' if months != 1 else ''}"
+    if days >= 1:
+        return f"{days} day{'s' if days != 1 else ''}"
+    return "less than a day"
+
+
+def _fmt_date(dt) -> str:
+    return dt.strftime("%Y-%m-%d") if dt else "unknown"
+
+
+async def _fetch_member_obj(ctx: _Ctx, user_id: int):
+    """discord.Member from cache, else one REST fetch. None if they're gone."""
+    guild = ctx.message.guild
+    if guild is None:
+        return None
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except Exception:
+        return None
+
+
+async def _member_props_block(ctx: _Ctx, user_id: int):
+    """🌸 Real, public server properties of ONE member as compact text for the
+    model to make facts / jokes / light roasts / trivia from. Never raises;
+    None when the member object can't be obtained. Only things Discord itself
+    shows on a profile — no message history, nothing private."""
+    try:
+        m = await _fetch_member_obj(ctx, user_id)
+        if m is None:
+            return None
+        guild = ctx.message.guild
+        lines = []
+
+        names = [f"Display name: {m.display_name}", f"Username: {m.name}"]
+        gname = getattr(m, "global_name", None)
+        if gname and gname != m.display_name:
+            names.append(f"Global name: {gname}")
+        if getattr(m, "nick", None):
+            names.append(f"Server nickname: {m.nick}")
+        lines.append(" | ".join(names))
+        if m.bot:
+            lines.append("Type: this account is a BOT")
+
+        created = getattr(m, "created_at", None)
+        lines.append(f"Discord account created: {_fmt_date(created)} ({_humanize_age(created)} old)")
+        joined = getattr(m, "joined_at", None)
+        lines.append(f"Joined this server: {_fmt_date(joined)} ({_humanize_age(joined)} ago)")
+
+        # Join order — only when the member cache is (nearly) complete, else it lies.
+        total = getattr(guild, "member_count", 0) or 0
+        cached = len(guild.members)
+        if joined and total and 0.9 * total <= cached <= 50000:
+            earlier = sum(1 for x in guild.members if x.joined_at and x.joined_at < joined)
+            lines.append(f"Join order: #{earlier + 1} of {total} members (#1 = earliest, approximate)")
+
+        roles = [r for r in reversed(m.roles) if not r.is_default()]
+        if roles:
+            shown = ", ".join(r.name for r in roles[:_PROPS_MAX_ROLES])
+            more = f" (+{len(roles) - _PROPS_MAX_ROLES} more)" if len(roles) > _PROPS_MAX_ROLES else ""
+            lines.append(f"Roles ({len(roles)}, highest first): {shown}{more}")
+        else:
+            lines.append("Roles: none")
+        if getattr(m.color, "value", 0):
+            lines.append(f"Name colour: #{m.color.value:06x}")
+
+        premium = getattr(m, "premium_since", None)
+        lines.append(f"Server booster since: {_fmt_date(premium)}" if premium else "Server booster: no")
+
+        if guild.owner_id == m.id:
+            lines.append("Is the server OWNER")
+        elif m.guild_permissions.administrator:
+            lines.append("Has Administrator permission")
+        try:
+            if m.is_timed_out():
+                lines.append("Currently timed out")
+        except Exception:
+            pass
+
+        try:
+            badges = [
+                f.name.replace("_", " ") for f in m.public_flags.all()
+                if f.name not in _HIDDEN_BADGES
+            ]
+        except Exception:
+            badges = []
+        if badges:
+            lines.append("Badges: " + ", ".join(badges))
+
+        # Presence only when Discord actually reports it (needs the presence
+        # intent; without it everyone is 'offline', which would be a lie).
+        status = str(getattr(m, "status", "offline"))
+        if status != "offline":
+            lines.append(f"Status right now: {status}")
+        acts = []
+        for a in (getattr(m, "activities", None) or ())[:3]:
+            if isinstance(a, discord.CustomActivity):
+                if a.name:
+                    acts.append(f'custom status "{str(a.name)[:60]}"')
+            elif getattr(a, "name", None):
+                kind = getattr(getattr(a, "type", None), "name", "activity")
+                acts.append(f"{kind} {str(a.name)[:60]}")
+        if acts:
+            lines.append("Activity: " + "; ".join(acts))
+
+        return "\n".join(lines)[:_PROPS_MAX_CHARS]
+    except Exception as e:
+        print(f"⚠️ Member props failed ({type(e).__name__}): {e}")
+        return None
+
+
+async def _exec_self_profile(ctx: _Ctx, want_props: bool = False) -> str:
     """🌸 The asker's OWN profile ('is my pfp cool'): no name lookup at all — the author's ID
-    goes straight to members.db, so '@Bruh' (the bot) can never be picked up as the target."""
+    goes straight to members.db, so '@Bruh' (the bot) can never be picked up as the target.
+    want_props also adds their server properties ('roast my pfp and join date')."""
     author = ctx.message.author
     profile_block = await _profile_block(ctx, str(author.id), user_id=author.id)
+    props_block = await _member_props_block(ctx, author.id) if want_props else None
     result = (
         f"✅ Yep, <@{author.id}> is here — that's the person asking, and they asked about THEIR OWN "
         "profile (say 'your', not 'their')."
     )
     _remember_member_result(ctx.message.id, result)
-    if profile_block:
-        return _clip(_member_result_for_model(result, profile_block))
-    return _clip(
-        _member_result_for_model(result)
-        + "\n(Their profile couldn't be loaded right now — tell them sweetly you can't see it, "
-        "and don't guess what it looks like.)"
-    )
+    out = _member_result_for_model(result, profile_block, props_block)
+    if not profile_block:
+        out += (
+            "\n(Their profile couldn't be loaded right now — tell them sweetly you can't see it, "
+            "and don't guess what it looks like.)"
+        )
+    return _clip(out, _MEMBER_RESULT_MAX_CHARS)
 
 
 async def _exec_member(ctx: _Ctx, args: dict) -> str:
@@ -1192,7 +1400,7 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
     if not target:
         return "ERROR: no member name was provided."
     if _is_self_profile_question(ctx, target):
-        return await _exec_self_profile(ctx)
+        return await _exec_self_profile(ctx, _wants_props(args))
     target = _resolve_asker_target(ctx, target)
     # 🌸 name_hint takes priority over the handler's regex fallback (a
     # real non-bot @mention in the message still wins, as before).
@@ -1208,9 +1416,18 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
         # hit ("✅ Yep, <@id> is here…") qualifies; not-found / ambiguous
         # results keep the plain existence answer.
         profile_block = None
-        if _wants_profile(args, getattr(ctx.message, "content", "") or "") and result.lstrip().startswith("✅"):
+        props_block = None
+        found = result.lstrip().startswith("✅")
+        if found and _wants_profile(args, getattr(ctx.message, "content", "") or ""):
             profile_block = await _profile_block(ctx, target)
-        result = _member_result_for_model(result, profile_block)
+        # 🌸 intent='props' → real server properties for facts/jokes/roasts/trivia.
+        # The member id comes from the lookup's own '<@id>' hit, so it can only
+        # ever describe the ONE member the handler actually found.
+        if found and _wants_props(args):
+            member_id = _member_id_from_result(result)
+            if member_id:
+                props_block = await _member_props_block(ctx, member_id)
+        result = _member_result_for_model(result, profile_block, props_block)
     else:
         _remember_member_result(ctx.message.id, "")
     return await _text_result(
@@ -1219,6 +1436,7 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
             f"Couldn't complete the member lookup for '{target}' (unusable name or a lookup "
             "error). Tell the user you couldn't check and ask for the exact username."
         ),
+        limit=_MEMBER_RESULT_MAX_CHARS,
     )
 
 
@@ -1343,7 +1561,7 @@ async def run_tool_calls(service, response_message, *, message, shared_ctx) -> t
             "role": "tool",
             "tool_call_id": tc.id,
             "name": name,
-            "content": _clip(content),
+            "content": _clip(content, _MEMBER_RESULT_MAX_CHARS if name == "check_member_existence" else None),
         })
 
     return tool_messages, ctx.delivered, ctx.pending, ctx.private

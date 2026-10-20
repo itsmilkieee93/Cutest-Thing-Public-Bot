@@ -131,6 +131,17 @@ LEGACY_MOOD_CLASSIFIER = False
 # tens of thousands.
 FETCH_MEMBER_BANNERS = True
 
+# 🌸 Rate-limit guards for the banner/accent REST fetch (see _fetch_member_banners):
+#   MAX_BANNER_FETCHES_PER_SYNC — hard cap of REST calls per guild sync. Anyone
+#       over the cap is simply picked up on the next boot, so a big backlog
+#       drains gradually instead of hammering Discord all at once.
+#   BANNER_FETCH_CONCURRENCY / BANNER_FETCH_DELAY — parallelism + pause after
+#       each call (seconds). ~2 workers * 0.4s ≈ 5 req/s, well under 429 range.
+#   (How long a "checked" result is trusted: shared.USER_EXTRAS_TTL, 7 days.)
+MAX_BANNER_FETCHES_PER_SYNC = 120
+BANNER_FETCH_CONCURRENCY = 2
+BANNER_FETCH_DELAY = 0.4
+
 
 # 🌸 MEMBER-CHECK SAFETY NET — strict "is NAME here / in this server" shape.
 # Anchored on the WHOLE message so ordinary chat ("is pizza good here") isn't
@@ -379,35 +390,92 @@ class GroqMentionService:
             print(f"⚠️ Failed to sync guild {guild.name} ({guild.id}) to DB: {e}")
 
     async def _fetch_member_banners(self, members: list[dict]) -> None:
-        """🌸 REST-fetches banners AND accent colours (one GET /users/{id}
-        gives both) for member dicts missing either, filling banner_url /
-        accent_color in place. Small concurrency + a pause per request keeps
-        it far under Discord's rate limits; a failed fetch (deleted user,
-        404) just leaves them empty. Only runs when FETCH_MEMBER_BANNERS is True."""
-        sem = asyncio.Semaphore(5)
+        """🌸 Fills banner_url / accent_color on member dicts, spending as few
+        REST calls as possible (one GET /users/{id} gives both):
+
+          1. Apply the GLOBAL persistent cache (shared.user_extras) first —
+             a user seen in any guild, on any earlier boot, costs 0 calls.
+          2. Only users never checked, or last checked > USER_EXTRAS_TTL ago,
+             are fetched. "Checked, has neither" is cached too, so the
+             majority of members (no banner/accent) are NOT refetched on
+             every boot like before.
+          3. Capped at MAX_BANNER_FETCHES_PER_SYNC per guild, low concurrency
+             + delay between calls; leftovers are fetched on later boots.
+          4. A 429/5xx result is NOT cached (retried next boot); only a real
+             answer or a 404 (deleted account) is.
+        Only runs when FETCH_MEMBER_BANNERS is True."""
+        now = time.time()
+
+        # in-memory layer: survives across guilds within this process
+        if not hasattr(self, "_user_extras"):
+            self._user_extras = await shared.load_user_extras()
+        cache = self._user_extras
+        ttl = shared.USER_EXTRAS_TTL
+
+        # 1) apply cache, collect who still needs a REST call
+        todo: list[dict] = []
+        seen_ids: set[int] = set()
+        for m in members:
+            uid = m["id"]
+            hit = cache.get(uid)
+            if hit:
+                banner, accent, checked_at = hit
+                if banner and not m.get("banner_url"):
+                    m["banner_url"] = banner
+                if accent and not m.get("accent_color"):
+                    m["accent_color"] = accent
+                if now - checked_at < ttl:
+                    continue  # fresh answer (even "nothing") — no call needed
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+            todo.append(m)
+
+        skipped = len(members) - len(todo)
+        deferred = max(0, len(todo) - MAX_BANNER_FETCHES_PER_SYNC)
+        todo = todo[:MAX_BANNER_FETCHES_PER_SYNC]
+
+        sem = asyncio.Semaphore(BANNER_FETCH_CONCURRENCY)
         found_banners = 0
         found_accents = 0
+        new_rows: list[tuple] = []
 
         async def one(m):
             nonlocal found_banners, found_accents
             async with sem:
                 try:
                     user = await self.bot.fetch_user(m["id"])
-                    if user.banner and not m.get("banner_url"):
-                        m["banner_url"] = user.banner.url
-                        found_banners += 1
-                    accent = _accent_hex(user)
-                    if accent and not m.get("accent_color"):
-                        m["accent_color"] = accent
-                        found_accents += 1
+                except discord.NotFound:
+                    # deleted account — remember it so we stop asking
+                    cache[m["id"]] = (None, None, now)
+                    new_rows.append((m["id"], None, None, now))
+                    await asyncio.sleep(BANNER_FETCH_DELAY)
+                    return
                 except discord.HTTPException:
-                    pass
-                await asyncio.sleep(0.05)
+                    # rate limit / server error: don't cache, retry next boot
+                    await asyncio.sleep(BANNER_FETCH_DELAY * 4)
+                    return
 
-        await asyncio.gather(*(
-            one(m) for m in members if not m.get("banner_url") or not m.get("accent_color")
-        ))
-        print(f"🖼️ [MEMBERS] Fetched {found_banners} new banner(s), {found_accents} new accent colour(s)")
+                banner = user.banner.url if user.banner else None
+                accent = _accent_hex(user)
+                if banner and not m.get("banner_url"):
+                    m["banner_url"] = banner
+                    found_banners += 1
+                if accent and not m.get("accent_color"):
+                    m["accent_color"] = accent
+                    found_accents += 1
+                cache[m["id"]] = (banner, accent, now)
+                new_rows.append((m["id"], banner, accent, now))
+                await asyncio.sleep(BANNER_FETCH_DELAY)
+
+        await asyncio.gather(*(one(m) for m in todo))
+        await shared.save_user_extras(new_rows)
+
+        print(
+            f"🖼️ [MEMBERS] Banner/accent: {skipped} from cache, {len(todo)} fetched "
+            f"({found_banners} new banner(s), {found_accents} new accent colour(s))"
+            + (f", {deferred} deferred to next sync" if deferred else "")
+        )
 
     async def sync_all_guilds(self):
         """🌸 Fetches + saves FULL data (metadata, roles, channels, members)

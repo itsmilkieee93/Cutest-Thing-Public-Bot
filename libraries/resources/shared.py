@@ -547,6 +547,74 @@ async def _get_members_db(guild_id: int) -> aiosqlite.Connection:
     return conn
 
 
+# ══════════════════════════════════════════════════════════════════
+# 🌸 USER EXTRAS CACHE (banner + accent colour, GLOBAL across guilds)
+# ══════════════════════════════════════════════════════════════════
+# Banners/accent colours are account-level (same in every server) but REST
+# only (GET /users/{id}). Without this cache the bot re-fetched every member
+# that lacked one — i.e. most people — on every boot, once PER guild, which
+# is what triggered the 429 spam. checked_at also remembers "looked, nothing
+# there" so those users are skipped until USER_EXTRAS_TTL expires.
+USER_EXTRAS_TTL = 7 * 24 * 3600  # seconds before a user is re-checked
+
+
+def _user_extras_db_path() -> str:
+    # Kept next to (not inside) BASE_GUILD_DIR so per-guild directory scans
+    # never trip over it.
+    return os.path.join(os.path.dirname(BASE_GUILD_DIR) or ".", "user_extras.db")
+
+
+async def _get_user_extras_db() -> aiosqlite.Connection:
+    path = _user_extras_db_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = await aiosqlite.connect(path)
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_extras (
+            user_id      INTEGER PRIMARY KEY,
+            banner_url   TEXT,
+            accent_color TEXT,
+            checked_at   REAL NOT NULL
+        )
+    """)
+    await conn.commit()
+    return conn
+
+
+async def load_user_extras() -> dict[int, tuple]:
+    """🌸 {user_id: (banner_url, accent_color, checked_at)}. {} on error."""
+    conn = await _get_user_extras_db()
+    try:
+        cur = await conn.execute(
+            "SELECT user_id, banner_url, accent_color, checked_at FROM user_extras"
+        )
+        return {r[0]: (r[1], r[2], r[3]) for r in await cur.fetchall()}
+    except Exception as e:
+        print(f"❌ Query error (load_user_extras): {e}")
+        return {}
+    finally:
+        await conn.close()
+
+
+async def save_user_extras(rows: list[tuple]) -> None:
+    """🌸 Upserts (user_id, banner_url, accent_color, checked_at) rows."""
+    if not rows:
+        return
+    conn = await _get_user_extras_db()
+    try:
+        await conn.executemany(
+            "INSERT OR REPLACE INTO user_extras (user_id, banner_url, accent_color, checked_at) "
+            "VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        await conn.commit()
+    except Exception as e:
+        print(f"❌ Failed to save user_extras: {e}")
+    finally:
+        await conn.close()
+
+
 async def load_member_banners(guild_id: int) -> dict[int, str]:
     """🌸 {member_id: banner_url} for every row in members.db that has a
     banner — lets a regeneration keep banners it can't re-fetch from the
