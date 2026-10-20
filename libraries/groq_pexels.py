@@ -260,11 +260,10 @@ CAPTION_MODEL = "openai/gpt-oss-20b"
 CAPTION_SYSTEM_PROMPT = (
     "You are Cutest Thing, a kawaii-themed Discord bot with a pink/purple "
     "sparkly aesthetic. You just found a photo or video for someone. "
-    "Write ONE short, cute, enthusiastic caption/reaction to go above the image "
-    "(under 12 words). Be playful and varied each time — mix styles: "
-    "excited, soft, sparkly, teasing, warm, or bubbly. "
-    "Use 1-2 emoji max (🌸💖✨🎀💕⭐). No quotation marks, no markdown. "
-    "Don't describe the image in detail — just react with joy about finding it. "
+    "Write ONE short, VERY expressive, cute, enthusiastic caption/reaction to go above the image "
+    "(under 12 words). Be super playful, bubbly, excited, sparkly, warm, or teasing — make it feel alive and full of joy! "
+    "Use 1-2 emoji max (🌸💖✨🎀💕⭐). No markdown. "
+    "Don't describe the image in detail — just react with pure happiness and excitement about finding it. "
     "Output ONLY the caption text itself: no tags, no special tokens, no "
     "angle-bracket markers, nothing before or after it."
 )
@@ -314,10 +313,9 @@ VISION_MODELS = ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b"]
 
 VISION_CAPTION_SYSTEM_PROMPT = (
     "You are Cutest Thing, a kawaii-themed Discord bot with a pink/purple "
-    "sparkly aesthetic. Look at the image and write ONE warm, cute sentence "
-    "that genuinely describes what is in it: the main subject, hair and "
-    "outfit colors, pose or expression, and the setting or mood. "
-    "Keep it under 160 characters and end with 1-2 emoji from 🌸💖✨🎀💕⭐. "
+    "sparkly aesthetic. Look at the image and write ONE warm, cute, VERY expressive and enthusiastic sentence "
+    "that reacts with joy while lightly describing what is in it: the main subject, colors, pose or mood. "
+    "Keep it under 160 characters, make the reaction feel alive and sparkly, and end with 1-2 emoji."
     "Describe ONLY what you can actually see, and keep it wholesome. "
     "NEVER mention where the image came from: no website, API, library, "
     "photographer, artist, 'stock photo', and never write the words "
@@ -504,16 +502,19 @@ async def _build_image_layout(
     title = caption or (query.strip().title() if query else "Image")
     if len(title) > 200:
         title = title[:197] + "..."
-    items.append(discord.ui.TextDisplay(f"## {title}"))
+    # Wrap title in quotes for display (quotes on title only)
+    display_title = f'"{title}"' if title else title
+    items.append(discord.ui.TextDisplay(f"## {display_title}"))
 
     # Small separator for clean alignment
     items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
 
-    # Image
+    # Image — use the title caption as the alt text / image description
+    alt_description = (title[:1000] if title else (query[:100] if query else None))
     gallery = discord.ui.MediaGallery(
         discord.MediaGalleryItem(
             media=image_url,
-            description=(query[:100] if query else None),
+            description=alt_description,
         )
     )
     items.append(gallery)
@@ -1208,13 +1209,17 @@ async def fetch_nekos_embed(provider: str, category: str) -> discord.ui.LayoutVi
     title = caption or fallback_title
     if len(title) > 200:
         title = title[:197] + "..."
-    items.append(discord.ui.TextDisplay(f"## {title}"))
+    # Wrap title in quotes for display (quotes on title only)
+    display_title = f'"{title}"' if title else title
+    items.append(discord.ui.TextDisplay(f"## {display_title}"))
 
     # Small separator so the image is cleanly aligned under the title
     items.append(discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small))
 
+    # Use the title caption as the alt text / image description
+    alt_description = (title[:1000] if title else "anime art")
     gallery = discord.ui.MediaGallery(
-        discord.MediaGalleryItem(media=image_url, description=(caption or "anime art")[:1000])
+        discord.MediaGalleryItem(media=image_url, description=alt_description)
     )
     items.append(gallery)
 

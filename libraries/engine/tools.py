@@ -196,8 +196,9 @@ TOOL_SCHEMAS = [
             "description": (
                 "Find and post a real image or video in the channel. Call this when the "
                 "user asks you to send/show/find a picture, photo, video, clip, vector, "
-                "cartoon, illustration or anime/manga art of something. NOT for songs, "
-                "music or audio — use search_and_play_music for those."
+                "cartoon, illustration or anime/manga art of something. Default to kind=photo "
+                "for ordinary subjects (places, cities, nature, animals, food, objects). "
+                "NOT for songs, music or audio — use search_and_play_music for those."
             ),
             "parameters": {
                 "type": "object",
@@ -206,7 +207,7 @@ TOOL_SCHEMAS = [
                         "type": "string",
                         "description": (
                             "Short English search subject, 1-5 words, no filler "
-                            "(e.g. 'red panda', 'sunset beach', 'anime girl')."
+                            "(e.g. 'red panda', 'sunset beach', 'mountain landscape')."
                         ),
                     },
                     # 🌸 Deliberately NOT a strict JSON-schema enum: Groq validates
@@ -220,7 +221,9 @@ TOOL_SCHEMAS = [
                         "description": (
                             "Exactly one of: photo (real photograph), video (real "
                             "video clip), vector (flat vector graphic), cartoon "
-                            "(drawn/illustrated art — use this for anime and manga)."
+                            "(drawn/illustrated art — ONLY when the user's CURRENT message literally asks "
+                            "for anime, manga, cartoon or illustration; never guess it from earlier "
+                            "messages in the chat). When unsure, use photo."
                         ),
                     },
                 },
@@ -410,7 +413,9 @@ TOOL_USE_DIRECTIVE = (
 
     "2. Math: always call calculate_local_math, never compute it yourself, and never "
     "alter a number a tool returned.\n"
-    "3. Pictures/videos/anime art → search_visual_media; songs/artists → "
+    "3. Pictures/videos/anime art → search_visual_media (kind=photo unless the user's "
+    "CURRENT message explicitly says anime/manga/cartoon/illustration/vector/video — "
+    "earlier anime pictures in the chat do NOT change this); songs/artists → "
     "search_and_play_music. The card/image is posted automatically right BELOW your "
     "message: write a short, cute, in-character line that leads into it, and don't paste "
     "links or repeat what it contains.\n"
@@ -705,16 +710,64 @@ _NEKOS_TRIGGER_RE = re.compile(
 )
 
 
+# 🌸 The USER's own words decide "drawn art vs real photo" — never the model's
+# guess alone. Chat history full of anime cards makes the model pick
+# kind="cartoon" (or write 'anime girl') even for "mountain image".
+_ART_REQUEST_RE = re.compile(
+    r"\b(anime|manga|neko|nekos|waifu|husbando|chibi|catgirl|cat\s*girl|"
+    r"cartoon|kartun|illustration|ilustrasi|drawing|drawn|fan\s*art|sketch|doodle)\b",
+    re.IGNORECASE,
+)
+# "another one" / "lagi" — a follow-up has no subject words of its own, so
+# there the model's kind/query (carried over from the previous card) is trusted.
+_FOLLOWUP_RE = re.compile(
+    r"\b(another|more|again|next|one\s+more|different|lagi|lainnya|yang\s+lain|ganti)\b",
+    re.IGNORECASE,
+)
+_FILLER_RE = re.compile(
+    r"\b(give|send|show|find|get|post|me|us|a|an|the|some|any|of|please|pls|can|could|you|"
+    r"image|images|picture|pictures|pic|pics|photo|photos|gambar|foto|kasih|kirim|tolong|dong|"
+    r"minta|cariin|carikan|aku|ku|yang)\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_media_intent(kind: str, query: str, message_text: str) -> tuple[str, str]:
+    """Returns the (kind, query) that should really be used.
+
+    - The user asked for drawn art (or it's a follow-up to one) → trust the model.
+    - Otherwise a model-picked cartoon / anime-flavored query is a hallucination
+      from chat history → force a real photo and take the subject from the
+      user's own message."""
+    if kind == "video":
+        return kind, query
+    user_art = bool(_ART_REQUEST_RE.search(message_text))
+    followup = bool(_FOLLOWUP_RE.search(message_text))
+    query_art = bool(_ART_REQUEST_RE.search(query))
+    if user_art or (followup and (kind == "cartoon" or query_art)):
+        return ("cartoon" if kind == "photo" else kind), query
+    if kind == "cartoon" or query_art:
+        # A query that itself carries anime words was copied from chat history /
+        # the examples → the real subject is whatever the user actually typed.
+        from_msg = " ".join(_FILLER_RE.sub(" ", message_text).split())
+        cleaned = from_msg if query_art else query
+        if not cleaned:
+            cleaned = " ".join(_ART_REQUEST_RE.sub(" ", query).split())
+        print(f"🛡️ ignored model's art pick (kind={kind!r}, query={query!r}) — "
+              f"user said {message_text!r}; using photo {cleaned!r}")
+        return ("photo" if kind == "cartoon" else kind), cleaned
+    return kind, query
+
+
 def _wants_nekos(kind: str, query: str, message_text: str) -> bool:
-    """True when this request is eligible for the nekos dice roll:
-    kind == "cartoon" (which already includes the anime/manga aliases), or
-    an anime/neko/waifu keyword in the query or the user's message. Never
-    for video/vector — the nekos APIs only serve still images/GIFs."""
+    """True only for a genuinely anime-flavored request (anime/neko/waifu/...
+    in the USER's message — or in the query on a follow-up). kind="cartoon"
+    alone is NOT enough anymore: "cartoon city" must not return a neko girl.
+    Never for video/vector — the nekos APIs only serve still images/GIFs."""
     if kind in ("video", "vector"):
         return False
-    if kind == "cartoon":
-        return True
-    return bool(_NEKOS_TRIGGER_RE.search(f"{query} {message_text}"))
+    text = f"{query} {message_text}" if _FOLLOWUP_RE.search(message_text) else message_text
+    return bool(_NEKOS_TRIGGER_RE.search(text))
 
 
 def _roll_nekos_provider() -> tuple[str | None, float]:
@@ -738,8 +791,12 @@ async def _exec_media(ctx: _Ctx, args: dict) -> str:
     if kind not in _VALID_KINDS:
         kind = "photo"
 
-    # 🌸 Anime-flavored request → roll the 50/30/20 dice.
     message_text = getattr(ctx.message, "content", "") or ""
+    kind, query = _sanitize_media_intent(kind, query, message_text)
+    if not query:
+        return "ERROR: no clear subject. Ask the user sweetly what they'd like a picture of."
+
+    # 🌸 Anime-flavored request → roll the 50/30/20 dice.
     if _wants_nekos(kind, query, message_text):
         provider, roll = _roll_nekos_provider()
         if provider is None:
