@@ -685,6 +685,49 @@ def _strip_punct(value) -> str:
     return _NON_ALNUM_RE.sub("", value).lower()
 
 
+# 🌸 strip_dashes: the model keeps slipping em/en dashes into replies even though the system
+# prompt forbids them (style rule 9 in engine/tools.py). This is the hard guarantee, run on every
+# AI reply right before it is sent. Hyphens inside words/dates (well-known, 2026-07-13) and
+# anything inside code spans or URLs are left alone.
+_DASH_PROTECT_RE = re.compile(r"```.*?```|`[^`\n]*`|https?://\S+", re.DOTALL)
+_DASH_NUM_RANGE_RE = re.compile(r"(?<=\d)[ \t]*[–—―][ \t]*(?=\d)")          # 5–10 -> 5-10
+_DASH_RE = re.compile(
+    r"[ \t]*[–—―]+[ \t]*"                      # em / en / horizontal bar, spaced or not
+    r"|(?<=\S)[ \t]+-{1,3}[ \t]+(?=\S)"        # ' - ' / ' -- ' between words (not a '- ' bullet)
+    r"|(?<=[^\s-])-{2,3}(?=[^\s-])"            # word--word
+)
+
+
+def _dash_sub(m: "re.Match") -> str:
+    s, e, text = m.start(), m.end(), m.string
+    before = text[s - 1] if s > 0 else ""
+    after = text[e] if e < len(text) else ""
+    if not before or before == "\n":           # dash opens a line: just drop it
+        return ""
+    if not after or after == "\n":             # dash closes a line: drop it
+        return ""
+    if before in ".!?,;:":                     # 'bomb! — With' -> 'bomb! With'
+        return " "
+    return ", "                                # 'purple—so cute' -> 'purple, so cute'
+
+
+def strip_dashes(text: str) -> str:
+    """🌸 Replace em/en dashes and ' - ' used as punctuation with a comma / space, so a reply
+    never contains a dash as punctuation. Safe on empty/None input."""
+    if not text or not isinstance(text, str):
+        return text or ""
+    parts = _DASH_PROTECT_RE.split(text)
+    protected = _DASH_PROTECT_RE.findall(text)
+    out = []
+    for i, part in enumerate(parts):
+        part = _DASH_NUM_RANGE_RE.sub("-", part)
+        part = _DASH_RE.sub(_dash_sub, part)
+        out.append(part)
+        if i < len(protected):
+            out.append(protected[i])
+    return "".join(out)
+
+
 async def _normalized_member_rows(conn, select_cols: str, columns: tuple, name: str) -> list:
     """Registers strip_punct on `conn` (aiosqlite's create_function is a
     coroutine) and compares strip_punct(column) with the cleaned query:
@@ -1234,6 +1277,247 @@ async def get_members_with_role(guild_id: int, role_name: str, role_id: int | No
     except Exception as e:
         print(f"❌ Query error (get_members_with_role): {e}")
         return []
+    finally:
+        await conn.close()
+
+
+async def get_random_members(
+    guild_id: int,
+    count: int = 1,
+    role_name: str | None = None,
+    role_id: int | None = None,
+    include_bots: bool = False,
+) -> list[dict]:
+    """
+    🌸 Picks `count` RANDOM member(s) straight from roles.db using SQLite's own
+    `ORDER BY RANDOM() LIMIT ?` (no loading the whole list into Python and
+    shuffling it). Every call re-rolls, so asking twice gives a fresh pick.
+
+    - `role_name` / `role_id` (both optional): only pick among holders of that
+      role. role_id wins when both are given (same rule as get_members_with_role).
+      An unknown role → [].
+    - Bots are skipped unless include_bots=True.
+    - `count` is clamped to 1..25.
+
+    Returns dicts with id, username, display_name.
+    """
+    count = max(1, min(int(count or 1), 25))
+    if not os.path.exists(_guild_db_dir(guild_id)):
+        return []
+
+    conn = await _get_roles_db(guild_id)
+    try:
+        if role_id is None and role_name:
+            cur = await conn.execute("SELECT id FROM roles WHERE LOWER(name) = LOWER(?)", (role_name,))
+            role_row = await cur.fetchone()
+            if not role_row:
+                return []
+            role_id = role_row[0]
+
+        where, params, join = [], [], ""
+        if not include_bots:
+            where.append("COALESCE(m.bot, 0) = 0")
+        if role_id is not None:
+            join = "JOIN member_roles mr ON mr.member_id = m.id"
+            where.append("mr.role_id = ?")
+            params.append(role_id)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        cur = await conn.execute(
+            f"SELECT m.id, m.username, m.display_name FROM members m {join} "
+            f"{where_sql} ORDER BY RANDOM() LIMIT ?",
+            (*params, count),
+        )
+        return [
+            {"id": r[0], "username": r[1], "display_name": r[2]}
+            for r in await cur.fetchall()
+        ]
+    except Exception as e:
+        print(f"❌ Query error (get_random_members): {e}")
+        return []
+    finally:
+        await conn.close()
+
+
+async def get_random_roles(guild_id: int, count: int = 1, include_managed: bool = False) -> list[dict]:
+    """
+    🌸 Picks `count` RANDOM role(s) from roles.db with `ORDER BY RANDOM() LIMIT ?`.
+    @everyone (its id equals the guild id) is never picked, and neither are
+    managed roles (bot/integration/booster roles) unless include_managed=True.
+    `count` is clamped to 1..25.
+
+    Returns dicts with id, name, member_count.
+    """
+    count = max(1, min(int(count or 1), 25))
+    if not os.path.exists(_guild_db_dir(guild_id)):
+        return []
+
+    conn = await _get_roles_db(guild_id)
+    try:
+        where = ["r.id != ?", "r.name != '@everyone'"]
+        if not include_managed:
+            where.append("COALESCE(r.managed, 0) = 0")
+        cur = await conn.execute(
+            "SELECT r.id, r.name, "
+            "       (SELECT COUNT(*) FROM member_roles mr WHERE mr.role_id = r.id) "
+            "FROM roles r "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY RANDOM() LIMIT ?",
+            (guild_id, count),
+        )
+        return [
+            {"id": r[0], "name": r[1], "member_count": r[2]}
+            for r in await cur.fetchall()
+        ]
+    except Exception as e:
+        print(f"❌ Query error (get_random_roles): {e}")
+        return []
+    finally:
+        await conn.close()
+
+
+async def get_top_senior_member(guild_id: int) -> dict | None:
+    """
+    🌸 The most SENIOR non-bot member: the one with the earliest `joined_at`
+    in roles.db. Rows whose joined_at is NULL, empty, 'unknown' or not a
+    parseable date are ignored (julianday() returns NULL for those), so a
+    half-synced member can never win by accident. Ties → lowest member id.
+
+    Returns {id, username, display_name, joined_at} or None (no data yet).
+    """
+    if not os.path.exists(_guild_db_dir(guild_id)):
+        return None
+
+    conn = await _get_roles_db(guild_id)
+    try:
+        cur = await conn.execute("""
+            SELECT m.id, m.username, m.display_name, m.joined_at
+            FROM members m
+            WHERE COALESCE(m.bot, 0) = 0
+              AND m.joined_at IS NOT NULL
+              AND TRIM(m.joined_at) != ''
+              AND LOWER(TRIM(m.joined_at)) != 'unknown'
+              AND julianday(m.joined_at) IS NOT NULL
+            ORDER BY julianday(m.joined_at) ASC, m.id ASC
+            LIMIT 1
+        """)
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "username": row[1], "display_name": row[2], "joined_at": row[3]}
+    except Exception as e:
+        print(f"❌ Query error (get_top_senior_member): {e}")
+        return None
+    finally:
+        await conn.close()
+
+
+async def get_top_role_collector(guild_id: int) -> dict | None:
+    """
+    🌸 The non-bot member holding the MOST roles: counts rows per member in
+    member_roles (@everyone is never stored there, so it isn't counted) and
+    takes the highest total. Ties → lowest member id.
+
+    Returns {id, username, display_name, role_count} or None (no data yet).
+    """
+    if not os.path.exists(_guild_db_dir(guild_id)):
+        return None
+
+    conn = await _get_roles_db(guild_id)
+    try:
+        cur = await conn.execute("""
+            SELECT m.id, m.username, m.display_name, COUNT(mr.role_id) AS role_count
+            FROM members m
+            JOIN member_roles mr ON mr.member_id = m.id
+            WHERE COALESCE(m.bot, 0) = 0
+            GROUP BY m.id
+            ORDER BY role_count DESC, m.id ASC
+            LIMIT 1
+        """)
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "username": row[1], "display_name": row[2], "role_count": row[3]}
+    except Exception as e:
+        print(f"❌ Query error (get_top_role_collector): {e}")
+        return None
+    finally:
+        await conn.close()
+
+
+async def get_top_profile_style_member(guild_id: int) -> dict | None:
+    """
+    🌸 The non-bot member with the most eye-catching PROFILE (members.db):
+      +1 custom avatar (not Discord's default one)   +1 animated (.gif) avatar
+      +1 profile banner   +1 accent colour set   +1 avatar decoration/frame
+    (max 5). Highest score wins; members tied on score are shuffled with
+    ORDER BY RANDOM() so equal profiles don't always crown the same person.
+    Returns None when nobody scores at least 1 or the data isn't synced yet.
+
+    members.db has no bot flag, so bot ids are read from roles.db first and
+    excluded. Only the accent colour is stored — Discord's newer two-colour
+    profile themes aren't exposed by discord.py, so they can't be scored.
+
+    Returns {id, username, display_name, style_score, custom_avatar,
+    animated_avatar, has_banner, accent_color, has_decoration, avatar_url,
+    banner_url, decoration_url}.
+    """
+    if not os.path.exists(_guild_members_db_path(guild_id)):
+        return None
+
+    bot_ids: list[int] = []
+    if os.path.exists(_guild_db_dir(guild_id)):
+        rconn = await _get_roles_db(guild_id)
+        try:
+            cur = await rconn.execute("SELECT id FROM members WHERE COALESCE(bot, 0) = 1")
+            bot_ids = [r[0] for r in await cur.fetchall()]
+        except Exception as e:
+            print(f"⚠️ Bot-id lookup failed (get_top_profile_style_member): {e}")
+        finally:
+            await rconn.close()
+
+    exclude_sql = f"AND id NOT IN ({','.join('?' * len(bot_ids))})" if bot_ids else ""
+
+    conn = await _get_members_db(guild_id)
+    try:
+        cur = await conn.execute(
+            f"""
+            SELECT id, username, COALESCE(server_name, global_name, username) AS shown,
+                   avatar_url, banner_url, accent_color, avatar_decoration_url,
+                   (CASE WHEN avatar_url IS NOT NULL AND avatar_url != ''
+                          AND avatar_url NOT LIKE '%/embed/avatars/%' THEN 1 ELSE 0 END)
+                 + (CASE WHEN avatar_url LIKE '%.gif%' THEN 1 ELSE 0 END)
+                 + (CASE WHEN banner_url IS NOT NULL AND banner_url != '' THEN 1 ELSE 0 END)
+                 + (CASE WHEN accent_color IS NOT NULL AND accent_color != '' THEN 1 ELSE 0 END)
+                 + (CASE WHEN avatar_decoration_url IS NOT NULL AND avatar_decoration_url != '' THEN 1 ELSE 0 END)
+                   AS style_score
+            FROM members
+            WHERE 1 = 1 {exclude_sql}
+            ORDER BY style_score DESC, RANDOM()
+            LIMIT 1
+            """,
+            tuple(bot_ids),
+        )
+        row = await cur.fetchone()
+        if not row or not row[7]:
+            return None
+        avatar, banner, accent, decoration = row[3], row[4], row[5], row[6]
+        return {
+            "id": row[0], "username": row[1], "display_name": row[2],
+            "style_score": row[7],
+            "custom_avatar": bool(avatar) and "/embed/avatars/" not in avatar,
+            "animated_avatar": bool(avatar) and ".gif" in avatar,
+            "has_banner": bool(banner),
+            "accent_color": accent or None,
+            "has_decoration": bool(decoration),
+            # 🌸 CDN links, so the caller can have a vision model actually LOOK at them
+            "avatar_url": avatar or None,
+            "banner_url": banner or None,
+            "decoration_url": decoration or None,
+        }
+    except Exception as e:
+        print(f"❌ Query error (get_top_profile_style_member): {e}")
+        return None
     finally:
         await conn.close()
 

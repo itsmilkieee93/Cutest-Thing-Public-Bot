@@ -1,4 +1,4 @@
-"""🌸 engine/tools.py — Groq custom Tools / Function Calling for the main
+"""🌸 engine/tools.py, Groq custom Tools / Function Calling for the main
 chat model (engine/completion.py).
 
 Replaces the old "separate cheap AI call guesses an intent label BEFORE
@@ -15,6 +15,13 @@ itself:
     check_member_existence    -> groq_instruct.handle_member_lookup_query
                                  (+ intent='props': facts/jokes/roasts from real member props,
                                   + intent='profile': pfp/banner description)
+    pick_random_member        -> shared.get_random_members (SQLite ORDER BY RANDOM())
+                                 (+ intent='props': fact/joke from the pick's real member props;
+                                  opinion questions ('favorite/best member') also get real stats:
+                                  shared.get_top_senior_member + get_top_role_collector +
+                                  get_top_profile_style_member; for opinion questions the style
+                                  winner's avatar/banner is read by PROFILE_VISION_MODEL)
+    pick_random_role          -> shared.get_random_roles   (SQLite ORDER BY RANDOM())
 
 Division of labor (so completion.py stays small):
   - TOOL_SCHEMAS / get_tool_schemas()  → what _call() puts in kwargs["tools"]
@@ -22,14 +29,15 @@ Division of labor (so completion.py stays small):
                                          the dict that goes back into `messages`
   - run_tool_calls()                   → executes every tool call in one model
                                          response and returns the role="tool"
-                                         messages (one per tool_call_id — Groq
+                                         messages (one per tool_call_id, Groq
                                          400s if any call is left unanswered,
                                          so this function NEVER raises).
 
 Handler imports are lazy (inside each executor) because groq_service.py
-imports engine.* at module load — importing it back at the top of this
+imports engine.* at module load, importing it back at the top of this
 file would be circular.
 """
+import colorsys
 import json
 import re
 import asyncio
@@ -63,7 +71,10 @@ TOOL_TIMEOUT_SECONDS = 45
 # 🌸 Tools that only make sense inside a server (they read the guild's
 # cached roles/members). Dropped from the schema list in DMs so the model
 # can't even try them.
-GUILD_ONLY_TOOLS = frozenset({"query_peran_server", "check_member_existence", "send_dm_to_user"})
+GUILD_ONLY_TOOLS = frozenset({
+    "query_peran_server", "check_member_existence", "send_dm_to_user",
+    "pick_random_member", "pick_random_role",
+})
 
 # 🌸 Same ping policy as groq_service.SAFE_REPLY_MENTIONS (pings only the
 # person being replied to). Duplicated here instead of imported to avoid
@@ -100,292 +111,163 @@ _PROPS_MAX_CHARS = 750         # hard cap on the props block
 _MEMBER_RESULT_MAX_CHARS = 2600  # member lookups may carry profile + props
 
 
+def _tool(name: str, description: str, properties: dict, required: list) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        },
+    }
+
+
+def _str(description: str) -> dict:
+    return {"type": "string", "description": description}
+
+
+# 🌸 Wording is deliberately terse (these schemas ride along on EVERY tool call = tokens).
+# Several args are plain strings/ints on purpose, never enums/booleans: Groq validates tool
+# arguments server-side and rejects the WHOLE call (400 tool_use_failed) when a strict-typed
+# argument is slightly off ("kind"/"intent"/"count"). Allowed values live in the descriptions;
+# the executors normalize aliases.
 TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": (
-                "Search the live web (Exa) and get back a short, already-summarized "
-                "answer. Call this for ANYTHING that depends on current or real-world "
-                "information you can't know reliably: news, scores, prices, weather, "
-                "releases, 'latest', 'right now', 'who is the current…', recent events, "
-                "or facts you aren't sure of. NOT for chit-chat, opinions, math, or "
-                "questions about this bot, this server or its members (use the server "
-                "tools for those)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "A clear, self-contained search query in English (or the "
-                            "user's language for local topics). Include names and "
-                            "context from the conversation — it is searched on its own."
-                        ),
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": (
-                            "Optional. One of: news, research paper, company, financial "
-                            "report, github, pdf, tweet, personal site, linkedin profile, "
-                            "people. Omit it for general questions."
-                        ),
-                    },
-                },
-                "required": ["query"],
-            },
+    _tool(
+        "search_web",
+        "Live web search (Exa) → short summarized answer. Use for anything current or real-world "
+        "you can't know reliably: news, scores, prices, weather, releases, 'latest', 'who is the "
+        "current…', recent events, shaky facts. NOT for chit-chat, opinions, math, or questions "
+        "about this bot/server/members (use the server tools).",
+        {
+            "query": _str("Clear, self-contained query in English (user's language for local topics), "
+                          "with names/context from the chat, it is searched on its own."),
+            "category": _str("Optional: news, research paper, company, financial report, github, pdf, "
+                             "tweet, personal site, linkedin profile, people. Omit for general questions."),
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "react_to_mood",
-            "description": (
-                "Add a matching emoji reaction to the user's message and get tone "
-                "guidance for your reply. Call this AT MOST ONCE, and ONLY when the "
-                "user's mood is clearly expressed: upset/sad, stressed/anxious, "
-                "angry/frustrated, or excited/hyped. Do NOT call it for neutral, "
-                "jokey or purely informational messages."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mood": {
-                        "type": "string",
-                        "description": "Exactly one of: upset, stressed, angry, excited.",
-                    },
-                },
-                "required": ["mood"],
-            },
+        ["query"],
+    ),
+    _tool(
+        "react_to_mood",
+        "Add a matching emoji reaction + get tone guidance. AT MOST ONCE, only when the mood is "
+        "clearly upset/sad, stressed/anxious, angry/frustrated or excited/hyped, never for "
+        "neutral, jokey or purely informational messages.",
+        {"mood": _str("Exactly one of: upset, stressed, angry, excited.")},
+        ["mood"],
+    ),
+    _tool(
+        "calculate_local_math",
+        "Exact deterministic calculator. Use whenever a number must be computed (arithmetic, %, "
+        "powers, roots, trig, factorials…), never do it yourself. NOT for dates, IDs, or numbers "
+        "with nothing to compute.",
+        {"expression": _str("Raw Python-syntax expression: * ** sqrt() sin() pi. E.g. '9*8*9*9', "
+                            "'sqrt(144)', '15% of 80' -> '0.15*80'. No chatter like 'send it to my dm'.")},
+        ["expression"],
+    ),
+    _tool(
+        "search_visual_media",
+        "Find and post a real image/video. Use when asked to send/show/find a picture, photo, video, "
+        "clip, vector, cartoon, illustration or anime/manga art. Default kind=photo for ordinary "
+        "subjects (places, nature, animals, food, objects). NOT for songs/audio "
+        "(use search_and_play_music).",
+        {
+            "query": _str("Short English subject, 1-5 words, no filler ('red panda', 'sunset beach')."),
+            "kind": _str("Exactly one of: photo (real photograph), video (real clip), vector (flat "
+                         "graphic), cartoon (drawn art, ONLY if the user's CURRENT message literally "
+                         "asks for anime, manga, cartoon or illustration; never infer it from earlier "
+                         "messages). Unsure → photo."),
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_local_math",
-            "description": (
-                "Evaluate a math expression EXACTLY with a deterministic calculator. "
-                "Call this whenever the user wants a number computed (arithmetic, "
-                "percentages, powers, roots, trig, factorials, etc.) — never compute "
-                "it yourself, LLM arithmetic is unreliable. Do NOT call it for dates, "
-                "IDs, or casual mentions of a number with nothing to compute."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": (
-                            "The raw math expression in Python syntax: * multiply, "
-                            "** power, sqrt(), sin(), pi, etc. Example: '9*8*9*9', "
-                            "'sqrt(144)', '15% of 80' -> '0.15*80'. Leave out chatter "
-                            "like 'send it to my dm'."
-                        ),
-                    },
-                },
-                "required": ["expression"],
-            },
+        ["query", "kind"],
+    ),
+    _tool(
+        "search_and_play_music",
+        "Search YouTube Music, post a playable song card with links. Use for a song, track, artist, "
+        "playlist or music recommendation. NOT for images/videos.",
+        {"query": _str("Song title and/or artist ('Bohemian Rhapsody Queen'). For vague asks "
+                       "('something chill') pick a concrete well-known song/artist.")},
+        ["query"],
+    ),
+    _tool(
+        "query_peran_server",
+        "Look up a ROLE in this server: holders and details. You have NO role data, MUST call for "
+        "'who has the Moderator role', 'members of role X'; never list names from a guess. Server-only.",
+        {"role_name": _str("Role name without @, OR its ID / <@&ID> mention exactly as written.")},
+        ["role_name"],
+    ),
+    _tool(
+        "pick_random_member",
+        "Pick RANDOM member(s) of this server, the database rolls the dice. You have NO member "
+        "list: MUST call for 'random member', 'pick someone', 'who should…', 'siapa random', "
+        "'pilih member acak'; never choose names yourself. Also call for opinion questions ('your "
+        "favorite member?', 'which member do you like?', 'who is the best/cutest/coolest?') with no "
+        "intent or 'opinion': the result carries REAL server stats (most senior, biggest role "
+        "collector, best avatar/banner/accent-colour profile) to form your own favorite from. "
+        "intent='props' when they also want a joke, roast, compliment or trivia about the pick "
+        "(you get its REAL properties to build from); intent='funfact' for just a fun fact. Optional role filter. Bots never picked. "
+        "Re-call for every new request (fresh roll). Server-only.",
+        {
+            "count": {"type": "integer", "description": "How many (default 1, max 10)."},
+            "intent": _str("'props' ONLY for a joke/roast/compliment/trivia/'tell me about them' about "
+                           "the pick. 'funfact' for a fun fact. 'opinion' or omit for "
+                           "favorite/best/cutest questions and plain picks."),
+            "role_name": _str("Optional: only pick holders of this role, name without @, OR ID / "
+                              "<@&ID> exactly as written. Omit for the whole server."),
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_visual_media",
-            "description": (
-                "Find and post a real image or video in the channel. Call this when the "
-                "user asks you to send/show/find a picture, photo, video, clip, vector, "
-                "cartoon, illustration or anime/manga art of something. Default to kind=photo "
-                "for ordinary subjects (places, cities, nature, animals, food, objects). "
-                "NOT for songs, music or audio — use search_and_play_music for those."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Short English search subject, 1-5 words, no filler "
-                            "(e.g. 'red panda', 'sunset beach', 'mountain landscape')."
-                        ),
-                    },
-                    # 🌸 Deliberately NOT a strict JSON-schema enum: Groq validates
-                    # tool arguments server-side, and a model that wrote
-                    # kind="anime" got the WHOLE call rejected (400
-                    # tool_use_failed) instead of just being mapped to the
-                    # right bucket. The four allowed values are spelled out
-                    # in the description and _exec_media normalizes aliases.
-                    "kind": {
-                        "type": "string",
-                        "description": (
-                            "Exactly one of: photo (real photograph), video (real "
-                            "video clip), vector (flat vector graphic), cartoon "
-                            "(drawn/illustrated art — ONLY when the user's CURRENT message literally asks "
-                            "for anime, manga, cartoon or illustration; never guess it from earlier "
-                            "messages in the chat). When unsure, use photo."
-                        ),
-                    },
-                },
-                "required": ["query", "kind"],
-            },
+        [],
+    ),
+    _tool(
+        "pick_random_role",
+        "Pick RANDOM role(s) of this server, the database rolls the dice. You have NO role list: "
+        "MUST call for 'random role', 'pick a role for me', 'role acak'; never invent names. "
+        "@everyone and bot/integration roles are never picked. Server-only.",
+        {"count": {"type": "integer", "description": "How many (default 1, max 10)."}},
+        [],
+    ),
+    _tool(
+        "send_dm_to_user",
+        "DM the user privately. Use when they explicitly ask ('dm me that', 'kirim ke dm dong', "
+        "'send it privately') or when what you'd share is genuinely sensitive (secret, redeem code, "
+        "password, personal results). Rarely needed. Server-only.",
+        {"content": _str("ONLY the private text, in full, it must NOT also appear in your public reply.")},
+        ["content"],
+    ),
+    _tool(
+        "decode_discord_snowflake",
+        "Decode a Discord ID (user/server/channel/message) into its exact creation date and time. "
+        "Use when given an ID and asked when it was created / how old the account, server or message "
+        "is. IDs are public, no lookup needed.",
+        {"snowflake": _str("17-20 digit ID, digits only (strip any <@ > wrapper).")},
+        ["snowflake"],
+    ),
+    _tool(
+        "check_member_existence",
+        "Look up a person in this server. You have NO member list: MUST call for ANY 'is X "
+        "here/there/in this server' question, however casual or typo'd; never answer yes/no from a "
+        "guess, and call AGAIN even if asked before (membership changes; old answers are stale). "
+        "Also call for ANYTHING else about a specific member, joke, light roast, compliment, "
+        "trivia, rating, comparison, 'tell me about X', 'how long has X been here', 'what roles does "
+        "X have', opinion, with intent='props': you get their REAL server properties (account age, "
+        "join date, roles, nickname, booster, badges, status) and build ONLY from those; you know "
+        "nothing of their personality or private life, so never invent it. A plain 'fun fact about X' "
+        "→ intent='funfact' (a random fun fact, no Discord stats; it may tease their name, and "
+        "their avatar/banner too when the user names them). intent='profile' ONLY when "
+        "the user EXPLICITLY asks about their profile picture/pfp/avatar/banner/decoration/accent "
+        "colour or how they look ('profile,props' for both), never for a mere opinion. For the "
+        "asker's OWN profile ('is my pfp cool') pass the asker's name; the @mention addressing YOU "
+        "(the bot) is never the target. NOT for celebrities/public figures who aren't members. "
+        "Server-only.",
+        {
+            "target_name": _str("Member's name, display name or username (may be several words), OR "
+                                "Discord ID (17-20 digits) OR <@ID> mention, copied exactly as the "
+                                "user wrote it."),
+            "intent": _str("Optional. 'props' for ANYTHING beyond plain yes/no: joke, roast, "
+                           "compliment, trivia, rating, comparison, opinion, 'tell me about X'. "
+                           "'funfact' for a fun fact (also when they want it to joke about the name/avatar/banner). "
+                           "'profile' ONLY when the user explicitly asks about their pfp/avatar/banner/"
+                           "decoration/accent colour or looks. 'profile,props' for both. Omit for a "
+                           "plain 'is X here'."),
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_and_play_music",
-            "description": (
-                "Search YouTube Music and post a playable song card with links. Call this "
-                "when the user asks for a song, track, artist, playlist or music "
-                "recommendation. NOT for images or videos."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Song title and/or artist name to search for, e.g. "
-                            "'Bohemian Rhapsody Queen'. For a vague request "
-                            "('something chill') pick a concrete well-known song or "
-                            "artist that fits."
-                        ),
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_peran_server",
-            "description": (
-                "Look up a ROLE in this Discord server: who holds it and its details. "
-                "You have NO role data, so you MUST call this for any question like 'who has "
-                "the Moderator role' or 'who are the members of role X' — never list names "
-                "from your own guess. Server-only."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role_name": {
-                        "type": "string",
-                        "description": (
-                            "The name of the role being searched for, without the @ — "
-                            "OR the role's Discord ID / a <@&ID> mention, exactly as written."
-                        ),
-                    },
-                },
-                "required": ["role_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_dm_to_user",
-            "description": (
-                "Send a private message to the user's DMs. Call this when the user "
-                "explicitly asks to be DM'd ('dm me that', 'kirim ke dm dong', 'send it "
-                "privately') or when what you'd share is genuinely sensitive (a secret, "
-                "coupon/redeem code, password, personal results) and shouldn't be visible "
-                "to the whole server. Rarely needed. Server-only."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": (
-                            "ONLY the private text to deliver, written out in full. It "
-                            "must not also appear in your public reply."
-                        ),
-                    },
-                },
-                "required": ["content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "decode_discord_snowflake",
-            "description": (
-                "Decode a Discord ID (snowflake) into the exact date and time it was "
-                "created — works for user, server, channel or message IDs. Call this "
-                "when the user gives an ID and asks when it was created / how old the "
-                "account, server or message is. IDs are public; no lookup is needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "snowflake": {
-                        "type": "string",
-                        "description": "The 17-20 digit Discord ID, digits only (strip any <@ > wrapper).",
-                    },
-                },
-                "required": ["snowflake"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_member_existence",
-            "description": (
-                "Look up a person in this Discord server. You have NO member list, so you "
-                "MUST call this for ANY question about whether someone is here/there/in/on "
-                "this server — however casually or typo'd it is phrased ('is dark side here in "
-                "this ssrver', 'is X there'). Never answer yes or no from your own guess, and "
-                "call it AGAIN even if the same person was already asked about earlier in the "
-                "chat (membership changes, old answers are stale). "
-                "ALSO call it for ANYTHING else about a specific member — a fun fact, joke, "
-                "light roast, compliment, trivia, rating, comparison, 'tell me about X', 'how long has "
-                "X been here', 'what roles does X have', an opinion — with intent='props': the result "
-                "then includes their REAL server properties (account age, join date, roles, nickname, "
-                "booster status, badges, status) and you build the fun/fact/joke ONLY from those. You "
-                "still do NOT know their personality or private life, so never invent any. "
-                "Pass intent='profile' ONLY when the user EXPLICITLY asks about their profile "
-                "picture / pfp / avatar / banner / avatar decoration / accent colour or how they look; "
-                "then the result includes a description of those (use 'profile,props' for both). "
-                "Never use 'profile' just because someone asked for an opinion. "
-                "For the asker's OWN profile ('is my pfp cool') pass the asker's own name — the @mention that "
-                "addresses YOU (the bot) is never the target. "
-                "NOT for celebrities or public figures who aren't members here. Server-only."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_name": {
-                        "type": "string",
-                        "description": (
-                            "Name, display name or username of the member to look for "
-                            "(may be several words), OR their Discord ID (17-20 digits) "
-                            "OR a <@ID> mention — copied exactly as the user wrote it."
-                        ),
-                    },
-                    # 🌸 String on purpose (not enum/boolean) — same reason as
-                    # search_visual_media's "kind": Groq rejects the WHOLE call
-                    # when a strict-typed argument is slightly off.
-                    "intent": {
-                        "type": "string",
-                        "description": (
-                            "Optional. 'props' when the user wants ANYTHING beyond a plain yes/no about "
-                            "this member: a fact, joke, light roast, compliment, trivia, rating, comparison, "
-                            "opinion or 'tell me about X' — you then get their real server properties "
-                            "(account age, join date, roles, nickname, booster, badges, status) to build it from. "
-                            "'profile' ONLY when the user explicitly asks about their profile picture, avatar, "
-                            "banner, avatar decoration or accent colour, or how they look. 'profile,props' for "
-                            "both. Omit it for a plain 'is X here'."
-                        ),
-                    },
-                },
-                "required": ["target_name"],
-            },
-        },
-    },
+        ["target_name"],
+    ),
 ]
 
 
@@ -394,52 +276,57 @@ TOOL_SCHEMAS = [
 # media link themselves or restate a whole embed after the tool already
 # delivered it.
 TOOL_USE_DIRECTIVE = (
-    "\n\n[Tools] You can call tools. RULES:\n"
-    "1. You have NO data about who is in this server or what roles exist. Any question "
-    "about whether a person is in/on/here/there in this server, or who has a role, MUST "
-    "go through check_member_existence / query_peran_server — never answer yes/no or "
-    "name people from your own guess, even if it seems obvious. Call the tool again even "
-    "if you answered the same question earlier in this chat. NEVER reply with only an "
-    "emoji (a lone check or cross is not an answer): always write a short sentence naming the person. "
-    "If the user asks anything about a specific server member (a fact, joke, light roast, "
-    "compliment, trivia, rating, 'tell me about X', 'how long has X been here', an opinion), call "
-    "check_member_existence with intent='props' and build the answer ONLY from the properties it "
-    "returns — you know nothing else about them, so never invent personality, hobbies or private "
-    "details; if they want something the properties don't cover, say sweetly you can't see that. "
-    "Only when the user EXPLICITLY asks about their profile picture/banner/decoration/accent "
-    "colour/looks, pass intent='profile' ('profile,props' for both). "
-    "For 'my pfp/banner/accent' (the ASKER's own), target_name is the asker's own name — the "
-    "@mention that addresses you is NEVER the target.\n"
-
-    "2. Math: always call calculate_local_math, never compute it yourself, and never "
-    "alter a number a tool returned.\n"
-    "3. Pictures/videos/anime art → search_visual_media (kind=photo unless the user's "
-    "CURRENT message explicitly says anime/manga/cartoon/illustration/vector/video — "
-    "earlier anime pictures in the chat do NOT change this); songs/artists → "
-    "search_and_play_music. The card/image is posted automatically right BELOW your "
-    "message: write a short, cute, in-character line that leads into it, and don't paste "
-    "links or repeat what it contains.\n"
-    "4. Private/sensitive content or an explicit 'DM me' → send_dm_to_user (never repeat "
-    "that content publicly). A Discord ID someone wants dated → decode_discord_snowflake.\n"
-    "5. Normal chat needs no tool — just reply.\n"
-    "6. Anything that depends on current/real-world info (news, scores, prices, weather, "
-    "'latest', releases, who currently holds a position) → search_web; never answer those "
-    "from memory. After a search, summarize in your own words.\n"
-    "7. If the user's mood is clearly upset, stressed, angry or excited, call "
-    "react_to_mood once and follow the tone guidance it returns; skip it for neutral "
-    "or jokey messages.\n"
-    "8. If a tool reports an error or nothing found, say so honestly and sweetly instead "
-    "of making something up. Never invent links, images, songs or member lists."
+    "\n\n[Tools] RULES:\n"
+    "1. You have NO data on who is in this server or what roles exist. Whether a person is "
+    "in/on/here/there, or who holds a role, MUST go through check_member_existence / "
+    "query_peran_server, never answer yes/no or name people from a guess, even if obvious, and "
+    "re-call even if you answered before. NEVER reply with a lone emoji: write a short sentence "
+    "naming the person. "
+    "Anything about a specific member (joke, light roast, compliment, trivia, rating, 'tell "
+    "me about X', 'how long has X been here', opinion) → check_member_existence intent='props', "
+    "built ONLY from the returned properties; never invent personality, hobbies or private "
+    "details, and if they ask for what the properties don't cover, say sweetly you can't see that. "
+    "A plain 'fun fact about X' → intent='funfact': a random fun fact, no Discord stats, may "
+    "tease their name (and avatar/banner if the user names them). "
+    "intent='profile' ('profile,props' for both) ONLY when the user EXPLICITLY asks about "
+    "pfp/banner/decoration/accent colour/looks. For the ASKER's own 'my pfp', target_name is the "
+    "asker's name, the @mention addressing you is NEVER the target.\n"
+    "Random member ('pick someone', 'siapa random', 'random person with role X') → "
+    "pick_random_member; random role → pick_random_role. Opinion questions ('your favorite "
+    "member?', 'which member do you like?', 'who is the best/cutest/coolest?') → pick_random_member "
+    "WITHOUT 'props': its result carries real server stats (elder, role collector, best "
+    "avatar/banner/accent profile), announce YOUR pick from them like a personal favorite. A "
+    "joke/roast about the pick → intent='props', built ONLY from the PROPS returned; a fun fact → "
+    "intent='funfact'. The "
+    "database already rolled the dice: announce exactly what it returns, never swap or re-pick "
+    "names.\n"
+    "2. Math: always calculate_local_math; never compute it yourself or alter a returned number.\n"
+    "3. Pictures/videos/anime art → search_visual_media (kind=photo unless the user's CURRENT "
+    "message explicitly says anime/manga/cartoon/illustration/vector/video; earlier anime pictures "
+    "don't count). Songs/artists → search_and_play_music. The card/image posts automatically right "
+    "BELOW your message: write one short, cute, in-character lead-in; don't paste links or repeat "
+    "its contents.\n"
+    "4. Private/sensitive content or an explicit 'DM me' → send_dm_to_user (never repeat that "
+    "content publicly). Discord ID to date → decode_discord_snowflake.\n"
+    "5. Normal chat needs no tool.\n"
+    "6. Current/real-world info (news, scores, prices, weather, 'latest', releases, who holds a "
+    "position) → search_web, never from memory; summarize in your own words.\n"
+    "7. Clearly upset, stressed, angry or excited user → react_to_mood once, follow its tone "
+    "guidance; skip for neutral/jokey.\n"
+    "8. On a tool error or nothing found, say so honestly and sweetly. Never invent links, images, "
+    "songs or member lists.\n"
+    "9. STYLE: never write a dash as punctuation: no em dash (—), no en dash (–), no ' - ' "
+    "between words. Use a comma, period or new sentence instead: write 'great, thanks', never "
+    "'great — thanks'. Hyphens inside words and dates (well-known, 2026-07-13) are fine."
 )
 
 # 🌸 Appended to the system prompt when a 400 forces a retry WITHOUT tools.
 # Without it the model just improvises (it once invented a fake imgur link
 # for an image request) — this tells it the honest move.
 TOOLS_UNAVAILABLE_NOTE = (
-    "\n\n[Note] Your tools (media, music, math, server lookups) are unavailable for this "
-    "one reply. If the user's message needed one of them, say sweetly that you couldn't "
-    "do it just now and they can try again. Never invent links, images, songs, math "
-    "results or member/role information."
+    "\n\n[Note] Tools (media, music, math, server lookups) are unavailable for this reply. If the "
+    "message needed one, say sweetly you couldn't just now and they can retry. Never invent links, "
+    "images, songs, math results or member/role info. Never write dashes as punctuation (— – or ' - '): use commas or periods."
 )
 
 
@@ -522,7 +409,7 @@ def _with_mention_note(text: str) -> str:
     to pass them through verbatim (they render as @name chips and, because
     replies are sent with users=False, never ping anyone)."""
     if "<@" in text:
-        return text + "\n(Keep every <@id> mention exactly as written in your reply — it shows as a clickable name.)"
+        return text + "\n(Copy every <@id>/<@&id> mention verbatim, it renders as a clickable name.)"
     return text
 
 
@@ -537,7 +424,7 @@ def _clip(text: str, limit: int | None = None) -> str:
 async def _deliver(ctx: "_Ctx", result) -> str:
     """🌸 QUEUES a handler's return value to be posted in the channel —
     the same shapes groq_service.py's old `if intercepted:` block handled
-    — and returns a short stub string for the model.
+   , and returns a short stub string for the model.
 
     Posting is DEFERRED on purpose: the model's own text reply doesn't
     exist yet (it's written AFTER it reads this stub), and the card must
@@ -555,7 +442,7 @@ async def _deliver(ctx: "_Ctx", result) -> str:
                                                .mp4 link, so Discord's own
                                                inline video player kicks in)
 
-    The deferred sends use mention_author=False — the text reply already
+    The deferred sends use mention_author=False, the text reply already
     pinged the user once; a second ping for the card would be noise.
     """
     message = ctx.message
@@ -753,7 +640,7 @@ def _sanitize_media_intent(kind: str, query: str, message_text: str) -> tuple[st
         cleaned = from_msg if query_art else query
         if not cleaned:
             cleaned = " ".join(_ART_REQUEST_RE.sub(" ", query).split())
-        print(f"🛡️ ignored model's art pick (kind={kind!r}, query={query!r}) — "
+        print(f"🛡️ ignored model's art pick (kind={kind!r}, query={query!r}), "
               f"user said {message_text!r}; using photo {cleaned!r}")
         return ("photo" if kind == "cartoon" else kind), cleaned
     return kind, query
@@ -761,9 +648,9 @@ def _sanitize_media_intent(kind: str, query: str, message_text: str) -> tuple[st
 
 def _wants_nekos(kind: str, query: str, message_text: str) -> bool:
     """True only for a genuinely anime-flavored request (anime/neko/waifu/...
-    in the USER's message — or in the query on a follow-up). kind="cartoon"
+    in the USER's message, or in the query on a follow-up). kind="cartoon"
     alone is NOT enough anymore: "cartoon city" must not return a neko girl.
-    Never for video/vector — the nekos APIs only serve still images/GIFs."""
+    Never for video/vector, the nekos APIs only serve still images/GIFs."""
     if kind in ("video", "vector"):
         return False
     text = f"{query} {message_text}" if _FOLLOWUP_RE.search(message_text) else message_text
@@ -897,7 +784,7 @@ def card_delivered(message_id: int) -> bool:
 
 _PROFILE_RULES = (
     "The user explicitly asked about this member's profile picture/banner/looks. "
-    "Answer exactly that, in your own voice, using ONLY the PROFILE above — never invent "
+    "Answer exactly that, in your own voice, using ONLY the PROFILE above, never invent "
     "anything beyond it. Describing the images is fine, but don't turn them into claims "
     "about the person's personality or character. Be warm and kind; no insults, no guesses "
     "about who they really are. If an image couldn't be viewed or isn't set, say that "
@@ -908,15 +795,13 @@ _PROFILE_RULES = (
 )
 
 _PROPS_RULES = (
-    "The user wants something about this member (a fact, joke, light roast, compliment, "
-    "trivia, rating, comparison or just info). Build it ONLY from the PROPS above — never "
-    "invent anything beyond it, and never claim to know their personality, hobbies, messages "
-    "or private life. Playful teasing about the stats (join date, account age, roles, badges, "
-    "boosting, 'ancient account', 'collects roles like trophies') is welcome, but keep it warm "
-    "and kind: no real insults, and no jokes about appearance, identity, religion, health, "
-    "family or money. Use the exact numbers/dates given. 1-3 short sentences unless they "
-    "ask for more, in your usual voice. If they ask for something the PROPS don't cover, say "
-    "sweetly that you can't see that."
+    "The user wants something about this member (fact, joke, light roast, compliment, trivia, "
+    "rating, comparison, info). Use ONLY the PROPS above: never invent anything, never claim to "
+    "know their personality, hobbies, messages or private life. Playful teasing about the stats "
+    "(join date, account age, roles, badges, boosting, 'ancient account', 'collects roles like "
+    "trophies') is welcome but warm: no real insults, no jokes about appearance, identity, "
+    "religion, health, family or money. Quote the exact numbers/dates. 1-3 short sentences unless "
+    "asked for more, in your usual voice. If PROPS don't cover the ask, say sweetly you can't see that."
 )
 
 
@@ -934,7 +819,7 @@ def _member_result_for_model(result: str, profile_block: str | None = None,
         rules = []
         if profile_block:
             parts.append(
-                "PROFILE (you can't see images — this is a description of what is there):\n"
+                "PROFILE (you can't see images, this is a description of what is there):\n"
                 f"{profile_block}"
             )
             rules.append(_PROFILE_RULES)
@@ -947,7 +832,7 @@ def _member_result_for_model(result: str, profile_block: str | None = None,
         f"LOOKUP RESULT: {body}\n"
         "(Reply with ONE short sentence in your own voice that states this result in "
         "full: who, and whether they are in the server. Never reply with only an emoji. "
-        "This lookup tells you NOTHING about their personality or looks — if the user also "
+        "This lookup tells you NOTHING about their personality or looks, if the user also "
         "asked what they're like / for an opinion, say sweetly you can't really tell from "
         "this, and do NOT describe or mention their profile picture or banner.)"
     )
@@ -1068,7 +953,7 @@ def _is_asker(ctx, target: str) -> bool:
 
 
 def _is_self_profile_question(ctx, target: str) -> bool:
-    """🌸 'is my pfp/profile cool' — the asker wants THEIR OWN profile looked at. True when the
+    """🌸 'is my pfp/profile cool', the asker wants THEIR OWN profile looked at. True when the
     message is first-person + profile words and the model's target is the bot itself (the
     @mention that addresses the bot) or the asker. Independent of the model's `intent` and of
     the unseen name lookup, which kept resolving the '@Bruh' text."""
@@ -1085,7 +970,7 @@ def _is_default_avatar(url) -> bool:
 def _is_animated_hash(url) -> bool:
     """🌸 True when a Discord CDN link's hash starts with a_ (animated).
     Looks at the last path segment only (…/avatars/<id>/a_<hash>.png,
-    …/avatar-decoration-presets/a_<hash>.png) — never LIKE '%a_%' in SQL,
+    …/avatar-decoration-presets/a_<hash>.png), never LIKE '%a_%' in SQL,
     where _ is a wildcard and everything matches."""
     if not url:
         return False
@@ -1095,7 +980,7 @@ def _is_animated_hash(url) -> bool:
 
 def _still_image_url(url: str, size: int = 512) -> str:
     """🌸 Vision-friendly CDN link: animated hashes (a_…) get a .png (first
-    frame — Discord serves that), and the size is capped so the image
+    frame, Discord serves that), and the size is capped so the image
     download stays small."""
     base = url.split("?", 1)[0]
     if base.endswith((".gif", ".webp")):
@@ -1155,13 +1040,12 @@ async def _describe_profile_images(ctx: _Ctx, avatar_url, banner_url, decoration
 
     labels = ", ".join(label.upper() for label, _ in items)
     prompt = (
-        f"These are a Discord user's {labels} image(s), in that order"
-        + (" (DECORATION is a decorative frame/effect drawn around the avatar, e.g. a border, "
-           "flames or sparkles)" if decoration_url else "")
-        + ". For each one write "
-        "ONE short line (max 25 words): the subject, art style, main colors and mood, plus "
-        "any readable text. Describe only what is visibly there — do NOT identify real "
-        "people or guess age, ethnicity or anything about who they are. Format exactly:\n"
+        f"A Discord user's {labels} image(s), in that order"
+        + (" (DECORATION = a frame/effect around the avatar: border, flames, sparkles)"
+           if decoration_url else "")
+        + ". For each write ONE line, max 25 words: subject, art style, main colors, mood, any "
+        "readable text. Describe only what is visible, do NOT identify real people or guess "
+        "age, ethnicity or who they are. Format exactly:\n"
         + "\n".join(f"{label.upper()}: <description>" for label, _ in items)
     )
     content = [{"type": "text", "text": prompt}]
@@ -1186,7 +1070,7 @@ async def _describe_profile_images(ctx: _Ctx, avatar_url, banner_url, decoration
     # 🌸 qwen reasoning output: drop a <think>…</think> block if the API left it inline.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     if not text:
-        print(f"⚠️ Profile image vision returned empty content ({PROFILE_VISION_MODEL}) — "
+        print(f"⚠️ Profile image vision returned empty content ({PROFILE_VISION_MODEL}), "
               "reasoning probably ate max_tokens; raise _PROFILE_VISION_MAX_TOKENS")
         return {}
 
@@ -1226,7 +1110,7 @@ async def _profile_block(ctx: _Ctx, target: str, user_id: int | None = None):
         deco if has_deco else None,
     )
 
-    unviewable = "exists but couldn't be viewed right now — don't guess what it shows"
+    unviewable = "exists but couldn't be viewed right now, don't guess what it shows"
     lines = []
     names = [n for n in (profile.get("global_name"), profile.get("username"), profile.get("server_name")) if n]
     if names:
@@ -1250,24 +1134,23 @@ async def _profile_block(ctx: _Ctx, target: str, user_id: int | None = None):
     flags = []
     if accent:
         flags.append(
-            "NITRO_FLAG accent_colour: a custom profile accent colour is a Nitro feature, "
-            "so this member most likely has Nitro (a fancy Nitro member)."
+            "NITRO_FLAG accent_colour: custom accent colour = Nitro feature, so most likely a "
+            "Nitro member."
         )
     if has_avatar and _is_animated_hash(avatar):
         flags.append(
-            "NITRO_FLAG animated_pfp: their profile picture hash starts with a_ (animated GIF pfp) — "
-            "animated avatars need Nitro, so they definitely have/had Nitro."
+            "NITRO_FLAG animated_pfp: animated GIF pfp (hash starts a_) needs Nitro, they "
+            "definitely have/had it."
         )
     if has_deco and _is_animated_hash(deco):
         flags.append(
-            "DECO_FLAG animated_decoration: their avatar decoration hash starts with a_ "
-            "(an animated frame). Decorations come from the Discord Shop (cheaper/free with Nitro), "
-            "so this is a premium-cosmetic flex but NOT proof of Nitro by itself."
+            "DECO_FLAG animated_decoration: animated avatar frame (Discord Shop, cheaper/free "
+            "with Nitro), a premium flex, NOT proof of Nitro."
         )
     elif has_deco:
         flags.append(
-            "DECO_FLAG static_decoration: they wear a (non-animated) avatar decoration from the "
-            "Discord Shop — a premium cosmetic, but NOT proof of Nitro by itself."
+            "DECO_FLAG static_decoration: static Discord Shop avatar frame, premium cosmetic, "
+            "NOT proof of Nitro."
         )
     if flags:
         lines.append("Flags:")
@@ -1294,6 +1177,47 @@ def _wants_props(args: dict) -> bool:
     public server data, and the whole point is 'anything about this member'."""
     intent = str(args.get("intent") or "").strip().lower()
     return bool({t for t in re.split(r"[^a-z]+", intent) if t} & _PROPS_INTENTS)
+
+
+# 🌸 'Fun fact about him' = a RANDOM fun fact dedicated to them, NOT Discord stats. The member
+# is still resolved (so the reply names the right person) but no PROPS block is built.
+_FUNFACT_TOKENS = frozenset({"funfact", "fact", "facts", "fun", "trivia"})
+_NON_FUNFACT_TOKENS = frozenset({
+    "props", "prop", "properties", "info", "joke", "jokes", "roast", "compliment",
+    "stats", "details", "about",
+})
+_FUNFACT_RULES = (
+    "FUN FACT request: do NOT use their Discord stats (join date, account age, roles, badges, "
+    "boosting). Give ONE random, true, quirky general fun fact (animals, space, food, science, "
+    "history, words), dedicated to them in 1-2 short sentences and your cutest voice. For the "
+    "joke twist you may playfully tease their NAME (a word in it, its symbols, how it looks or "
+    "sounds). Keep any teasing light and warm: no real insults, nothing about their body, face, "
+    "identity, religion, health, family or money. Never present the fact as true about their real "
+    "life, and never invent their personality, hobbies or private details."
+)
+# 🌸 Added ONLY when a PROFILE block (pfp/banner description) is attached to a fun fact request.
+_FUNFACT_PROFILE_RULES = (
+    "A PROFILE is attached: you may also joke about their avatar, banner or decoration, built ONLY "
+    "from the PROFILE text (colours, objects, vibe, Nitro flags). Tease the pictures and the name, "
+    "never the person. If an image couldn't be viewed, say so instead of guessing."
+)
+
+
+def _funfact_with_profile(body: str, profile_block: str) -> str:
+    """🌸 Fun fact + joke about name/avatar/banner: the lookup line, the PROFILE description,
+    then the fun fact rules plus the profile-teasing rules."""
+    return (
+        f"LOOKUP RESULT: {body}\n"
+        "PROFILE (you can't see images, this is a description of what is there):\n"
+        f"{profile_block}\n"
+        f"({_FUNFACT_RULES} {_FUNFACT_PROFILE_RULES} Keep the <@id> mention exactly as written.)"
+    )
+
+
+def _wants_funfact(args: dict) -> bool:
+    intent = str(args.get("intent") or "").strip().lower()
+    toks = {x for x in re.split(r"[^a-z]+", intent) if x}
+    return bool(toks & _FUNFACT_TOKENS) and not (toks & _NON_FUNFACT_TOKENS)
 
 
 def _member_id_from_result(result: str) -> int | None:
@@ -1342,7 +1266,7 @@ async def _member_props_block(ctx: _Ctx, user_id: int):
     """🌸 Real, public server properties of ONE member as compact text for the
     model to make facts / jokes / light roasts / trivia from. Never raises;
     None when the member object can't be obtained. Only things Discord itself
-    shows on a profile — no message history, nothing private."""
+    shows on a profile, no message history, nothing private."""
     try:
         m = await _fetch_member_obj(ctx, user_id)
         if m is None:
@@ -1428,21 +1352,21 @@ async def _member_props_block(ctx: _Ctx, user_id: int):
 
 
 async def _exec_self_profile(ctx: _Ctx, want_props: bool = False) -> str:
-    """🌸 The asker's OWN profile ('is my pfp cool'): no name lookup at all — the author's ID
+    """🌸 The asker's OWN profile ('is my pfp cool'): no name lookup at all, the author's ID
     goes straight to members.db, so '@Bruh' (the bot) can never be picked up as the target.
     want_props also adds their server properties ('roast my pfp and join date')."""
     author = ctx.message.author
     profile_block = await _profile_block(ctx, str(author.id), user_id=author.id)
     props_block = await _member_props_block(ctx, author.id) if want_props else None
     result = (
-        f"✅ Yep, <@{author.id}> is here — that's the person asking, and they asked about THEIR OWN "
+        f"✅ Yep, <@{author.id}> is here, that's the person asking, and they asked about THEIR OWN "
         "profile (say 'your', not 'their')."
     )
     _remember_member_result(ctx.message.id, result)
     out = _member_result_for_model(result, profile_block, props_block)
     if not profile_block:
         out += (
-            "\n(Their profile couldn't be loaded right now — tell them sweetly you can't see it, "
+            "\n(Their profile couldn't be loaded right now, tell them sweetly you can't see it, "
             "and don't guess what it looks like.)"
         )
     return _clip(out, _MEMBER_RESULT_MAX_CHARS)
@@ -1457,6 +1381,16 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
     if not target:
         return "ERROR: no member name was provided."
     if _is_self_profile_question(ctx, target):
+        if _wants_funfact(args):
+            self_body = f"<@{ctx.message.author.id}> is the person asking (say 'you', not 'they')."
+            if _EXPLICIT_PROFILE_RE.search(getattr(ctx.message, "content", "") or ""):
+                self_profile = await _profile_block(ctx, str(ctx.message.author.id), user_id=ctx.message.author.id)
+                if self_profile:
+                    return _funfact_with_profile(self_body, self_profile)
+            return (
+                f"LOOKUP RESULT: {self_body}\n"
+                f"({_FUNFACT_RULES} Keep the <@id> mention exactly as written.)"
+            )
         return await _exec_self_profile(ctx, _wants_props(args))
     target = _resolve_asker_target(ctx, target)
     # 🌸 name_hint takes priority over the handler's regex fallback (a
@@ -1475,16 +1409,28 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
         profile_block = None
         props_block = None
         found = result.lstrip().startswith("✅")
-        if found and _wants_profile(args, getattr(ctx.message, "content", "") or ""):
+        msg_text = getattr(ctx.message, "content", "") or ""
+        funfact = found and _wants_funfact(args)
+        # 🌸 A fun fact with 'make fun of his avatar/banner' also reads the profile, behind the
+        # same hard gate as intent='profile': the user's OWN words must name pfp/avatar/banner/looks.
+        if found and (_wants_profile(args, msg_text)
+                      or (funfact and _EXPLICIT_PROFILE_RE.search(msg_text))):
             profile_block = await _profile_block(ctx, target)
         # 🌸 intent='props' → real server properties for facts/jokes/roasts/trivia.
         # The member id comes from the lookup's own '<@id>' hit, so it can only
         # ever describe the ONE member the handler actually found.
-        if found and _wants_props(args):
+        if found and not funfact and _wants_props(args):
             member_id = _member_id_from_result(result)
             if member_id:
                 props_block = await _member_props_block(ctx, member_id)
-        result = _member_result_for_model(result, profile_block, props_block)
+        if funfact:
+            body = re.sub(r"^[\s✅❌]+", "", result).strip()
+            if profile_block:
+                result = _funfact_with_profile(body, profile_block)
+            else:
+                result = f"LOOKUP RESULT: {body}\n({_FUNFACT_RULES} Keep the <@id> mention exactly as written.)"
+        else:
+            result = _member_result_for_model(result, profile_block, props_block)
     else:
         _remember_member_result(ctx.message.id, "")
     return await _text_result(
@@ -1497,9 +1443,274 @@ async def _exec_member(ctx: _Ctx, args: dict) -> str:
     )
 
 
+_RANDOM_PICK_MAX = 10
+_RANDOM_PROPS_MAX = 3            # picks that get a props block (fact/joke) per call
+_RANDOM_RESULT_MAX_CHARS = 5200  # room for up to 3 props blocks + stats + rules
+_ROLE_ID_ARG_RE = re.compile(r"^\s*<?@?&?(\d{17,20})>?\s*$")
+
+
+def _clamp_count(value, default: int = 1, maximum: int = _RANDOM_PICK_MAX) -> int:
+    """🌸 Models send count as 3, "3", 3.0 or garbage, always land on 1..maximum."""
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, maximum))
+
+
+_OPINION_RULES = (
+    "For YOUR opinion (favorite member, who you like, best/cutest/coolest): pick ONE person from "
+    "the SERVER STATS above, not just the random pick, and say it as your personal favorite, in "
+    "your usual voice. Praise the elder for staying longest, admire the role collector's trophy "
+    "shelf, or gush over the profile-style star's aesthetic (best for cute/pretty questions). If "
+    "'What their profile looks like' is given, it was read from the real images: rate the ART "
+    "(style, colours, mood, banner, frame), never anyone's face or body; a photo of a person is "
+    "just 'a photo', talk colours/vibe. Without that line you can't see the images (the accent "
+    "colour's vibe is fair game). Cite the exact dates/numbers/features. You know nothing else "
+    "about them: no invented personality, hobbies, messages or private life; stay warm, never "
+    "insulting. For a plain random pick or a fact/joke about it (PROPS above), ignore the STATS and "
+    "follow that request."
+)
+
+
+# 🌸 Opinion questions ('who is your favorite member?', 'who is the cutest?') are the ONLY
+# pick_random_member calls that spend a vision call on the profile-style winner's avatar /
+# banner. Either the model says intent='opinion', or the user's own words are opinion-ish
+# (the model often forgets the intent, same reason _wants_profile has a regex gate).
+_OPINION_INTENTS = ("opinion", "favorite", "favourite", "best", "rate", "rating")
+_OPINION_RE = re.compile(
+    r"\b(fav(?:ou?rite)?s?|best|cutest|prettiest|coolest|hottest|handsomest|most\s+\w+|aesthetic|"
+    r"who\s+do\s+you\s+(?:like|love|prefer)|which\s+(?:member|one)\s+do\s+you\s+(?:like|love|prefer)|"
+    r"terbaik|favorit|paling\s+\w+|imut|cantik|keren|lucu|suka)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_opinion(args: dict, message_text: str = "") -> bool:
+    intent = str(args.get("intent") or "").strip().lower()
+    return intent.startswith(_OPINION_INTENTS) or bool(_OPINION_RE.search(message_text or ""))
+
+
+def _color_vibe(hex_color: str | None) -> str:
+    """🌸 '#FFB6C1' -> 'soft pink (pastel, very kawaii)'. Plain words so the model
+    can talk about the colour without guessing from a hex code."""
+    try:
+        h = str(hex_color).strip().lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except (TypeError, ValueError, IndexError):
+        return "an unreadable colour"
+    hue, sat, val = colorsys.rgb_to_hsv(r, g, b)
+    deg = hue * 360
+    if val < 0.2:
+        return "near-black"
+    if sat < 0.12:
+        return "white" if val > 0.85 else "grey"
+    if deg < 15 or deg >= 345:
+        name = "red"
+    elif deg < 45:
+        name = "orange"
+    elif deg < 70:
+        name = "yellow"
+    elif deg < 165:
+        name = "green"
+    elif deg < 200:
+        name = "cyan"
+    elif deg < 255:
+        name = "blue"
+    elif deg < 290:
+        name = "purple"
+    else:
+        name = "pink"
+    pastel = sat < 0.55 and val > 0.8
+    if name == "red" and sat < 0.65 and val > 0.7:
+        name = "pink"  # light/pastel reds are pinks (#FFB6C1), not 'soft red'
+    if pastel:
+        name = f"soft {name}"
+    kawaii = name.endswith(("pink", "purple")) or pastel
+    tags = [t_ for t_ in ("pastel" if pastel else "", "very kawaii" if kawaii else "") if t_]
+    return f"{name} ({', '.join(tags)})" if tags else name
+
+
+async def _server_stats_block(ctx: _Ctx, look: bool = False) -> str | None:
+    """🌸 Real statistics for opinion questions, all straight from the databases via
+    shared.py: the most senior member (earliest joined_at), the biggest role collector
+    (roles.db) and the best profile style (members.db: avatar / banner / accent colour /
+    decoration). Each lookup fails soft; None when none of them has data.
+    look=True (opinion questions) also has PROFILE_VISION_MODEL read the style winner's
+    avatar / banner / decoration, so the rating can talk about what is really in them."""
+    senior = collector = styled = None
+    try:
+        senior = await ctx.shared.get_top_senior_member(ctx.guild_id)
+    except Exception as e:
+        print(f"⚠️ Senior-member stat failed ({type(e).__name__}): {e}")
+    try:
+        collector = await ctx.shared.get_top_role_collector(ctx.guild_id)
+    except Exception as e:
+        print(f"⚠️ Role-collector stat failed ({type(e).__name__}): {e}")
+    try:
+        styled = await ctx.shared.get_top_profile_style_member(ctx.guild_id)
+    except Exception as e:
+        print(f"⚠️ Profile-style stat failed ({type(e).__name__}): {e}")
+
+    lines = []
+    if senior:
+        try:
+            joined = datetime.fromisoformat(str(senior["joined_at"]).strip())
+            when = f"joined {_fmt_date(joined)} ({_humanize_age(joined)} ago)"
+        except (TypeError, ValueError):
+            when = f"joined {senior['joined_at']}"
+        lines.append(
+            f"- Most senior member (earliest to join): <@{senior['id']}> "
+            f"({senior['display_name'] or senior['username']}), {when}"
+        )
+    if collector:
+        lines.append(
+            f"- Biggest role collector (most roles): <@{collector['id']}> "
+            f"({collector['display_name'] or collector['username']}), "
+            f"{collector['role_count']} role(s)"
+        )
+    if styled:
+        feats = []
+        if styled["custom_avatar"]:
+            feats.append("an animated custom avatar" if styled["animated_avatar"] else "a custom avatar")
+        if styled["has_banner"]:
+            feats.append("a profile banner")
+        if styled["accent_color"]:
+            feats.append(
+                f"an accent colour {styled['accent_color']}, {_color_vibe(styled['accent_color'])}"
+            )
+        if styled["has_decoration"]:
+            feats.append("an avatar decoration")
+        lines.append(
+            f"- Best profile style (avatar/banner/accent colour): <@{styled['id']}> "
+            f"({styled['display_name'] or styled['username']}), "
+            f"{styled['style_score']}/5 style points: " + ", ".join(feats)
+        )
+        if look:
+            descs = await _describe_profile_images(
+                ctx,
+                styled["avatar_url"] if styled["custom_avatar"] else None,
+                styled["banner_url"],
+                styled["decoration_url"],
+            )
+            if descs:
+                seen = "; ".join(f"{k}: {v}" for k, v in descs.items())
+                lines.append(
+                    f"  What their profile looks like (read from the images by a vision model): {seen}"
+                )
+            else:
+                lines.append(
+                    "  (The images couldn't be viewed right now, rate only from the features above.)"
+                )
+    if not lines:
+        return None
+    ids = [x["id"] for x in (senior, collector, styled) if x]
+    if len(ids) > 1 and len(set(ids)) == 1:
+        lines.append("(The same person leads every stat, a triple champion!)" if len(ids) == 3
+                     else "(The same person leads both stats, a double champion!)")
+    return "SERVER STATS (real data from the database, non-bot members only):\n" + "\n".join(lines)
+
+
+async def _exec_random_member(ctx: _Ctx, args: dict) -> str:
+    if ctx.message.guild is None:
+        return "This only works inside a server, not in DMs."
+
+    count = _clamp_count(args.get("count"))
+    role = str(args.get("role_name") or "").strip().lstrip("@")
+    role_id = None
+    id_match = _ROLE_ID_ARG_RE.match(role) if role else None
+    if id_match:
+        role_id = int(id_match.group(1))
+
+    # 🌸 ORDER BY RANDOM() LIMIT ? happens inside SQLite (shared.get_random_members).
+    members = await ctx.shared.get_random_members(
+        ctx.guild_id, count, role_name=role or None, role_id=role_id,
+    )
+    scope = f" with the role '{role}'" if role and not role_id else (" with that role" if role_id else "")
+    if not members:
+        return (
+            f"No members found{scope}. Tell the user sweetly nobody could be picked (role missing, "
+            "empty, or data not synced), never invent a name."
+        )
+
+    lines = [f"- <@{m['id']}> ({m['display_name'] or m['username']})" for m in members]
+    note = ""
+    if len(members) < count:
+        note = f"\n(Only {len(members)} available{scope}, fewer than the {count} asked.)"
+    result = (
+        f"🎲 Random pick ({len(members)}){scope}, chosen by the database. For a plain pick "
+        "request announce exactly these, no swaps:\n"
+        + "\n".join(lines) + note
+    )
+
+    # 🌸 intent='props' ('random member with a fact and a joke'): attach each pick's REAL
+    # server properties (same block check_member_existence builds) so the fact/joke comes
+    # from data, not invention. Capped so a 10-member pick can't blow the follow-up call.
+    if _wants_funfact(args):
+        result += "\n\n(" + _FUNFACT_RULES + " Do it for each pick.)"
+    elif _wants_props(args):
+        blocks = []
+        for m in members[:_RANDOM_PROPS_MAX]:
+            block = await _member_props_block(ctx, m["id"])
+            if block:
+                blocks.append(f"PROPS for <@{m['id']}>:\n{block}")
+        if blocks:
+            result += (
+                "\n\n" + "\n\n".join(blocks) + "\n\n(" + _PROPS_RULES
+                + " Apply to each pick with PROPS.)"
+            )
+            if len(members) > _RANDOM_PROPS_MAX:
+                result += f"\n(Only the first {_RANDOM_PROPS_MAX} picks got PROPS; just name the rest.)"
+        else:
+            result += (
+                "\n(Properties couldn't load, name the pick(s), say sweetly you can't see more. "
+                "No invented facts.)"
+            )
+
+    # 🌸 Opinion questions ('who is your favorite member?', 'who is the best/cutest?') get REAL
+    # statistics (server elder, role collector, profile style; the style winner's avatar/banner
+    # is read by the vision model) so the bot forms its own favorite instead of a blind dice
+    # roll. Gated by _wants_opinion (intent or the user's own words) so plain picks and
+    # fact/joke requests don't pay for the extra queries, vision call and tokens. It applies
+    # on the props path too — the model often adds intent='props' to opinion questions.
+    if _wants_opinion(args, getattr(ctx.message, "content", "") or ""):
+        stats = await _server_stats_block(ctx, look=True)
+        if stats:
+            result += "\n\n" + stats + "\n\n(" + _OPINION_RULES + ")"
+        else:
+            result += (
+                "\n(No stats yet: for 'best/coolest/funniest member' questions, crown the random "
+                "pick playfully and warmly, no invented personality.)"
+            )
+    return _clip(_with_mention_note(result), _RANDOM_RESULT_MAX_CHARS)
+
+
+async def _exec_random_role(ctx: _Ctx, args: dict) -> str:
+    if ctx.message.guild is None:
+        return "This only works inside a server, not in DMs."
+
+    count = _clamp_count(args.get("count"))
+    roles = await ctx.shared.get_random_roles(ctx.guild_id, count)
+    if not roles:
+        return (
+            "No roles found. Tell the user sweetly none could be picked now (data may not be "
+            "synced), never invent a role."
+        )
+
+    lines = [f"- <@&{r['id']}> ({r['name']}, {r['member_count']} member(s))" for r in roles]
+    note = ""
+    if len(roles) < count:
+        note = f"\n(Only {len(roles)} available, fewer than the {count} asked.)"
+    result = (
+        f"🎲 Random pick ({len(roles)}), chosen by the database, announce exactly these, no "
+        "swaps:\n" + "\n".join(lines) + note
+    )
+    return _clip(_with_mention_note(result), _MEMBER_RESULT_MAX_CHARS)
+
+
 async def _exec_dm(ctx: _Ctx, args: dict) -> str:
     if ctx.message.guild is None:
-        return "This is already a DM, so there's nothing to send privately — just reply normally."
+        return "This is already a DM, so there's nothing to send privately, just reply normally."
     from extras.groq_dm_instruct import send_private_dm
 
     content = str(args.get("content") or "").strip()
@@ -1554,6 +1765,8 @@ _EXECUTORS = {
     "search_and_play_music": _exec_music,
     "query_peran_server": _exec_role,
     "check_member_existence": _exec_member,
+    "pick_random_member": _exec_random_member,
+    "pick_random_role": _exec_random_role,
     "send_dm_to_user": _exec_dm,
     "decode_discord_snowflake": _exec_snowflake,
 }
@@ -1563,15 +1776,15 @@ async def run_tool_calls(service, response_message, *, message, shared_ctx) -> t
     """🌸 Executes every tool call in one model response.
 
     Returns (tool_messages, delivered, pending, private):
-      tool_messages — one {"role": "tool", "tool_call_id": ..., "content": ...}
+      tool_messages, one {"role": "tool", "tool_call_id": ..., "content": ...}
                       per call, in order, ready to extend into `messages`.
-      delivered     — True if any tool queued media/music for the channel,
+      delivered    , True if any tool queued media/music for the channel,
                       so the caller can switch tools off for the follow-up
                       and avoid a duplicate post.
-      pending       — the queued async sends (see _deliver). NOT run here:
+      pending      , the queued async sends (see _deliver). NOT run here:
                       they must go out only after the model's text reply
                       has been sent, so the card appears below it.
-      private       — texts sent to the user's DMs this round; completion.py
+      private      , texts sent to the user's DMs this round; completion.py
                       scrubs them from the public reply if the model echoes
                       them (extras.groq_dm_instruct.redact_dm_leaks).
 

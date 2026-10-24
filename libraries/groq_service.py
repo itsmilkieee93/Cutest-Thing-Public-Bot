@@ -1406,6 +1406,10 @@ class GroqMentionService:
                     # ✅ Strip [REACT:emoji] tags from response text so they don't show to users
                     clean_response = REACT_TAG_PATTERN.sub("", response).strip()
 
+                    # 🌸 Hard guarantee for the "no dashes as punctuation" style rule: the model
+                    # still slips em/en dashes in, so strip them here (see shared.strip_dashes).
+                    clean_response = shared.strip_dashes(clean_response)
+
                     # 🌸 DM split-routing MUST run BEFORE the public send below —
                     # it further strips [DM_START]...[DM_END] out of
                     # clean_response (mutating what actually reaches the server
@@ -1417,6 +1421,8 @@ class GroqMentionService:
                     clean_response = await route_dm_split(
                         message, clean_response, self.bot.groq.generate_dm_notice,
                     )
+                    # 🌸 The AI-phrased DM notice is appended inside route_dm_split, strip it too.
+                    clean_response = shared.strip_dashes(clean_response)
 
                     # 🌸 An image embed / music card already carries its own
                     # caption or summary — don't also send the model's text as a
